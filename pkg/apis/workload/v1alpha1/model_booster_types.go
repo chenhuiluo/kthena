@@ -77,6 +77,7 @@ type ModelBackend struct {
 	// "RUNTIME_PORT": default is 8100
 	// "RUNTIME_METRICS_PATH": default is /metrics
 	// "HF_ENDPOINT":The url of hugging face. Default is https://huggingface.co/
+	// "KTHENA_SKIP_ENGINE_DEPENDENCY_INSTALL": default is false. When set to true, skip startup-time pip install of engine connector dependencies.
 	// Cannot be updated.
 	// +optional
 	// +patchMergeKey=name

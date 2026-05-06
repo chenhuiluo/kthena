@@ -17,11 +17,13 @@ limitations under the License.
 package convert
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	workload "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/model-booster-controller/env"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
 )
@@ -137,6 +139,58 @@ func TestCreateModelServingResources(t *testing.T) {
 			diff := cmp.Diff(tt.expected, got)
 			if diff != "" {
 				t.Errorf("ModelServing mismatch (-expected +actual):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestBuildModelServingSkipEngineDependencyInstall(t *testing.T) {
+	tests := []struct {
+		name              string
+		mutateModel       func(*workload.ModelBooster)
+		connectorFragment string
+	}{
+		{
+			name:              "MooncakeConnector",
+			mutateModel:       func(*workload.ModelBooster) {},
+			connectorFragment: "mooncake-transfer-engine",
+		},
+		{
+			name: "NixlConnector",
+			mutateModel: func(model *workload.ModelBooster) {
+				for i := range model.Spec.Backend.Workers {
+					model.Spec.Backend.Workers[i].Config.Raw = []byte(strings.ReplaceAll(
+						string(model.Spec.Backend.Workers[i].Config.Raw),
+						"MooncakeConnector",
+						"NixlConnector",
+					))
+				}
+			},
+			connectorFragment: "nixl &&",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model := loadYaml[workload.ModelBooster](t, "testdata/input/pd-disaggregated-model-mooncake.yaml")
+			model.Spec.Backend.Env = append(model.Spec.Backend.Env, corev1.EnvVar{
+				Name:  env.SkipEngineDependencyInstall,
+				Value: "true",
+			})
+			tt.mutateModel(model)
+
+			serving, err := BuildModelServing(model)
+			assert.NoError(t, err)
+
+			for _, role := range serving.Spec.Template.Roles {
+				for _, container := range role.EntryTemplate.Spec.Containers {
+					if container.Name != "vllm" {
+						continue
+					}
+					command := strings.Join(container.Command, " ")
+					assert.NotContains(t, command, "pip install", "role %s should not install engine dependencies at startup", role.Name)
+					assert.NotContains(t, command, tt.connectorFragment, "role %s should use the prebuilt engine image dependencies", role.Name)
+				}
 			}
 		})
 	}
