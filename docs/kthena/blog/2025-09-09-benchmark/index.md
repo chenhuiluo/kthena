@@ -150,7 +150,7 @@ An advanced **cache-aware scheduling strategy** leveraging **KV cache hit rates*
 **Configuration Example:**
 
 ```yaml
-blockSizeToHash: 16       # Token block size
+blockSizeToHash: 128      # Token block size
 maxBlocksToMatch: 128     # Maximum blocks to process
 ```
 

@@ -165,7 +165,7 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 	for _, p := range pods {
 		podNames = append(podNames, p.Pod.Name)
 	}
-	klog.Infof("KVCacheAware.Score: called for model=%q, pods=%v, promptTextLen=%d, messagesLen=%d",
+	klog.V(4).Infof("KVCacheAware.Score: called for model=%q, pods=%v, promptTextLen=%d, messagesLen=%d",
 		ctx.Model, podNames, len(ctx.Prompt.Text), len(ctx.Prompt.Messages))
 
 	scoreResults := make(map[*datastore.PodInfo]int)
@@ -175,7 +175,7 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 	}
 
 	if (ctx.Prompt.Text == "" && len(ctx.Prompt.Messages) == 0) || ctx.Model == "" {
-		klog.Infof("KVCacheAware.Score: early return — empty prompt or model (model=%q, textLen=%d, messagesLen=%d)",
+		klog.V(4).Infof("KVCacheAware.Score: early return — empty prompt or model (model=%q, textLen=%d, messagesLen=%d)",
 			ctx.Model, len(ctx.Prompt.Text), len(ctx.Prompt.Messages))
 		return scoreResults
 	}
@@ -183,18 +183,18 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 	start := time.Now()
 	tokens, err := t.normalizeAndTokenizePrompt(ctx, pods)
 	tokenizerDuration := time.Since(start)
-	klog.Infof("KVCacheAware.Score: tokenization took %v, tokens=%d, err=%v", tokenizerDuration, len(tokens), err)
+	klog.V(4).Infof("KVCacheAware.Score: tokenization took %v, tokens=%d, err=%v", tokenizerDuration, len(tokens), err)
 
 	if err != nil || len(tokens) == 0 {
-		klog.Infof("KVCacheAware.Score: early return — tokenization failed or empty (err=%v, tokens=%d)", err, len(tokens))
+		klog.V(4).Infof("KVCacheAware.Score: early return — tokenization failed or empty (err=%v, tokens=%d)", err, len(tokens))
 		return scoreResults
 	}
 
 	blockHashes := t.processor.TokensToBlockHashes(tokens, t.maxBlocksToMatch)
-	klog.Infof("KVCacheAware.Score: generated %d block hashes from %d tokens (blockSize=%d)",
+	klog.V(4).Infof("KVCacheAware.Score: generated %d block hashes from %d tokens (blockSize=%d)",
 		len(blockHashes), len(tokens), t.processor.blockSize)
 	if len(blockHashes) == 0 {
-		klog.Infof("KVCacheAware.Score: early return — no block hashes generated")
+		klog.V(4).Infof("KVCacheAware.Score: early return — no block hashes generated")
 		return scoreResults
 	}
 
@@ -205,7 +205,7 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 		klog.Warningf("KVCacheAware.Score: Redis query failed after %v: %v", redisDuration, err)
 		return scoreResults
 	}
-	klog.Infof("KVCacheAware.Score: Redis query took %v, blocksWithHits=%d/%d",
+	klog.V(4).Infof("KVCacheAware.Score: Redis query took %v, blocksWithHits=%d/%d",
 		redisDuration, len(blockToPods), len(blockHashes))
 
 	podScores := t.calculatePodScores(blockHashes, blockToPods)
@@ -217,7 +217,7 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 		}
 	}
 
-	klog.Infof("KVCacheAware.Score: completed in %v, finalScores=%v", time.Since(scoreStart), podScores)
+	klog.V(4).Infof("KVCacheAware.Score: completed in %v, finalScores=%v", time.Since(scoreStart), podScores)
 	return scoreResults
 }
 
@@ -276,7 +276,7 @@ func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName strin
 		blockToPods[blockHashes[i]] = podNames
 	}
 
-	klog.Infof("KVCacheAware.queryRedis: total blocks with hits: %d/%d", len(blockToPods), len(blockHashes))
+	klog.V(4).Infof("KVCacheAware.queryRedis: total blocks with hits: %d/%d", len(blockToPods), len(blockHashes))
 	return blockToPods, nil
 }
 
@@ -291,17 +291,17 @@ func (t *KVCacheAware) calculatePodScores(blockHashes []uint64, blockToPods map[
 	podScores := make(map[string]int)
 
 	if len(blockHashes) == 0 {
-		klog.Infof("KVCacheAware.calculateScores: no block hashes to process")
+		klog.V(4).Infof("KVCacheAware.calculateScores: no block hashes to process")
 		return podScores
 	}
 
 	firstBlockPods, exists := blockToPods[blockHashes[0]]
 	if !exists || len(firstBlockPods) == 0 {
-		klog.Infof("KVCacheAware.calculateScores: first block hash=%d has no cached pods — all scores 0", blockHashes[0])
+		klog.V(4).Infof("KVCacheAware.calculateScores: first block hash=%d has no cached pods — all scores 0", blockHashes[0])
 		return podScores
 	}
 
-	klog.Infof("KVCacheAware.calculateScores: first block matched pods=%v, starting prefix matching across %d blocks",
+	klog.V(4).Infof("KVCacheAware.calculateScores: first block matched pods=%v, starting prefix matching across %d blocks",
 		firstBlockPods, len(blockHashes))
 
 	activePods := make(map[string]bool, len(firstBlockPods))
@@ -313,13 +313,13 @@ func (t *KVCacheAware) calculatePodScores(blockHashes []uint64, blockToPods map[
 	lastMatchedBlock := 0
 	for i := 1; i < len(blockHashes); i++ {
 		if len(activePods) == 0 {
-			klog.V(2).Infof("KVCacheAware.calculateScores: no active pods left at block %d", i)
+			klog.V(4).Infof("KVCacheAware.calculateScores: no active pods left at block %d", i)
 			break
 		}
 
 		blockPods, exists := blockToPods[blockHashes[i]]
 		if !exists || len(blockPods) == 0 {
-			klog.V(2).Infof("KVCacheAware.calculateScores: block[%d] hash=%d has no cached pods, stopping", i, blockHashes[i])
+			klog.V(4).Infof("KVCacheAware.calculateScores: block[%d] hash=%d has no cached pods, stopping", i, blockHashes[i])
 			break
 		}
 
@@ -332,7 +332,7 @@ func (t *KVCacheAware) calculatePodScores(blockHashes []uint64, blockToPods map[
 		}
 
 		if len(nextActivePods) == 0 {
-			klog.V(2).Infof("KVCacheAware.calculateScores: no pod survived intersection at block %d", i)
+			klog.V(4).Infof("KVCacheAware.calculateScores: no pod survived intersection at block %d", i)
 			break
 		}
 
@@ -341,13 +341,13 @@ func (t *KVCacheAware) calculatePodScores(blockHashes []uint64, blockToPods map[
 	}
 
 	totalBlocks := len(blockHashes)
-	klog.Infof("KVCacheAware.calculateScores: prefix matching ended at block %d/%d, scoring %d pods",
+	klog.V(4).Infof("KVCacheAware.calculateScores: prefix matching ended at block %d/%d, scoring %d pods",
 		lastMatchedBlock+1, totalBlocks, len(podScores))
 
 	for podName, matchLen := range podScores {
 		score := int((float64(matchLen) / float64(totalBlocks)) * 100)
 		podScores[podName] = score
-		klog.Infof("KVCacheAware.calculateScores: pod=%s matched=%d/%d blocks, score=%d",
+		klog.V(4).Infof("KVCacheAware.calculateScores: pod=%s matched=%d/%d blocks, score=%d",
 			podName, matchLen, totalBlocks, score)
 	}
 
@@ -356,13 +356,13 @@ func (t *KVCacheAware) calculatePodScores(blockHashes []uint64, blockToPods map[
 
 func (tbp *TokenBlockProcessor) TokensToBlockHashes(tokens []uint32, maxBlocks int) []uint64 {
 	if len(tokens) == 0 {
-		klog.Infof("KVCacheAware.TokensToBlockHashes: no tokens provided")
+		klog.V(4).Infof("KVCacheAware.TokensToBlockHashes: no tokens provided")
 		return nil
 	}
 
 	chunks := tbp.chunkTokens(tokens, maxBlocks)
 	hashes := tbp.computeBlockHashes(chunks)
-	klog.V(2).Infof("KVCacheAware.TokensToBlockHashes: %d tokens -> %d chunks -> %d hashes (blockSize=%d, maxBlocks=%d)",
+	klog.V(4).Infof("KVCacheAware.TokensToBlockHashes: %d tokens -> %d chunks -> %d hashes (blockSize=%d, maxBlocks=%d)",
 		len(tokens), len(chunks), len(hashes), tbp.blockSize, maxBlocks)
 	return hashes
 }

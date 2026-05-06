@@ -80,7 +80,7 @@ spec:
                     path: /health
                     port: 8000
               - name: runtime
-                image: ghcr.io/yaozengzeng/runtime:latest
+                image: ghcr.io/volcano-sh/runtime:latest
                 imagePullPolicy: Always
                 args:
                   - --port
