@@ -1186,7 +1186,7 @@ func TestKVCacheAware_Constants_Core(t *testing.T) {
 		{
 			name:     "Default block size",
 			actual:   defaultBlockSizeToHash,
-			expected: 128,
+			expected: 16,
 		},
 		{
 			name:     "Default max blocks",

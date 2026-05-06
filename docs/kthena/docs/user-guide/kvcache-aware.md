@@ -279,7 +279,7 @@ data:
           maxWaitingRequests: 10
       - name: kvcache-aware
         args:
-          blockSizeToHash: 128
+          blockSizeToHash: 16
           maxBlocksToMatch: 128
       plugins:
         Filter:
@@ -297,7 +297,7 @@ data:
 
 | Parameter          | Default | Description                                                                      |
 | ------------------ | ------- | -------------------------------------------------------------------------------- |
-| `blockSizeToHash`  | 128     | Number of tokens per block. Must match the vLLM block size for optimal matching. |
+| `blockSizeToHash`  | 16      | Number of tokens per block. Must match the vLLM block size for optimal matching. |
 | `maxBlocksToMatch` | 128     | Maximum number of blocks to process per request. Limits Redis queries.           |
 
 **Helm values:**

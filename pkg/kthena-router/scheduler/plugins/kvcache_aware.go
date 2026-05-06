@@ -56,7 +56,7 @@ const (
 
 	// defaultBlockSizeToHash is the default number of tokens per block for hashing
 	// Each token sequence is divided into blocks of this size before generating hashes
-	defaultBlockSizeToHash = 128
+	defaultBlockSizeToHash = 16
 
 	// defaultMaxBlocksToMatch is the default maximum number of blocks to process for scoring
 	// Limits the number of blocks to prevent excessive Redis queries and processing time

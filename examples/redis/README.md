@@ -24,7 +24,7 @@ data:
       pluginConfig:
       - name: kvcache-aware
         args:
-          blockSizeToHash: 128
+          blockSizeToHash: 16
           maxBlocksToMatch: 128
       plugins:
         Score:

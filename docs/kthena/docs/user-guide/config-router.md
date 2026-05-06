@@ -76,7 +76,7 @@ data:
         maxHashCacheSize: 50000
     - name: kvcache-aware
       args:
-        blockSizeToHash: 128
+        blockSizeToHash: 16
         maxBlocksToMatch: 128
     plugins:
       Filter:
@@ -121,7 +121,7 @@ data:
           maxHashCacheSize: 50000
       - name: kvcache-aware
         args:
-          blockSizeToHash: 128
+          blockSizeToHash: 16
           maxBlocksToMatch: 128
       plugins:
         Filter:
