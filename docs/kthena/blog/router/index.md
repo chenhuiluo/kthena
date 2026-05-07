@@ -3,6 +3,7 @@ slug: router-blog-post
 title: A Deep Dive into the Kthena Router
 authors: [YaoZengzeng]
 tags: []
+date: 2025-10-21
 ---
 
 # A Deep Dive into the Kthena Router
