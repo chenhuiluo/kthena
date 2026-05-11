@@ -51,7 +51,7 @@ func GetMetricPods(lister listerv1.PodLister, namespace string, target *workload
 	if err != nil {
 		return nil, err
 	}
-	if podList, err := lister.Pods(namespace).List(*selector); err != nil {
+	if podList, err := lister.Pods(namespace).List(selector); err != nil {
 		return nil, err
 	} else {
 		return podList, nil
@@ -86,7 +86,7 @@ func GetRoleName(targetRef *corev1.ObjectReference) (string, string, error) {
 	return strs[0], strs[1], nil
 }
 
-func GetTargetLabels(target *workload.Target) (*labels.Selector, error) {
+func GetTargetLabels(target *workload.Target) (labels.Selector, error) {
 	if target == nil || target.TargetRef.Name == "" {
 		return nil, nil
 	}
@@ -116,5 +116,5 @@ func GetTargetLabels(target *workload.Target) (*labels.Selector, error) {
 		return nil, err
 	}
 
-	return &labelSelector, nil
+	return labelSelector, nil
 }
