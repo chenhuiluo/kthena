@@ -123,6 +123,50 @@ func TestTokenizerManager(t *testing.T) {
 		// This test verifies the behavior doesn't panic
 		t.Logf("GetTokenizer returned: %v", result)
 	})
+
+	// Test vLLM engine routing
+	t.Run("vLLM engine", func(t *testing.T) {
+		pod := &datastore.PodInfo{
+			Pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pod-vllm",
+					Namespace: "default",
+				},
+				Status: v1.PodStatus{
+					Phase: v1.PodRunning,
+					PodIP: "10.0.0.10",
+				},
+			},
+		}
+		pod.SetEngineForTest(EngineVLLM)
+
+		tok := manager.GetTokenizer("test-model", []*datastore.PodInfo{pod})
+		if tok == nil {
+			t.Fatal("Expected non-nil tokenizer for vLLM pod")
+		}
+	})
+
+	// Test SGLang engine routing
+	t.Run("SGLang engine", func(t *testing.T) {
+		pod := &datastore.PodInfo{
+			Pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pod-sglang",
+					Namespace: "default",
+				},
+				Status: v1.PodStatus{
+					Phase: v1.PodRunning,
+					PodIP: "10.0.0.11",
+				},
+			},
+		}
+		pod.SetEngineForTest(EngineSGLang)
+
+		tok := manager.GetTokenizer("test-model", []*datastore.PodInfo{pod})
+		if tok == nil {
+			t.Fatal("Expected non-nil tokenizer for SGLang pod")
+		}
+	})
 }
 
 // Test error types
