@@ -571,8 +571,9 @@ func TestGetExistingPodGroups(t *testing.T) {
 
 	t.Run("successful retrieval of existing pod groups from fallback live list", func(t *testing.T) {
 		fakeVolcanoClient := volcanofake.NewSimpleClientset(podGroup1, podGroup2, podGroup3, podGroupDifferentNamespace)
-		apiextfake := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
+		apiextfake := apiextfake.NewSimpleClientset()
 		manager := NewManager(nil, fakeVolcanoClient, apiextfake, nil)
+		assert.Nil(t, manager.GetPodGroupLister(), "fallback test requires PodGroup lister to be uninitialized")
 
 		result, err := manager.getExistingPodGroups(context.Background(), modelServing)
 
