@@ -51,15 +51,11 @@ func GetMetricPods(lister listerv1.PodLister, namespace string, target *workload
 	if err != nil {
 		return nil, err
 	}
-	if selector == nil {
-		return nil, nil
-	}
-
-	podList, err := lister.Pods(namespace).List(*selector)
-	if err != nil {
+	if podList, err := lister.Pods(namespace).List(*selector); err != nil {
 		return nil, err
+	} else {
+		return podList, nil
 	}
-	return podList, nil
 }
 
 func UpdateModelServing(ctx context.Context, client clientset.Interface, modelInfer *workload.ModelServing) error {

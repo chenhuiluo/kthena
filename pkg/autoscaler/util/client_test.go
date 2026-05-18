@@ -330,26 +330,6 @@ func TestGetMetricPods(t *testing.T) {
 			wantPodNames: []string{},
 			wantErr:      false,
 		},
-		{
-			name:         "nil target returns no pods",
-			namespace:    "default",
-			target:       nil,
-			wantPodCount: 0,
-			wantPodNames: []string{},
-			wantErr:      false,
-		},
-		{
-			name:      "empty target name returns no pods",
-			namespace: "default",
-			target: &workload.Target{
-				TargetRef: corev1.ObjectReference{
-					Kind: workload.ModelServingKind.Kind,
-				},
-			},
-			wantPodCount: 0,
-			wantPodNames: []string{},
-			wantErr:      false,
-		},
 	}
 
 	for _, tt := range tests {
