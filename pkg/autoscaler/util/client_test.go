@@ -292,8 +292,8 @@ func TestGetMetricPods(t *testing.T) {
 		wantErr      bool
 	}{
 		{
-			name:         "pods in default namespace",
-			namespace:    "default",
+			name:      "pods in default namespace",
+			namespace: "default",
 			target: &workload.Target{
 				TargetRef: corev1.ObjectReference{
 					Name: "model1",
@@ -305,8 +305,8 @@ func TestGetMetricPods(t *testing.T) {
 			wantErr:      false,
 		},
 		{
-			name:         "pods in other-namespace",
-			namespace:    "other-namespace",
+			name:      "pods in other-namespace",
+			namespace: "other-namespace",
 			target: &workload.Target{
 				TargetRef: corev1.ObjectReference{
 					Name: "model1",
@@ -318,8 +318,8 @@ func TestGetMetricPods(t *testing.T) {
 			wantErr:      false,
 		},
 		{
-			name:         "pods in non-existent namespace",
-			namespace:    "non-existent",
+			name:      "pods in non-existent namespace",
+			namespace: "non-existent",
 			target: &workload.Target{
 				TargetRef: corev1.ObjectReference{
 					Name: "model1",
