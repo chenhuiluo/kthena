@@ -19,7 +19,7 @@ creation-date: 2026-05-08
 The Kthena Autoscaler currently collects metrics by directly scraping each pod's HTTP endpoint (Prometheus text format). While this covers the typical LLM serving case, it cannot consume metrics that are only available in an external Prometheus server — such as
 cluster-level aggregations, cross-service SLOs, or GPU utilisation data exported by DCGM/node-exporter.
 
-This proposal extends the binding `Target` model so that each target can declare a **Prometheus server** as its metric source, providing a per-target PromQL query that is evaluated against an external Prometheus HTTP API instead of scraping pods directly. `AutoscalingPolicy` remains a pure scaling contract (metric name + threshold + behaviour) with no knowledge of where metrics come from. The change preserves full backward compatibility with the existing pod-scraping path.
+This proposal extends the binding `Target` model so that each target declares metric sources only through `metricSources`, including **Prometheus** and **Pod** source variants per metric key. Prometheus metrics are evaluated against an external Prometheus HTTP API; pod metrics are scraped directly from pods but are also configured via `metricSources` (not via `MetricEndpoint`). `AutoscalingPolicy` remains a pure scaling contract (metric name + threshold + behaviour) with no knowledge of where metrics come from.
 
 ### Motivation
 
@@ -40,7 +40,7 @@ Additionally, for **heterogeneous target** scaling, each deployment type (e.g. `
 
 - Support per-target PromQL queries in the binding's `Target` struct so that both `HomogeneousTarget` and `HeterogeneousTarget` can retrieve metrics from an external Prometheus server.
 - Keep `AutoscalingPolicy` as a pure scaling contract; it defines metric names and thresholds but has no knowledge of where metrics come from.
-- Keep the pod-scraping path unchanged; existing policies and bindings require no migration.
+- Keep pod-scraping support as a first-class source type (`Pod`) in `metricSources`.
 - Support bearer-token and TLS authentication when connecting to Prometheus.
 - Introduce a clean separation between algorithm key (`name` on the policy) and metric selector (`metricSources` on the binding target).
 
@@ -56,7 +56,7 @@ Additionally, for **heterogeneous target** scaling, each deployment type (e.g. `
 Introduce a `MetricSource` discriminated union on **`Target.metricSources`** only — a `map[string]MetricSource` (keys match `AutoscalingPolicy.spec.metrics[].name`) that lets each binding target declare how to fetch each metric. This design enforces a clean separation of concerns:
 
 - **`AutoscalingPolicy`** defines *what* to scale on (metric name, threshold, behaviour) — it is reusable across different targets and has no metric-source knowledge.
-- **`AutoscalingPolicyBinding` / `Target`** defines *how* to fetch the metric for that specific deployment — pod scraping (`MetricEndpoint`, the existing default) or an external Prometheus query.
+- **`AutoscalingPolicyBinding` / `Target`** defines *how* to fetch each metric for that specific deployment via `metricSources` (`Pod` or `Prometheus`).
 
 The scaling algorithm (`RecommendedInstancesAlgorithm`) already has a split between `ReadyInstancesMetrics` (pod-source, per-instance) and `ExternalMetrics` (single aggregate value). Prometheus-sourced metrics are populated into `ExternalMetrics` since they return a single scalar value, not a per-pod value. The existing `getDesiredInstancesForSingleExternalMetric` function then handles them without changes.
 
@@ -159,9 +159,9 @@ spec:
 #### Notes/Constraints/Caveats
 
 - Prometheus queries must return a **scalar or single-element instant vector**. The controller rejects (logs an error and skips the metric) results with zero or more than one element.
-- When `Target.metricSources` has no entry for a given metric name, the controller falls back to pod scraping via `Target.MetricEndpoint` — the existing default behaviour.
+- `Target.metricSources` is the only metric-source configuration surface. Each policy metric key must have a corresponding source entry.
 - `MetricName` in the existing API is renamed to `Name` to reflect its role as a pure algorithm key with no scrape-filter semantics. A kubebuilder validation ensures it cannot be empty.
-- For `PodMetricSource` (used inside `Target.metricSources` to override the pod scrape filter name), `metricName` defaults to the metric's `name` in the policy when omitted, preserving backward compatibility.
+- For `PodMetricSource`, `name` defaults to the policy metric key when omitted.
 
 #### Risks and Mitigations
 
@@ -194,7 +194,7 @@ type AutoscalingPolicyMetric struct {
 
 ##### `autoscalingpolicybinding_types.go`
 
-All metric-source types are defined here. `Target` gains a `MetricSources` map that lets each target declare how to fetch each metric. The new types are:
+All metric-source types are defined here. `Target` contains a `MetricSources` map that declares how to fetch each metric. The new types are:
 
 ```go
 // MetricSourceType selects the backend from which a metric value is fetched.
@@ -224,8 +224,7 @@ type MetricSource struct {
 }
 
 // PodMetricSource configures pod-endpoint scraping for a metric.
-// Used inside Target.metricSources when the scraped metric name differs from the
-// policy metric name.
+// Used inside Target.metricSources.
 type PodMetricSource struct {
     // Name is the Prometheus metric name matched against labels in the pod's
     // scraped output. Defaults to the policy metric name when omitted.
@@ -246,7 +245,7 @@ type PrometheusMetricSource struct {
     // QueryTimeout is intentionally not added in v1.
     // The query call must use the reconcile-scoped context timeout
     // (AutoscaleCtxTimeoutSeconds) to keep timeout behavior consistent with
-    // pod scraping and to avoid per-target timeout skew.
+    // pod-source fetches and Prometheus fetches and to avoid per-target timeout skew.
     // Auth holds optional authentication configuration for the Prometheus server.
     // +optional
     Auth *PrometheusAuth `json:"auth,omitempty"`
@@ -274,21 +273,17 @@ type PrometheusTLSConfig struct {
 }
 ```
 
-`Target` gains a `MetricSources` map providing per-target metric source configuration:
+`Target` uses `MetricSources` as the only per-target metric source configuration:
 
 ```go
 // Target defines a ModelServing deployment that can be monitored and scaled.
 type Target struct {
     TargetRef      corev1.ObjectReference  `json:"targetRef"`
     SubTarget      *SubTarget              `json:"subTargets,omitempty"`
-    // MetricEndpoint configures default pod endpoint scraping.
-    // It is used only when MetricSources has no entry for a metric key.
-    MetricEndpoint MetricEndpoint          `json:"metricEndpoint,omitempty"`
     // MetricSources declares how to fetch specific metrics for this target.
     // Keys must match AutoscalingPolicy.spec.metrics[].name.
-    // When both MetricSources and MetricEndpoint are set, MetricSources takes precedence
-    // for keys present in this map.
-    // For keys absent in this map, the controller falls back to MetricEndpoint.
+    // This is the only metric-source configuration surface for Target.
+    // Missing keys are treated as invalid configuration.
     // +optional
     MetricSources  map[string]MetricSource `json:"metricSources,omitempty"`
 }
@@ -303,13 +298,10 @@ type Target struct {
 1. **Pod path** (existing, unchanged): scrapes pods via `fetchMetricsFromPods` and populates `ReadyInstancesMetrics []algorithm.Metrics`.
 2. **Prometheus path** (new): calls `fetchPrometheusMetric` per metric and populates `ExternalMetrics algorithm.Metrics`.
 
-Source resolution for a given metric `m` within a target `t` (highest priority first):
+Source resolution for a given metric `m` within a target `t`:
 
-1. `t.MetricSources[m.Name]` present → use the declared `MetricSource` (Pod override or Prometheus).
-2. No entry in `MetricSources` → fall back to pod scraping via `t.MetricEndpoint`.
-
-In other words, if both fields are configured, `MetricSources` is authoritative for
-configured metric keys.
+1. `t.MetricSources[m.Name]` must be present and is used as the source of truth.
+2. Missing entry is treated as invalid configuration for that metric key.
 
 The new `fetchPrometheusMetric` function uses `github.com/prometheus/client_golang/api/prometheus/v1` (already an indirect dependency via `client_model` and `common`) to execute an instant query and extract the scalar value.
 
@@ -376,12 +368,12 @@ If we later need per-metric detail, we can still encode the metric key in `Reaso
 All existing `AutoscalingPolicy` and `AutoscalingPolicyBinding` resources continue to work without modification:
 
 - `MetricName` is renamed to `Name` in the Go struct, and the JSON tag `metricName` also rename to `name` for the first release.
-- `Target.MetricSources` is optional and absent by default; when absent, the controller falls back to the existing pod-scraping path via `MetricEndpoint`.
+- **Removing `Target.MetricEndpoint`** is a breaking API change for bindings that relied on endpoint defaults.
 
 #### Test Plan
 
 - **Unit tests** for `fetchPrometheusMetric`: mock the Prometheus HTTP API using `httptest.Server` returning various result types (scalar, vector, matrix, error).
-- **Unit tests** for source resolution precedence (`MetricSources[metricKey]` > `MetricEndpoint` default).
+- **Unit tests** for source resolution and validation (`MetricSources[metricKey]` required; missing key is invalid).
 - **Unit tests** for `MetricCollector.UpdateMetrics` with mixed pod + Prometheus sources.
 - **Integration tests**: deploy a real Prometheus instance (via `setup-envtest` or a sidecar) and verify end-to-end scrape → scale decision.
 - **E2E tests**: extend existing autoscaler e2e suite with a Prometheus-source binding and verify replica count adjusts in response to changes in a Prometheus gauge.
