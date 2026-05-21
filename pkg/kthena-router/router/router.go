@@ -415,7 +415,12 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) {
 	// Common scheduling logic for both ModelServer and InferencePool
 	var prompt *common.ChatMessage
 	if cached, exists := c.Get(PromptKey); exists {
-		prompt = cached.(*common.ChatMessage)
+		var ok bool
+		if prompt, ok = cached.(*common.ChatMessage); !ok {
+			accesslog.SetError(c, "prompt_parsing", "internal error: invalid prompt type")
+			c.AbortWithStatusJSON(http.StatusInternalServerError, "internal error")
+			return
+		}
 	} else {
 		accesslog.SetError(c, "prompt_parsing", "prompt not found")
 		c.AbortWithStatusJSON(http.StatusNotFound, "prompt not found")
