@@ -41,8 +41,8 @@ func WaitForModelServingReady(t *testing.T, ctx context.Context, kthenaClient *c
 	t.Log("Waiting for ModelServing to be ready...")
 	err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
 		getCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
 		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(namespace).Get(getCtx, name, metav1.GetOptions{})
-		cancel()
 		if err != nil {
 			t.Logf("Error getting ModelServing %s, retrying: %v", name, err)
 			return false, nil
@@ -64,8 +64,8 @@ func WaitForModelServingSpecReplicas(t *testing.T, ctx context.Context, kthenaCl
 	t.Helper()
 	require.Eventually(t, func() bool {
 		getCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
 		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(namespace).Get(getCtx, name, metav1.GetOptions{})
-		cancel()
 		if err != nil || ms.Spec.Replicas == nil {
 			return false
 		}
@@ -92,8 +92,8 @@ func WaitForDeploymentReady(t *testing.T, ctx context.Context, kubeClient kubern
 	t.Helper()
 	err := wait.PollUntilContextTimeout(ctx, defaultPollingInterval, timeout, true, func(ctx context.Context) (bool, error) {
 		getCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
 		deploy, err := kubeClient.AppsV1().Deployments(namespace).Get(getCtx, name, metav1.GetOptions{})
-		cancel()
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return false, nil
@@ -110,8 +110,8 @@ func WaitForDeploymentReady(t *testing.T, ctx context.Context, kubeClient kubern
 func WaitForDeploymentReadyE(ctx context.Context, kubeClient kubernetes.Interface, namespace, name string, timeout time.Duration) error {
 	err := wait.PollUntilContextTimeout(ctx, defaultPollingInterval, timeout, true, func(ctx context.Context) (bool, error) {
 		getCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
 		deploy, err := kubeClient.AppsV1().Deployments(namespace).Get(getCtx, name, metav1.GetOptions{})
-		cancel()
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return false, nil

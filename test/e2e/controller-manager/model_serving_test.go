@@ -134,10 +134,10 @@ func TestModelServingLifecycle(t *testing.T) {
 	// Verify that associated pods are cleaned up
 	require.Eventually(t, func() bool {
 		listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
 		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(listCtx, metav1.ListOptions{
 			LabelSelector: labelSelector,
 		})
-		cancel()
 		if err != nil {
 			return false
 		}
@@ -1622,10 +1622,10 @@ type servingGroupState struct {
 
 func collectRunningServingGroupStates(ctx context.Context, kubeClient *kubernetes.Clientset, msName string) (map[int32]servingGroupState, error) {
 	listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	pods, err := kubeClient.CoreV1().Pods(testNamespace).List(listCtx, metav1.ListOptions{
 		LabelSelector: modelServingLabelSelector(msName),
 	})
-	cancel()
 	if err != nil {
 		return nil, err
 	}
@@ -1671,8 +1671,8 @@ func waitForPartitionState(t *testing.T, ctx context.Context, kthenaClient *clie
 	var updateRevision string
 	require.Eventually(t, func() bool {
 		getCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
 		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(getCtx, msName, metav1.GetOptions{})
-		cancel()
 		if err != nil {
 			return false
 		}
@@ -1714,8 +1714,8 @@ func waitForRollingUpdateConverged(t *testing.T, ctx context.Context, kthenaClie
 	var finalMS *workload.ModelServing
 	require.Eventually(t, func() bool {
 		getCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
 		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(getCtx, msName, metav1.GetOptions{})
-		cancel()
 		if err != nil {
 			return false
 		}
@@ -1772,10 +1772,10 @@ func verifyAllPodsHaveImage(t *testing.T, ctx context.Context, kubeClient *kuber
 	t.Helper()
 	require.Eventually(t, func() bool {
 		listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
 		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(listCtx, metav1.ListOptions{
 			LabelSelector: labelSelector,
 		})
-		cancel()
 		if err != nil || len(pods.Items) == 0 {
 			return false
 		}

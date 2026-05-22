@@ -116,8 +116,8 @@ func waitForWebhookReady(t *testing.T, ctx context.Context, kthenaClient *client
 		probe.Name = "webhook-ready-probe-" + utils.RandomString(5)
 
 		createCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
 		_, err := kthenaClient.WorkloadV1alpha1().ModelBoosters(namespace).Create(createCtx, probe, metav1.CreateOptions{DryRun: []string{"All"}})
-		cancel()
 		if err != nil {
 			errStr := err.Error()
 			if strings.Contains(errStr, "connect: connection refused") {
