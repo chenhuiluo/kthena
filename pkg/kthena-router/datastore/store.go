@@ -63,8 +63,9 @@ var (
 
 const (
 	// Configuration constants for fairness scheduling
-	defaultQueueQPS = 100
-	uppdateInterval = 1 * time.Second
+	defaultQueueQPS          = 100
+	defaultUpdateInterval    = 1 * time.Second
+	metricsUpdateIntervalEnv = "METRICS_UPDATE_INTERVAL"
 
 	// onFlightSyncInterval caps Redis read traffic from SyncOnFlightCounts.
 	// At most one HMGET is issued per interval regardless of request rate;
@@ -355,11 +356,12 @@ type store struct {
 	// initialSynced is used to indicate whether all the resources has been processed and storred into this store.
 	initialSynced *atomic.Bool
 	// model -> RequestPriorityQueue
-	requestWaitingQueue sync.Map
-	tokenTracker        TokenTracker
-	podRuntimeInspector PodRuntimeInspector
-	rootCtx             context.Context // Lifecycle context for queue goroutines, set by Run()
-	fairnessQueueConfig FairnessQueueConfig
+	requestWaitingQueue   sync.Map
+	tokenTracker          TokenTracker
+	podRuntimeInspector   PodRuntimeInspector
+	rootCtx               context.Context // Lifecycle context for queue goroutines, set by Run()
+	fairnessQueueConfig   FairnessQueueConfig
+	metricsUpdateInterval time.Duration
 }
 
 func New(opts ...Option) Store {
@@ -378,9 +380,10 @@ func New(opts ...Option) Store {
 		initialSynced:       &atomic.Bool{},
 		requestWaitingQueue: sync.Map{},
 		// Create token tracker with environment-based configuration
-		tokenTracker:        createTokenTracker(),
-		podRuntimeInspector: realPodRuntimeInspector{},
-		fairnessQueueConfig: createFairnessQueueConfig(),
+		tokenTracker:          createTokenTracker(),
+		podRuntimeInspector:   realPodRuntimeInspector{},
+		fairnessQueueConfig:   createFairnessQueueConfig(),
+		metricsUpdateInterval: parseMetricsUpdateInterval(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -456,6 +459,17 @@ func isValidFairnessWeight(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0
 }
 
+func parseMetricsUpdateInterval() time.Duration {
+	if v := os.Getenv(metricsUpdateIntervalEnv); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		} else {
+			klog.Warningf("Invalid %s: %q, using default %v", metricsUpdateIntervalEnv, v, defaultUpdateInterval)
+		}
+	}
+	return defaultUpdateInterval
+}
+
 func (s *store) Run(ctx context.Context) {
 	s.rootCtx = ctx
 	go func() {
@@ -472,7 +486,7 @@ func (s *store) Run(ctx context.Context) {
 					return true
 				})
 				s.initialSynced.Store(true)
-				time.Sleep(uppdateInterval)
+				time.Sleep(s.metricsUpdateInterval)
 			}
 		}
 	}()

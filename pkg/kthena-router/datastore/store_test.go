@@ -43,6 +43,71 @@ func ptr[T any](v T) *T {
 	return &v
 }
 
+func TestParseMetricsUpdateInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		envValue string
+		expected time.Duration
+	}{
+		{
+			name:     "default when env not set",
+			envValue: "",
+			expected: defaultUpdateInterval,
+		},
+		{
+			name:     "valid duration 200ms",
+			envValue: "200ms",
+			expected: 200 * time.Millisecond,
+		},
+		{
+			name:     "valid duration 500ms",
+			envValue: "500ms",
+			expected: 500 * time.Millisecond,
+		},
+		{
+			name:     "valid duration 5s",
+			envValue: "5s",
+			expected: 5 * time.Second,
+		},
+		{
+			name:     "invalid duration falls back to default",
+			envValue: "notaduration",
+			expected: defaultUpdateInterval,
+		},
+		{
+			name:     "zero duration falls back to default",
+			envValue: "0s",
+			expected: defaultUpdateInterval,
+		},
+		{
+			name:     "negative duration falls back to default",
+			envValue: "-1s",
+			expected: defaultUpdateInterval,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.envValue != "" {
+				t.Setenv("METRICS_UPDATE_INTERVAL", tc.envValue)
+			}
+			got := parseMetricsUpdateInterval()
+			assert.Equal(t, tc.expected, got)
+		})
+	}
+}
+
+func TestNewStoreUsesMetricsUpdateInterval(t *testing.T) {
+	t.Setenv("METRICS_UPDATE_INTERVAL", "2s")
+	s := New().(*store)
+	assert.Equal(t, 2*time.Second, s.metricsUpdateInterval)
+}
+
+func TestNewStoreUsesDefaultMetricsUpdateInterval(t *testing.T) {
+	s := New().(*store)
+	assert.Equal(t, defaultUpdateInterval, s.metricsUpdateInterval)
+}
+
 func TestCreateFairnessQueueConfig_RejectsInvalidWeights(t *testing.T) {
 	t.Setenv("FAIRNESS_PRIORITY_TOKEN_WEIGHT", "NaN")
 	t.Setenv("FAIRNESS_PRIORITY_REQUEST_NUM_WEIGHT", strconv.FormatFloat(math.Inf(1), 'f', -1, 64))
