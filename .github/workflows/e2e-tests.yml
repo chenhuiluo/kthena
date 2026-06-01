@@ -29,6 +29,7 @@ jobs:
         category:
           - controller-manager
           - router
+          - router-plugins
           - gateway-api
           - gateway-inference-extension
     steps:

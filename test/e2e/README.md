@@ -12,6 +12,7 @@ The E2E tests use helm to install kthena into a Kind cluster and verify core fun
 |----------|-------------|-------------|
 | `controller-manager` | ModelServing, ModelBooster, Autoscaling | `make test-e2e-controller-manager` |
 | `router` | ModelRoute without Gateway API | `make test-e2e-router` |
+| `router-plugins` | Router scheduler plugins; includes `sim → ZMQ bridge → runtime → Redis` for kvcache-aware | `make test-e2e-router-plugins` |
 | `gateway-api` | ModelRoute with Gateway API | `make test-e2e-gateway-api` |
 | `gateway-inference-extension` | HTTPRoute, InferencePool | `make test-e2e-gateway-inference-extension` |
 
@@ -38,6 +39,7 @@ The GitHub Actions E2E workflow runs the same category targets in parallel by us
 |--------|-------------|--------------|
 | `E2E (controller-manager)` | `make test-e2e-controller-manager` | `kthena-controller-manager` |
 | `E2E (router)` | `make test-e2e-router` | `kthena-router` |
+| `E2E (router-plugins)` | `make test-e2e-router-plugins` | `kthena-router-plugins` |
 | `E2E (gateway-api)` | `make test-e2e-gateway-api` | `kthena-gateway-api` |
 | `E2E (gateway-inference-extension)` | `make test-e2e-gateway-inference-extension` | `kthena-gateway-inference-extension` |
 
@@ -70,6 +72,9 @@ make test-e2e-controller-manager
 
 # Router tests (no Gateway API)
 make test-e2e-router
+
+# Router scheduler plugin tests
+make test-e2e-router-plugins
 
 # Gateway API tests
 make test-e2e-gateway-api
