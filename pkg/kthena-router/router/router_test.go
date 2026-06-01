@@ -18,6 +18,7 @@ package router
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"os"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -39,8 +41,11 @@ import (
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/accesslog"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/connectors"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -867,4 +872,203 @@ func parseBool(str string) (bool, error) {
 		return false, nil
 	}
 	return false, &strconv.NumError{Func: "ParseBool", Num: str, Err: strconv.ErrSyntax}
+}
+
+// setupFairnessTestRouter creates a Router wired to a real datastore and a mock
+// HTTP backend.  It populates the store with a ModelServer, Pod, and ModelRoute
+// so that doLoadbalance can find a target pod whose IP/port matches the mock
+// backend.
+func setupFairnessTestRouter(t *testing.T, backendHandler http.Handler) (*Router, datastore.Store, *httptest.Server) {
+	t.Helper()
+	router, store, backend := setupTestRouter(t, backendHandler)
+
+	backendURL, _ := url.Parse(backend.URL)
+	backendIP := backendURL.Hostname()
+	backendPort, _ := strconv.Atoi(backendURL.Port())
+
+	modelServer := &aiv1alpha1.ModelServer{
+		ObjectMeta: v1.ObjectMeta{Name: "ms-fair", Namespace: "default"},
+		Spec: aiv1alpha1.ModelServerSpec{
+			Model:           func(s string) *string { return &s }("fair-model-base"),
+			WorkloadPort:    aiv1alpha1.WorkloadPort{Port: int32(backendPort)},
+			InferenceEngine: "vLLM",
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-fair", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: backendIP, Phase: corev1.PodRunning},
+	}
+	modelRoute := &aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-fair", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "fair-model",
+			Rules: []*aiv1alpha1.Rule{
+				{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms-fair"}}},
+			},
+		},
+	}
+
+	store.AddOrUpdateModelServer(modelServer, sets.New(types.NamespacedName{Name: "pod-fair", Namespace: "default"}))
+	store.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{modelServer})
+	store.AddOrUpdateModelRoute(modelRoute)
+
+	return router, store, backend
+}
+
+func TestHandleFairnessScheduling(t *testing.T) {
+	okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"fair-ok"}`)
+	})
+
+	tests := []struct {
+		name            string
+		backendHandler  http.Handler
+		fairnessTimeout time.Duration
+		setUserID       bool
+		// storeWrapper replaces the router's store before calling handleFairnessScheduling.
+		// nil means use the real store (request will be dispatched by the QPS ticker).
+		storeWrapper func(real datastore.Store) datastore.Store
+		// cancelAfter, when >0, cancels the request context after this duration
+		// to simulate a client disconnect.
+		cancelAfter      time.Duration
+		wantErr          bool
+		wantErrMsg       string
+		wantHTTPStatus   int
+		wantBodyContains string
+	}{
+		{
+			name:             "happy path with userId",
+			backendHandler:   okHandler,
+			fairnessTimeout:  5 * time.Second,
+			setUserID:        true,
+			wantErr:          false,
+			wantHTTPStatus:   http.StatusOK,
+			wantBodyContains: `"id":"fair-ok"`,
+		},
+		{
+			name:             "happy path without userId",
+			backendHandler:   okHandler,
+			fairnessTimeout:  5 * time.Second,
+			setUserID:        false,
+			wantErr:          false,
+			wantHTTPStatus:   http.StatusOK,
+			wantBodyContains: `"id":"fair-ok"`,
+		},
+		{
+			name:            "timeout when queue never dispatches",
+			fairnessTimeout: 50 * time.Millisecond,
+			setUserID:       true,
+			storeWrapper:    func(real datastore.Store) datastore.Store { return &blockingEnqueueStore{Store: real} },
+			wantErr:         true,
+			wantErrMsg:      "timed out",
+			wantHTTPStatus:  http.StatusGatewayTimeout,
+		},
+		{
+			name:            "client disconnect before dispatch",
+			fairnessTimeout: 10 * time.Second,
+			setUserID:       true,
+			storeWrapper:    func(real datastore.Store) datastore.Store { return &blockingEnqueueStore{Store: real} },
+			cancelAfter:     50 * time.Millisecond,
+			wantErr:         true,
+			wantErrMsg:      "client disconnected",
+			wantHTTPStatus:  http.StatusServiceUnavailable,
+		},
+		{
+			name:            "enqueue failure",
+			fairnessTimeout: 5 * time.Second,
+			setUserID:       true,
+			storeWrapper:    func(real datastore.Store) datastore.Store { return &failingEnqueueStore{Store: real} },
+			wantErr:         true,
+			wantErrMsg:      "failed to enqueue request",
+			wantHTTPStatus:  http.StatusInternalServerError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router, store, backend := setupFairnessTestRouter(t, tt.backendHandler)
+			defer backend.Close()
+
+			router.fairnessTimeout = tt.fairnessTimeout
+			if tt.storeWrapper != nil {
+				router.store = tt.storeWrapper(store)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			router.store.Run(ctx)
+			defer cancel()
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			reqBody := `{"model":"fair-model","prompt":"hello fairness"}`
+
+			var clientCancel context.CancelFunc
+			if tt.cancelAfter > 0 {
+				var ctx context.Context
+				ctx, clientCancel = context.WithCancel(context.Background())
+				c.Request, _ = http.NewRequestWithContext(ctx, "POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
+			} else {
+				c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
+			}
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			modelRequest, err := ParseModelRequest(c)
+			assert.NoError(t, err)
+			prompt, perr := utils.ParsePrompt(modelRequest)
+			assert.NoError(t, perr)
+			c.Set(PromptKey, prompt)
+			if tt.setUserID {
+				c.Set(common.UserIdKey, "user-test")
+			}
+			c.Set("metricsRecorder", metrics.NewRequestMetricsRecorder(router.metrics, "fair-model", "/v1/chat/completions"))
+
+			// Run handleFairnessScheduling asynchronously so we can trigger
+			// client cancellation mid-flight when needed.
+			done := make(chan error, 1)
+			go func() {
+				done <- router.handleFairnessScheduling(c, modelRequest, "req-test", "fair-model")
+			}()
+
+			if clientCancel != nil {
+				time.Sleep(tt.cancelAfter)
+				clientCancel()
+			}
+
+			err = <-done
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrMsg)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantHTTPStatus, w.Code)
+			if tt.wantBodyContains != "" {
+				assert.Contains(t, w.Body.String(), tt.wantBodyContains)
+			}
+		})
+	}
+}
+
+// --- Test helper: store wrapper that accepts Enqueue but never notifies ---
+
+// blockingEnqueueStore wraps a real Store but overrides Enqueue so the
+// request is accepted (no error) but never dispatched (NotifyChan is never closed).
+type blockingEnqueueStore struct {
+	datastore.Store
+}
+
+func (s *blockingEnqueueStore) Enqueue(req *datastore.Request) error {
+	// Accept the request but never signal NotifyChan — simulates a full queue.
+	return nil
+}
+
+// failingEnqueueStore wraps a real Store and always returns an error on Enqueue.
+type failingEnqueueStore struct {
+	datastore.Store
+}
+
+func (s *failingEnqueueStore) Enqueue(req *datastore.Request) error {
+	return fmt.Errorf("injected enqueue failure")
 }
