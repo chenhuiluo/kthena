@@ -30,9 +30,9 @@ type Context struct {
 	Model  string
 	Prompt *common.ChatMessage
 
-	// CorrelationID is the session identifier from the X-Correlation-ID HTTP header.
-	// Used by session-affinity plugin to route requests from the same session to the same pod.
-	CorrelationID string
+	// SessionID is the session identifier extracted from the HTTP header configured
+	// via the SESSION_BOOST_HEADER environment variable.
+	SessionID string
 
 	Hashes []uint64
 

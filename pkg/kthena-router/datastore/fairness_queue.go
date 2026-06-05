@@ -92,7 +92,7 @@ type Request struct {
 	ReqID         string
 	UserID        string  // User ID for fairness scheduling
 	ModelName     string  // Target model for per-model fair queuing
-	CorrelationID string  // Session identifier from X-Correlation-ID header for multi-turn conversations
+	SessionID string  // Session identifier for multi-turn conversations
 	Priority      float64 // Priority (lower value means higher priority)
 	SessionBoost  bool    // Whether this request has session priority boost (recently completed session)
 	RequestTime   time.Time

@@ -239,9 +239,9 @@ type Store interface {
 	// Enqueue adds a request to the fair queue
 	Enqueue(*Request) error
 
-	// MarkSessionCompleted records that a request with the given correlation ID
+	// MarkSessionCompleted records that a request with the given session ID
 	// has completed, enabling priority boosting for follow-up requests in the same session.
-	MarkSessionCompleted(modelName, correlationID string)
+	MarkSessionCompleted(modelName, sessionID string)
 
 	// EnqueueSessionBoost adds a request to the standalone session boost queue.
 	// Returns false if the session boost queue is not enabled.
@@ -703,15 +703,15 @@ func (s *store) makePodCounter() func() int {
 	}
 }
 
-func (s *store) MarkSessionCompleted(modelName, correlationID string) {
-	if correlationID == "" {
+func (s *store) MarkSessionCompleted(modelName, sessionID string) {
+	if sessionID == "" {
 		return
 	}
 	// Mark on the standalone session boost queue
 	if sbVal, ok := s.sessionBoostQueue.Load(modelName); ok {
 		sbQueue, _ := sbVal.(*SessionBoostQueue)
 		if sbQueue != nil {
-			sbQueue.MarkSessionCompleted(correlationID)
+			sbQueue.MarkSessionCompleted(sessionID)
 		}
 	}
 }

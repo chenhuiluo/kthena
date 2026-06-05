@@ -40,7 +40,7 @@ type BackendWaitingChecker func() bool
 // requests in the same session to be prioritized for prefix cache utilization.
 type SessionTracker struct {
 	mu       sync.RWMutex
-	sessions map[string]time.Time // correlationID -> last completion time
+	sessions map[string]time.Time // sessionID -> last completion time
 	ttl      time.Duration
 }
 
@@ -53,23 +53,23 @@ func NewSessionTracker(ttl time.Duration) *SessionTracker {
 }
 
 // MarkCompleted records that a request from the given session has completed.
-func (st *SessionTracker) MarkCompleted(correlationID string) {
-	if correlationID == "" {
+func (st *SessionTracker) MarkCompleted(sessionID string) {
+	if sessionID == "" {
 		return
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	st.sessions[correlationID] = time.Now()
+	st.sessions[sessionID] = time.Now()
 }
 
-// HasRecentCompletion checks if the given correlation ID has a completion within the TTL window.
-func (st *SessionTracker) HasRecentCompletion(correlationID string) bool {
-	if correlationID == "" {
+// HasRecentCompletion checks if the given session ID has a completion within the TTL window.
+func (st *SessionTracker) HasRecentCompletion(sessionID string) bool {
+	if sessionID == "" {
 		return false
 	}
 	st.mu.RLock()
 	defer st.mu.RUnlock()
-	completionTime, exists := st.sessions[correlationID]
+	completionTime, exists := st.sessions[sessionID]
 	if !exists {
 		return false
 	}
@@ -103,7 +103,8 @@ func (st *SessionTracker) ActiveSessions() int {
 // SessionBoostQueueConfig holds configurable parameters for the standalone session boost queue.
 type SessionBoostQueueConfig struct {
 	// SessionIDHeader is the HTTP header name used to identify conversation sessions.
-	// Defaults to "X-Correlation-ID".
+	// Configured via the SESSION_BOOST_HEADER environment variable. If not set,
+	// session identification is disabled.
 	SessionIDHeader string
 
 	// SessionBoostTTL is the duration after which a session boost expires.
@@ -132,7 +133,7 @@ type SessionBoostQueueConfig struct {
 // DefaultSessionBoostQueueConfig returns default configuration for the session boost queue.
 func DefaultSessionBoostQueueConfig() SessionBoostQueueConfig {
 	return SessionBoostQueueConfig{
-		SessionIDHeader:          "X-Correlation-ID",
+		SessionIDHeader:          "", // Must be set via SESSION_BOOST_HEADER env var
 		SessionBoostTTL:          60 * time.Second,
 		SessionBoostGracePeriod:  50 * time.Millisecond,
 		BackpressurePollInterval: 100 * time.Millisecond,
@@ -220,13 +221,13 @@ func NewSessionBoostQueue(metricsInstance *metrics.Metrics, cfg SessionBoostQueu
 }
 
 // PushRequest adds a request to the session boost queue.
-// If the request's correlation ID matches a recently completed session, it is boosted.
+// If the request's session ID matches a recently completed session, it is boosted.
 func (q *SessionBoostQueue) PushRequest(r *Request) error {
 	q.mu.Lock()
 
-	// Check session boost: if this request's correlation ID has a recent completion,
+	// Check session boost: if this request's session ID has a recent completion,
 	// mark it as boosted so it gets priority in the queue.
-	if r.CorrelationID != "" && q.sessionTracker.HasRecentCompletion(r.CorrelationID) {
+	if r.SessionID != "" && q.sessionTracker.HasRecentCompletion(r.SessionID) {
 		r.SessionBoost = true
 	}
 
@@ -240,8 +241,8 @@ func (q *SessionBoostQueue) PushRequest(r *Request) error {
 	}
 
 	if r.SessionBoost {
-		klog.V(4).Infof("[SessionBoostQueue] session boost: reqID=%s correlationID=%s promoted, queueLen=%d",
-			r.ReqID, r.CorrelationID, queueLen)
+		klog.V(4).Infof("[SessionBoostQueue] session boost: reqID=%s sessionID=%s promoted, queueLen=%d",
+			r.ReqID, r.SessionID, queueLen)
 	}
 
 	// Signal that a new item is available
@@ -533,8 +534,8 @@ func (q *SessionBoostQueue) Close() {
 }
 
 // MarkSessionCompleted records that a request from the given session has completed.
-func (q *SessionBoostQueue) MarkSessionCompleted(correlationID string) {
-	q.sessionTracker.MarkCompleted(correlationID)
+func (q *SessionBoostQueue) MarkSessionCompleted(sessionID string) {
+	q.sessionTracker.MarkCompleted(sessionID)
 }
 
 // GetSessionTracker returns the session tracker.

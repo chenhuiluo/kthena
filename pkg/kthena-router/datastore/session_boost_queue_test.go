@@ -33,20 +33,20 @@ func TestSessionBoostQueue_BasicPriorityOrdering(t *testing.T) {
 	now := time.Now()
 
 	normalReq := &Request{
-		ReqID:         "req-normal",
-		UserID:        "user-A",
-		ModelName:     "model-1",
-		CorrelationID: "conv-999",
-		Priority:      1.0,
-		RequestTime:   now,
+		ReqID:       "req-normal",
+		UserID:      "user-A",
+		ModelName:   "model-1",
+		SessionID:   "conv-999",
+		Priority:    1.0,
+		RequestTime: now,
 	}
 	boostReq := &Request{
-		ReqID:         "req-boosted",
-		UserID:        "user-B",
-		ModelName:     "model-1",
-		CorrelationID: "conv-123",
-		Priority:      100.0,
-		RequestTime:   now.Add(time.Second),
+		ReqID:       "req-boosted",
+		UserID:      "user-B",
+		ModelName:   "model-1",
+		SessionID:   "conv-123",
+		Priority:    100.0,
+		RequestTime: now.Add(time.Second),
 	}
 
 	if err := q.PushRequest(normalReq); err != nil {
@@ -124,11 +124,11 @@ func TestSessionBoostQueue_BoostExpires(t *testing.T) {
 
 	now := time.Now()
 	req := &Request{
-		ReqID:         "req-1",
-		UserID:        "user-A",
-		ModelName:     "model-1",
-		CorrelationID: "conv-123",
-		RequestTime:   now,
+		ReqID:       "req-1",
+		UserID:      "user-A",
+		ModelName:   "model-1",
+		SessionID:   "conv-123",
+		RequestTime: now,
 	}
 	if err := q.PushRequest(req); err != nil {
 		t.Fatalf("PushRequest failed: %v", err)
@@ -153,10 +153,10 @@ func TestSessionBoostQueue_MultipleSessions(t *testing.T) {
 
 	now := time.Now()
 	requests := []*Request{
-		{ReqID: "normal-1", UserID: "u1", ModelName: "m", CorrelationID: "conv-X", RequestTime: now},
-		{ReqID: "boost-A", UserID: "u2", ModelName: "m", CorrelationID: "conv-A", RequestTime: now.Add(time.Millisecond)},
-		{ReqID: "boost-B", UserID: "u3", ModelName: "m", CorrelationID: "conv-B", RequestTime: now.Add(2 * time.Millisecond)},
-		{ReqID: "normal-2", UserID: "u4", ModelName: "m", CorrelationID: "", RequestTime: now.Add(3 * time.Millisecond)},
+		{ReqID: "normal-1", UserID: "u1", ModelName: "m", SessionID: "conv-X", RequestTime: now},
+		{ReqID: "boost-A", UserID: "u2", ModelName: "m", SessionID: "conv-A", RequestTime: now.Add(time.Millisecond)},
+		{ReqID: "boost-B", UserID: "u3", ModelName: "m", SessionID: "conv-B", RequestTime: now.Add(2 * time.Millisecond)},
+		{ReqID: "normal-2", UserID: "u4", ModelName: "m", SessionID: "", RequestTime: now.Add(3 * time.Millisecond)},
 	}
 
 	for _, r := range requests {
@@ -271,12 +271,12 @@ func TestSessionBoostQueue_GracePeriod_BoostedArrives(t *testing.T) {
 
 	now := time.Now()
 	req1 := &Request{
-		ReqID:         "req-1",
-		UserID:        "user-A",
-		ModelName:     "model-1",
-		CorrelationID: "session-1",
-		RequestTime:   now,
-		NotifyChan:    make(chan struct{}),
+		ReqID:       "req-1",
+		UserID:      "user-A",
+		ModelName:   "model-1",
+		SessionID:   "session-1",
+		RequestTime: now,
+		NotifyChan:  make(chan struct{}),
 	}
 	if err := q.PushRequest(req1); err != nil {
 		t.Fatalf("PushRequest failed: %v", err)
@@ -295,12 +295,12 @@ func TestSessionBoostQueue_GracePeriod_BoostedArrives(t *testing.T) {
 	// Mark session completed and push a non-boosted request
 	q.MarkSessionCompleted("session-1")
 	nonBoosted := &Request{
-		ReqID:         "req-non-boosted",
-		UserID:        "user-B",
-		ModelName:     "model-1",
-		CorrelationID: "other-session",
-		RequestTime:   now.Add(time.Millisecond),
-		NotifyChan:    make(chan struct{}),
+		ReqID:       "req-non-boosted",
+		UserID:      "user-B",
+		ModelName:   "model-1",
+		SessionID:   "other-session",
+		RequestTime: now.Add(time.Millisecond),
+		NotifyChan:  make(chan struct{}),
 	}
 	if err := q.PushRequest(nonBoosted); err != nil {
 		t.Fatalf("PushRequest failed: %v", err)
@@ -312,12 +312,12 @@ func TestSessionBoostQueue_GracePeriod_BoostedArrives(t *testing.T) {
 	// During grace, push a session-boosted follow-up
 	time.Sleep(20 * time.Millisecond)
 	boostedFollowUp := &Request{
-		ReqID:         "req-boosted-followup",
-		UserID:        "user-A",
-		ModelName:     "model-1",
-		CorrelationID: "session-1",
-		RequestTime:   now.Add(2 * time.Millisecond),
-		NotifyChan:    make(chan struct{}),
+		ReqID:       "req-boosted-followup",
+		UserID:      "user-A",
+		ModelName:   "model-1",
+		SessionID:   "session-1",
+		RequestTime: now.Add(2 * time.Millisecond),
+		NotifyChan:  make(chan struct{}),
 	}
 	if err := q.PushRequest(boostedFollowUp); err != nil {
 		t.Fatalf("PushRequest failed: %v", err)
@@ -407,20 +407,20 @@ func TestSessionBoostQueue_DirectMode(t *testing.T) {
 
 	now := time.Now()
 	normalReq := &Request{
-		ReqID:         "req-normal",
-		UserID:        "user-A",
-		ModelName:     "model-1",
-		CorrelationID: "other",
-		RequestTime:   now,
-		NotifyChan:    make(chan struct{}),
+		ReqID:       "req-normal",
+		UserID:      "user-A",
+		ModelName:   "model-1",
+		SessionID:   "other",
+		RequestTime: now,
+		NotifyChan:  make(chan struct{}),
 	}
 	boostReq := &Request{
-		ReqID:         "req-boosted",
-		UserID:        "user-B",
-		ModelName:     "model-1",
-		CorrelationID: "session-1",
-		RequestTime:   now.Add(time.Millisecond),
-		NotifyChan:    make(chan struct{}),
+		ReqID:       "req-boosted",
+		UserID:      "user-B",
+		ModelName:   "model-1",
+		SessionID:   "session-1",
+		RequestTime: now.Add(time.Millisecond),
+		NotifyChan:  make(chan struct{}),
 	}
 
 	if err := q.PushRequest(normalReq); err != nil {
@@ -492,7 +492,7 @@ func TestSessionBoostQueue_CancelledRequestsSkipped(t *testing.T) {
 	}
 }
 
-func TestSessionBoostQueue_EmptyCorrelationID(t *testing.T) {
+func TestSessionBoostQueue_EmptySessionID(t *testing.T) {
 	cfg := DefaultSessionBoostQueueConfig()
 	q := NewSessionBoostQueue(nil, cfg)
 	defer q.Close()
@@ -501,11 +501,11 @@ func TestSessionBoostQueue_EmptyCorrelationID(t *testing.T) {
 
 	now := time.Now()
 	req := &Request{
-		ReqID:         "req-1",
-		UserID:        "user-A",
-		ModelName:     "model-1",
-		CorrelationID: "", // No correlation ID
-		RequestTime:   now,
+		ReqID:       "req-1",
+		UserID:      "user-A",
+		ModelName:   "model-1",
+		SessionID:   "", // No session ID
+		RequestTime: now,
 	}
 
 	if err := q.PushRequest(req); err != nil {
@@ -517,7 +517,7 @@ func TestSessionBoostQueue_EmptyCorrelationID(t *testing.T) {
 		t.Fatalf("Pop failed: %v", err)
 	}
 	if popped.SessionBoost {
-		t.Error("Request without CorrelationID should not have SessionBoost")
+		t.Error("Request without SessionID should not have SessionBoost")
 	}
 }
 

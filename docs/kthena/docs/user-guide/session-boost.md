@@ -12,7 +12,7 @@ Without session boost, a follow-up request may be queued behind unrelated reques
 
 When session boost is enabled, the router does the following:
 
-1. Extracts the session identifier from the configured HTTP header (default: `X-Correlation-ID`).
+1. Extracts the session identifier from the HTTP header configured via `SESSION_BOOST_HEADER` environment variable.
 2. Checks whether the same session completed a request recently (within TTL).
 3. If yes, marks the new request as **boosted** and promotes it ahead of non-boosted requests in the queue.
 4. After a request completes, enters a brief **grace period** to give a potential follow-up from the same session time to arrive.
@@ -49,7 +49,7 @@ networking:
   kthenaRouter:
     sessionBoost:
       enabled: true
-      header: "X-Correlation-ID"
+      header: "X-Session-ID"
       ttl: "60s"
       gracePeriod: "50ms"
 ```
@@ -72,7 +72,7 @@ env:
 - name: ENABLE_SESSION_BOOST
   value: "true"
 - name: SESSION_BOOST_HEADER
-  value: "X-Correlation-ID"
+  value: "X-Session-ID"
 - name: SESSION_BOOST_TTL
   value: "60s"
 - name: SESSION_BOOST_GRACE_PERIOD
@@ -85,14 +85,14 @@ env:
 
 ## Configuration Reference
 
-| Environment Variable             | Purpose                                                                    | Default            | Notes                                                                                     |
-| -------------------------------- | -------------------------------------------------------------------------- | ------------------ | ----------------------------------------------------------------------------------------- |
-| `ENABLE_SESSION_BOOST`           | Enable the session boost queue                                             | `false`            | Global feature switch                                                                     |
-| `SESSION_BOOST_HEADER`           | HTTP header used to identify conversation sessions                         | `X-Correlation-ID` | Must match what your clients send                                                         |
-| `SESSION_BOOST_TTL`              | Duration after which a session's boost expires                             | `60s`              | Longer values help slow human conversations; shorter values suit fast automated pipelines |
-| `SESSION_BOOST_GRACE_PERIOD`     | Wait time after a request completes for a same-session follow-up to arrive | `50ms`             | Increase for slower clients; set to `0` to disable                                        |
-| `SESSION_BOOST_POLL_INTERVAL`    | Backend capacity polling interval                                          | `100ms`            | Lower values reduce latency but increase polling load                                     |
-| `SESSION_BOOST_INFLIGHT_PER_POD` | Maximum inflight requests per backend pod                                  | `1`                | Increase if your backend handles concurrent requests efficiently                          |
+| Environment Variable             | Purpose                                                                    | Default      | Notes                                                                                     |
+| -------------------------------- | -------------------------------------------------------------------------- | ------------ | ----------------------------------------------------------------------------------------- |
+| `ENABLE_SESSION_BOOST`           | Enable the session boost queue                                             | `false`      | Global feature switch                                                                     |
+| `SESSION_BOOST_HEADER`           | HTTP header used to identify conversation sessions                         | *(required)* | Must match what your clients send                                                         |
+| `SESSION_BOOST_TTL`              | Duration after which a session's boost expires                             | `60s`        | Longer values help slow human conversations; shorter values suit fast automated pipelines |
+| `SESSION_BOOST_GRACE_PERIOD`     | Wait time after a request completes for a same-session follow-up to arrive | `50ms`       | Increase for slower clients; set to `0` to disable                                        |
+| `SESSION_BOOST_POLL_INTERVAL`    | Backend capacity polling interval                                          | `100ms`      | Lower values reduce latency but increase polling load                                     |
+| `SESSION_BOOST_INFLIGHT_PER_POD` | Maximum inflight requests per backend pod                                  | `1`          | Increase if your backend handles concurrent requests efficiently                          |
 
 ## Client Integration
 
@@ -102,13 +102,13 @@ Clients must include the configured session header in their requests. All reques
 # Turn 1
 curl -X POST http://kthena-router/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "X-Correlation-ID: conv-abc-123" \
+  -H "X-Session-ID: conv-abc-123" \
   -d '{"model": "llama-3", "messages": [{"role": "user", "content": "Hello"}]}'
 
 # Turn 2 (same session)
 curl -X POST http://kthena-router/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "X-Correlation-ID: conv-abc-123" \
+  -H "X-Session-ID: conv-abc-123" \
   -d '{"model": "llama-3", "messages": [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi!"}, {"role": "user", "content": "Tell me about Kubernetes"}]}'
 ```
 
@@ -220,7 +220,7 @@ Send a multi-turn conversation and measure TTFT for the second turn:
 ### Requests are not being boosted
 
 Verify that:
-1. The client sends the configured header (default: `X-Correlation-ID`) with a consistent value across turns.
+1. The client sends the configured header (set via `SESSION_BOOST_HEADER`) with a consistent value across turns.
 2. The follow-up request arrives within `SESSION_BOOST_TTL` of the previous request's completion.
 3. `ENABLE_SESSION_BOOST` is set to `true` in the router environment.
 

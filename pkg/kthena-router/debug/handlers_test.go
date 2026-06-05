@@ -186,8 +186,8 @@ func (m *MockStore) GetSessionIDHeader() string {
 	return args.String(0)
 }
 
-func (m *MockStore) MarkSessionCompleted(modelName, correlationID string) {
-	m.Called(modelName, correlationID)
+func (m *MockStore) MarkSessionCompleted(modelName, sessionID string) {
+	m.Called(modelName, sessionID)
 }
 
 func (m *MockStore) GetRequestWaitingQueueStats() []datastore.QueueStat {
