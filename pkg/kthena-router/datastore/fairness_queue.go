@@ -89,16 +89,16 @@ func CalculateFairnessPriority(source FairnessPrioritySource, userID, modelName 
 
 // Request represents a request item in the priority queue
 type Request struct {
-	ReqID         string
-	UserID        string  // User ID for fairness scheduling
-	ModelName     string  // Target model for per-model fair queuing
-	SessionID string  // Session identifier for multi-turn conversations
-	Priority      float64 // Priority (lower value means higher priority)
-	SessionBoost  bool    // Whether this request has session priority boost (recently completed session)
-	RequestTime   time.Time
-	NotifyChan    chan struct{}
-	CancelCh      <-chan struct{} // Request-scoped cancellation signal
-	Release       func()          // Set by the queue when a permit is acquired
+	ReqID        string
+	UserID       string  // User ID for fairness scheduling
+	ModelName    string  // Target model for per-model fair queuing
+	SessionID    string  // Session identifier for multi-turn conversations
+	Priority     float64 // Priority (lower value means higher priority)
+	SessionBoost bool    // Whether this request has session priority boost (recently completed session)
+	RequestTime  time.Time
+	NotifyChan   chan struct{}
+	CancelCh     <-chan struct{} // Request-scoped cancellation signal
+	Release      func()          // Set by the queue when a permit is acquired
 }
 
 // RequestPriorityQueue implements the heap.Interface

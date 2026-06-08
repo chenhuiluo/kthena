@@ -381,6 +381,17 @@ func (q *SessionBoostQueue) runBackpressureMode(ctx context.Context) {
 		pollInterval, q.config.SessionBoostGracePeriod)
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+
+	if q.config.SessionBoostGracePeriod > 0 {
+		q.runBackpressureWithGrace(ctx, ticker)
+	} else {
+		q.runBackpressureNoGrace(ctx, ticker)
+	}
+}
+
+// runBackpressureNoGrace is the fast path when grace period is disabled (default).
+// Listens on notifyCh for immediate dequeue of freshly enqueued requests.
+func (q *SessionBoostQueue) runBackpressureNoGrace(ctx context.Context, ticker *time.Ticker) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -388,11 +399,27 @@ func (q *SessionBoostQueue) runBackpressureMode(ctx context.Context) {
 		case <-q.stopCh:
 			return
 		case <-q.releaseCh:
-			if q.config.SessionBoostGracePeriod > 0 {
-				q.waitGraceAndDequeue(ctx)
-			} else {
-				q.tryBackpressureDequeue(ctx)
-			}
+			q.tryBackpressureDequeue(ctx)
+		case <-q.notifyCh:
+			q.tryBackpressureDequeue(ctx)
+		case <-ticker.C:
+			q.tryBackpressureDequeue(ctx)
+		}
+	}
+}
+
+// runBackpressureWithGrace handles the case where grace period is configured.
+// Does NOT listen on notifyCh in the main select to avoid racing with the grace
+// period logic on releaseCh. The ticker serves as the backstop for new arrivals.
+func (q *SessionBoostQueue) runBackpressureWithGrace(ctx context.Context, ticker *time.Ticker) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-q.stopCh:
+			return
+		case <-q.releaseCh:
+			q.waitGraceAndDequeue(ctx)
 		case <-ticker.C:
 			q.tryBackpressureDequeue(ctx)
 		}
@@ -442,8 +469,10 @@ func (q *SessionBoostQueue) waitGraceAndDequeue(ctx context.Context) {
 	}
 }
 
-// tryBackpressureDequeue attempts to dequeue one request if both the inflight limit
-// and the backend capacity check pass.
+// tryBackpressureDequeue admits as many queued requests as possible in one pass,
+// stopping when the inflight limit is reached, backends report no capacity, or
+// the queue is empty. This avoids the one-request-per-tick bottleneck during
+// initial ramp-up and whenever spare capacity exists.
 func (q *SessionBoostQueue) tryBackpressureDequeue(ctx context.Context) {
 	perPod := q.config.InflightPerPod
 	if perPod <= 0 {
@@ -458,58 +487,60 @@ func (q *SessionBoostQueue) tryBackpressureDequeue(ctx context.Context) {
 		}
 	}
 
-	currentInflight := q.inflightCount.Load()
+	for {
+		currentInflight := q.inflightCount.Load()
 
-	if currentInflight >= maxInflight {
-		klog.V(4).Infof("[SessionBoostQueue] backpressure: inflight limit reached, inflight=%d maxInflight=%d pods=%d perPod=%d",
-			currentInflight, maxInflight, podCount, perPod)
-		return
-	}
+		if currentInflight >= maxInflight {
+			klog.V(4).Infof("[SessionBoostQueue] backpressure: inflight limit reached, inflight=%d maxInflight=%d pods=%d perPod=%d",
+				currentInflight, maxInflight, podCount, perPod)
+			return
+		}
 
-	if !q.backendChecker() {
+		if !q.backendChecker() {
+			q.mu.RLock()
+			queueLen := q.heap.Len()
+			q.mu.RUnlock()
+			klog.V(4).Infof("[SessionBoostQueue] backpressure: backend pods busy, holding dequeue. queueLen=%d inflight=%d pods=%d",
+				queueLen, currentInflight, podCount)
+			return
+		}
+
 		q.mu.RLock()
 		queueLen := q.heap.Len()
 		q.mu.RUnlock()
-		klog.V(4).Infof("[SessionBoostQueue] backpressure: backend pods busy, holding dequeue. queueLen=%d inflight=%d pods=%d",
-			queueLen, currentInflight, podCount)
-		return
-	}
+		if queueLen == 0 {
+			return
+		}
 
-	q.mu.RLock()
-	queueLen := q.heap.Len()
-	q.mu.RUnlock()
-	if queueLen == 0 {
-		return
-	}
+		req, err := q.popWhenAvailable(ctx)
+		if err != nil || req == nil {
+			return
+		}
 
-	req, err := q.popWhenAvailable(ctx)
-	if err != nil || req == nil {
-		return
-	}
+		q.inflightCount.Add(1)
+		releaseOnce := sync.Once{}
+		req.Release = func() {
+			releaseOnce.Do(func() {
+				q.inflightCount.Add(-1)
+				select {
+				case q.releaseCh <- struct{}{}:
+				default:
+				}
+				if q.metrics != nil {
+					q.metrics.DecSessionBoostQueueInflight(req.ModelName)
+				}
+			})
+		}
+		if q.metrics != nil {
+			q.metrics.IncSessionBoostQueueInflight(req.ModelName)
+		}
 
-	q.inflightCount.Add(1)
-	releaseOnce := sync.Once{}
-	req.Release = func() {
-		releaseOnce.Do(func() {
-			q.inflightCount.Add(-1)
-			select {
-			case q.releaseCh <- struct{}{}:
-			default:
-			}
-			if q.metrics != nil {
-				q.metrics.DecSessionBoostQueueInflight(req.ModelName)
-			}
-		})
-	}
-	if q.metrics != nil {
-		q.metrics.IncSessionBoostQueueInflight(req.ModelName)
-	}
+		klog.V(4).Infof("[SessionBoostQueue] backpressure dequeue: reqID=%s user=%s model=%s sessionBoost=%v inflight=%d/%d",
+			req.ReqID, req.UserID, req.ModelName, req.SessionBoost, q.inflightCount.Load(), maxInflight)
 
-	klog.V(4).Infof("[SessionBoostQueue] backpressure dequeue: reqID=%s user=%s model=%s sessionBoost=%v inflight=%d/%d",
-		req.ReqID, req.UserID, req.ModelName, req.SessionBoost, q.inflightCount.Load(), maxInflight)
-
-	if req.NotifyChan != nil {
-		close(req.NotifyChan)
+		if req.NotifyChan != nil {
+			close(req.NotifyChan)
+		}
 	}
 }
 

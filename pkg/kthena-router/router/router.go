@@ -1098,6 +1098,10 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 	var pri float64
 	if userId != "" {
 		pri = r.calculateRequestPriority(userId, modelName)
+	} else {
+		// Assign lowest priority to unauthenticated requests so they don't
+		// starve authenticated users (lower value = higher priority).
+		pri = math.MaxFloat64
 	}
 	queueReq := &datastore.Request{
 		ReqID:       requestID,
