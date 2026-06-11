@@ -45,6 +45,21 @@ import (
 	inferControllerUtils "github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
 )
 
+// MetricCollector 负责从目标 Pod 采集伸缩指标，支持两条路径：
+//
+// 路径1 — Pod 直采（默认推荐，延迟 ~1s）：
+//   HTTP GET http://<podIP>:<port>/<uri>，解析 Prometheus text exposition format
+//   适合：队列深度、GPU Cache 利用率、TTFT、TPOT 等秒级 SLO 指标
+//   Kthena 可以完全不依赖外部 Prometheus，仅靠 Pod 直采完成所有伸缩决策
+//
+// 路径2 — Prometheus 中转（辅助，延迟 15-30s）：
+//   查询 Prometheus Server 的 instant query API，支持 PromQL 聚合
+//   适合：rate(), histogram_quantile() 等需要跨 Pod 聚合的指标
+//
+// 直方图处理：
+//   对 HISTOGRAM 类型指标，保存快照到 SnapshotSlidingWindow（60s 新鲜，300s 过期），
+//   计算 QuantileInDiff(95, current, past) 得到增量 P95 延迟。
+//   冷启动问题：新 Pod 第一次抓取无历史快照，增量桶计数全为 0，分位数返回 0。
 type MetricCollector struct {
 	PastHistograms *datastructure.SnapshotSlidingWindow[map[string]HistogramInfo]
 	Target         *v1alpha1.Target
@@ -98,6 +113,16 @@ func GetMetricTargets(autoscalePolicy *v1alpha1.AutoscalingPolicy) algorithm.Met
 	return metricTargets
 }
 
+// UpdateMetrics 是指标采集的主入口，返回三种数据：
+//   - unreadyInstancesCount: 未就绪的 Pod 数量（用于推荐算法的未就绪补偿）
+//   - readyInstancesMetric:  所有就绪 Pod 的指标汇总（key=指标名, value=所有 Pod 之和）
+//   - externalMetrics:       来自 Prometheus 的外部指标（key=指标名, value=查询结果）
+//
+// 处理流程：
+//  1. planMetricSources() 将指标源分为 Pod 直采组和 Prometheus 查询组
+//  2. Prometheus 指标直接查询，放入 externalMetrics
+//  3. Pod 直采组按相同的 scrape 配置分组，每组调用 collectPodMetricsGroup()
+//  4. collectPodMetricsGroup() 发现 Pod、检查就绪性、HTTP 抓取、解析格式、汇总
 func (collector *MetricCollector) UpdateMetrics(
 	ctx context.Context,
 	podLister listerv1.PodLister,

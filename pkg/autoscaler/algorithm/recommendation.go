@@ -24,6 +24,23 @@ import (
 
 type Metrics = map[string]float64
 
+// RecommendedInstancesAlgorithm 是伸缩的第一阶段（推荐阶段）。
+// 回答的问题："在当前指标值下，需要多少个副本才能让每个副本的平均负载恰好等于目标值？"
+//
+// 两条计算路径：
+//   Instance 指标（每 Pod 维度，如 GPU Cache 利用率）：
+//     recommended = ceil( Σ(metric_value_i) / target )
+//     直觉：总负载 ÷ 单副本目标容量 = 需要的副本数
+//
+//   External 指标（全局维度，如 Prometheus 查询的系统级 QPS）：
+//     recommended = ceil( metric_value / target )
+//     直觉：全局需求量 ÷ 系统级目标 = 需要的副本数
+//
+// 关键设计点：
+//   - 容忍带 Tolerance：|ratio - 1.0| <= 0.10 内不伸缩（防抖静区）
+//   - 缺失 Pod 不对称处理：扩容方向悲观（按0贡献），缩容方向乐观（按目标值贡献）
+//   - 方向反转保护：修正后如果方向反了，直接保持当前值
+//   - 多指标取 max：确保任一 SLO 违规都触发扩容
 type RecommendedInstancesAlgorithm struct {
 	MinInstances          int32
 	MaxInstances          int32
@@ -35,6 +52,10 @@ type RecommendedInstancesAlgorithm struct {
 	ExternalMetrics       Metrics
 }
 
+// GetRecommendedInstances 执行推荐算法。
+// 返回 (recommendedInstances, skip)：
+//   - recommendedInstances: 推荐的副本数
+//   - skip=true: 当前状态在容忍带内或无有效指标，不需要伸缩（调用方应返回 -1）
 func (alg *RecommendedInstancesAlgorithm) GetRecommendedInstances() (recommendedInstances int32, skip bool) {
 	klog.InfoS("start to getRecommendedInstances", "args", alg)
 	if alg.CurrentInstancesCount < alg.MinInstances {
