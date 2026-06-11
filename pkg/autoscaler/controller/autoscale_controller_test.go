@@ -110,7 +110,7 @@ func TestToleranceHigh_then_DoScale_expect_NoUpdateActions(t *testing.T) {
 	pods := []*corev1.Pod{readyPod(ns, "pod-a", host, lbs)}
 	ac := &AutoscaleController{client: client, modelServingLister: msLister, podsLister: fakePodLister{podsByNs: map[string][]*corev1.Pod{ns: pods}}, scalerMap: map[string]*autoscalerAutoscaler{}, optimizerMap: map[string]*autoscalerOptimizer{}}
 
-	if err := ac.doScale(context.Background(), binding, policy); err != nil {
+	if _, err := ac.doScale(context.Background(), binding, policy); err != nil {
 		t.Fatalf("doScale error: %v", err)
 	}
 	if len(client.Fake.Actions()) != 0 {
@@ -138,7 +138,7 @@ func TestHighLoad_then_DoScale_expect_Replicas10(t *testing.T) {
 	pods := []*corev1.Pod{readyPod(ns, "pod-up", host, lbs)}
 	ac := &AutoscaleController{client: client, modelServingLister: msLister, podsLister: fakePodLister{podsByNs: map[string][]*corev1.Pod{ns: pods}}, scalerMap: map[string]*autoscalerAutoscaler{}, optimizerMap: map[string]*autoscalerOptimizer{}}
 
-	if err := ac.doScale(context.Background(), binding, policy); err != nil {
+	if _, err := ac.doScale(context.Background(), binding, policy); err != nil {
 		t.Fatalf("doScale error: %v", err)
 	}
 	updated, err := client.WorkloadV1alpha1().ModelServings(ns).Get(context.Background(), "ms-up", metav1.GetOptions{})
@@ -174,7 +174,7 @@ func TestTwoBackends_then_DoOptimize_expect_PatchActions(t *testing.T) {
 	pods := []*corev1.Pod{readyPod(ns, "pod-a", host, lbsA), readyPod(ns, "pod-b", host, lbsB)}
 	ac := &AutoscaleController{client: client, modelServingLister: msLister, podsLister: fakePodLister{podsByNs: map[string][]*corev1.Pod{ns: pods}}, scalerMap: map[string]*autoscalerAutoscaler{}, optimizerMap: map[string]*autoscalerOptimizer{}}
 
-	if err := ac.doOptimize(context.Background(), binding, policy); err != nil {
+	if _, err := ac.doOptimize(context.Background(), binding, policy); err != nil {
 		t.Fatalf("doOptimize error: %v", err)
 	}
 	updates := 0
@@ -212,7 +212,7 @@ func TestTwoBackendsHighLoad_then_DoOptimize_expect_DistributionA5B4(t *testing.
 	pods := []*corev1.Pod{readyPod(ns, "pod-a2", host, lbsA), readyPod(ns, "pod-b2", host, lbsB)}
 	ac := &AutoscaleController{client: client, modelServingLister: msLister, podsLister: fakePodLister{podsByNs: map[string][]*corev1.Pod{ns: pods}}, scalerMap: map[string]*autoscalerAutoscaler{}, optimizerMap: map[string]*autoscalerOptimizer{}}
 
-	if err := ac.doOptimize(context.Background(), binding, policy); err != nil {
+	if _, err := ac.doOptimize(context.Background(), binding, policy); err != nil {
 		t.Fatalf("doOptimize error: %v", err)
 	}
 	updatedA, err := client.WorkloadV1alpha1().ModelServings(ns).Get(context.Background(), "ms-a2", metav1.GetOptions{})
@@ -794,6 +794,104 @@ func TestPatchDoesNotMutateResourcesInFakeClient(t *testing.T) {
 			t.Logf("After patch: prefill CPU=%s, mem=%s | decode CPU=%s, mem=%s | image=%s",
 				gotPrefillCPU.String(), gotPrefillMem.String(),
 				gotDecodeCPU.String(), gotDecodeMem.String(), gotImage)
+		})
+	}
+}
+
+func TestComputeNextInterval(t *testing.T) {
+	tests := []struct {
+		name      string
+		direction int
+		want      time.Duration
+	}{
+		{"scale up positive", 3, 5 * time.Second},
+		{"scale up minimal", 1, 5 * time.Second},
+		{"scale down", -2, 30 * time.Second},
+		{"scale down minimal", -1, 30 * time.Second},
+		{"stable zero", 0, 15 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ac := &AutoscaleController{
+				syncPeriod:      15 * time.Second,
+				scaleUpPeriod:   5 * time.Second,
+				scaleDownPeriod: 30 * time.Second,
+			}
+			got := ac.computeNextInterval(tt.direction)
+			if got != tt.want {
+				t.Errorf("computeNextInterval(%d) = %v, want %v", tt.direction, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestApplySyncPolicy(t *testing.T) {
+	defaultSync := util.DefaultSyncPeriodSeconds * time.Second
+	defaultUp := util.ScaleUpSyncPeriodSeconds * time.Second
+	defaultDown := util.ScaleDownSyncPeriodSeconds * time.Second
+
+	tests := []struct {
+		name              string
+		policy            *workload.AutoscalingPolicy
+		wantSyncPeriod    time.Duration
+		wantScaleUpPeriod time.Duration
+		wantScaleDownPer  time.Duration
+	}{
+		{
+			name:              "nil syncPolicy uses defaults",
+			policy:            &workload.AutoscalingPolicy{},
+			wantSyncPeriod:    defaultSync,
+			wantScaleUpPeriod: defaultUp,
+			wantScaleDownPer:  defaultDown,
+		},
+		{
+			name: "partial config uses defaults for unset fields",
+			policy: &workload.AutoscalingPolicy{
+				Spec: workload.AutoscalingPolicySpec{
+					Behavior: workload.AutoscalingPolicyBehavior{
+						SyncPolicy: &workload.AutoscalingPolicySyncPolicy{
+							ScaleUpPeriod: &metav1.Duration{Duration: 3 * time.Second},
+						},
+					},
+				},
+			},
+			wantSyncPeriod:    defaultSync,
+			wantScaleUpPeriod: 3 * time.Second,
+			wantScaleDownPer:  defaultDown,
+		},
+		{
+			name: "full config overrides all defaults",
+			policy: &workload.AutoscalingPolicy{
+				Spec: workload.AutoscalingPolicySpec{
+					Behavior: workload.AutoscalingPolicyBehavior{
+						SyncPolicy: &workload.AutoscalingPolicySyncPolicy{
+							DefaultPeriod:   &metav1.Duration{Duration: 10 * time.Second},
+							ScaleUpPeriod:   &metav1.Duration{Duration: 2 * time.Second},
+							ScaleDownPeriod: &metav1.Duration{Duration: 60 * time.Second},
+						},
+					},
+				},
+			},
+			wantSyncPeriod:    10 * time.Second,
+			wantScaleUpPeriod: 2 * time.Second,
+			wantScaleDownPer:  60 * time.Second,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ac := &AutoscaleController{}
+			ac.applySyncPolicy(tt.policy)
+			if ac.syncPeriod != tt.wantSyncPeriod {
+				t.Errorf("syncPeriod = %v, want %v", ac.syncPeriod, tt.wantSyncPeriod)
+			}
+			if ac.scaleUpPeriod != tt.wantScaleUpPeriod {
+				t.Errorf("scaleUpPeriod = %v, want %v", ac.scaleUpPeriod, tt.wantScaleUpPeriod)
+			}
+			if ac.scaleDownPeriod != tt.wantScaleDownPer {
+				t.Errorf("scaleDownPeriod = %v, want %v", ac.scaleDownPeriod, tt.wantScaleDownPer)
+			}
 		})
 	}
 }

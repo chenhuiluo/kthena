@@ -35,7 +35,6 @@ import (
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	listerv1 "k8s.io/client-go/listers/core/v1"
@@ -59,6 +58,9 @@ type AutoscaleController struct {
 	podsInformer                       cache.Controller
 	scalerMap                          map[string]*autoscaler.Autoscaler
 	optimizerMap                       map[string]*autoscaler.Optimizer
+	syncPeriod                         time.Duration
+	scaleUpPeriod                      time.Duration
+	scaleDownPeriod                    time.Duration
 }
 
 func NewAutoscaleController(kubeClient kubernetes.Interface, client clientset.Interface) *AutoscaleController {
@@ -91,6 +93,9 @@ func NewAutoscaleController(kubeClient kubernetes.Interface, client clientset.In
 		podsInformer:                       podsInformer.Informer(),
 		scalerMap:                          make(map[string]*autoscaler.Autoscaler),
 		optimizerMap:                       make(map[string]*autoscaler.Optimizer),
+		syncPeriod:                         util.DefaultSyncPeriodSeconds * time.Second,
+		scaleUpPeriod:                      util.ScaleUpSyncPeriodSeconds * time.Second,
+		scaleDownPeriod:                    util.ScaleDownSyncPeriodSeconds * time.Second,
 	}
 	return ac
 }
@@ -111,24 +116,31 @@ func (ac *AutoscaleController) Run(ctx context.Context) {
 	)
 
 	klog.Info("start autoscale controller")
-	go wait.Until(func() {
-		ac.Reconcile(ctx)
-	}, util.AutoscalingSyncPeriodSeconds*time.Second, nil)
-
-	<-ctx.Done()
-	klog.Info("shut down autoscale controller")
+	interval := ac.syncPeriod
+	for {
+		select {
+		case <-ctx.Done():
+			klog.Info("shut down autoscale controller")
+			return
+		case <-time.After(interval):
+			direction := ac.Reconcile(ctx)
+			interval = ac.computeNextInterval(direction)
+			klog.V(2).InfoS("adaptive reconcile interval", "interval", interval, "direction", direction)
+		}
+	}
 }
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-func (ac *AutoscaleController) Reconcile(ctx context.Context) {
+// Returns the net scaling direction: >0 scale-up, <0 scale-down, 0 no change.
+func (ac *AutoscaleController) Reconcile(ctx context.Context) int {
 	klog.V(4).Info("start to reconcile")
 	ctx, cancel := context.WithTimeout(ctx, util.AutoscaleCtxTimeoutSeconds*time.Second)
 	defer cancel()
 	bindings, err := ac.autoscalingPoliciesBindingLister.List(labels.Everything())
 	if err != nil {
 		klog.Errorf("failed to list autoscaling policy bindings, err: %v", err)
-		return
+		return 0
 	}
 
 	scalerSet := sets.New[string]()
@@ -161,13 +173,16 @@ func (ac *AutoscaleController) Reconcile(ctx context.Context) {
 		}
 	}
 
+	totalDirection := 0
 	for _, binding := range bindings {
-		err := ac.schedule(ctx, binding)
+		dir, err := ac.schedule(ctx, binding)
 		if err != nil {
-			klog.Errorf("failed to process autoscale,err: %v", err)
+			klog.Errorf("failed to process autoscale, err: %v", err)
 			continue
 		}
+		totalDirection += dir
 	}
+	return totalDirection
 }
 
 func (ac *AutoscaleController) updateTargetReplicas(ctx context.Context, target *workload.Target, defaultNamespace string, replicas int32) error {
@@ -248,31 +263,37 @@ func (ac *AutoscaleController) getTargetReplicas(target *workload.Target, defaul
 	return 0, fmt.Errorf("target ref kind %s, name: %s not supported", targetRef.Kind, targetRef.Name)
 }
 
-func (ac *AutoscaleController) schedule(ctx context.Context, binding *workload.AutoscalingPolicyBinding) error {
+func (ac *AutoscaleController) schedule(ctx context.Context, binding *workload.AutoscalingPolicyBinding) (int, error) {
 	klog.V(2).Infof("start to process asp binding %s", klog.KObj(binding))
 	autoscalePolicy, err := ac.getAutoscalePolicy(binding.Spec.PolicyRef.Name, binding.Namespace)
 	if err != nil {
 		klog.Errorf("get autoscale policy error: %v", err)
-		return err
+		return 0, err
 	}
+	ac.applySyncPolicy(autoscalePolicy)
+
 	if binding.Spec.HeterogeneousTarget != nil {
-		if err := ac.doOptimize(ctx, binding, autoscalePolicy); err != nil {
+		dir, err := ac.doOptimize(ctx, binding, autoscalePolicy)
+		if err != nil {
 			klog.Errorf("failed to do optimize, err: %v", err)
-			return err
+			return 0, err
 		}
+		return dir, nil
 	} else if binding.Spec.HomogeneousTarget != nil {
-		if err := ac.doScale(ctx, binding, autoscalePolicy); err != nil {
+		dir, err := ac.doScale(ctx, binding, autoscalePolicy)
+		if err != nil {
 			klog.Errorf("failed to do scale, err: %v", err)
-			return err
+			return 0, err
 		}
+		return dir, nil
 	} else {
 		klog.Warningf("binding %s has no scalingConfiguration and optimizerConfiguration", binding.Name)
 	}
 
-	return nil
+	return 0, nil
 }
 
-func (ac *AutoscaleController) doOptimize(ctx context.Context, binding *workload.AutoscalingPolicyBinding, autoscalePolicy *workload.AutoscalingPolicy) error {
+func (ac *AutoscaleController) doOptimize(ctx context.Context, binding *workload.AutoscalingPolicyBinding, autoscalePolicy *workload.AutoscalingPolicy) (int, error) {
 	key := formatAutoscalerMapKey(binding.Namespace, binding.Name, nil)
 	optimizer, ok := ac.optimizerMap[key]
 	if !ok || optimizer.NeedUpdate(autoscalePolicy, binding) {
@@ -286,7 +307,7 @@ func (ac *AutoscaleController) doOptimize(ctx context.Context, binding *workload
 		currentInstancesCount, err := ac.getTargetReplicas(&param.Target, binding.Namespace)
 		if err != nil {
 			klog.Errorf("failed to get current replicas, err: %v", err)
-			return err
+			return 0, err
 		}
 		replicasMap[param.Target.TargetRef.Name] = currentInstancesCount
 	}
@@ -295,8 +316,18 @@ func (ac *AutoscaleController) doOptimize(ctx context.Context, binding *workload
 	recommendedInstances, err := optimizer.Optimize(ctx, ac.podsLister, autoscalePolicy, replicasMap)
 	if err != nil {
 		klog.Errorf("failed to do optimize, err: %v", err)
-		return err
+		return 0, err
 	}
+	// Compute direction
+	var currentSum, recommendedSum int32
+	for _, v := range replicasMap {
+		currentSum += v
+	}
+	for _, v := range recommendedInstances {
+		recommendedSum += v
+	}
+	direction := int(recommendedSum - currentSum)
+
 	// Do update replicas
 	for _, param := range optimizer.Meta.Config.Params {
 		instancesCount, exists := recommendedInstances[param.Target.TargetRef.Name]
@@ -306,14 +337,14 @@ func (ac *AutoscaleController) doOptimize(ctx context.Context, binding *workload
 		}
 		if err := ac.updateTargetReplicas(ctx, &param.Target, binding.Namespace, instancesCount); err != nil {
 			klog.Errorf("failed to update target kind:%s name: %s replicas:%d, err: %v", param.Target.TargetRef.Kind, param.Target.TargetRef.Name, instancesCount, err)
-			return err
+			return 0, err
 		}
 	}
 
-	return nil
+	return direction, nil
 }
 
-func (ac *AutoscaleController) doScale(ctx context.Context, binding *workload.AutoscalingPolicyBinding, autoscalePolicy *workload.AutoscalingPolicy) error {
+func (ac *AutoscaleController) doScale(ctx context.Context, binding *workload.AutoscalingPolicyBinding, autoscalePolicy *workload.AutoscalingPolicy) (int, error) {
 	target := binding.Spec.HomogeneousTarget.Target
 	key := formatAutoscalerMapKey(binding.Namespace, binding.Name, &target.TargetRef)
 	scaler, ok := ac.scalerMap[key]
@@ -326,25 +357,26 @@ func (ac *AutoscaleController) doScale(ctx context.Context, binding *workload.Au
 	currentInstancesCount, err := ac.getTargetReplicas(&target, binding.Namespace)
 	if err != nil {
 		klog.Errorf("failed to get current replicas, err: %v", err)
-		return err
+		return 0, err
 	}
 	// Get recommended replicas
 	klog.InfoS("do homogeneous scaling for target", "targetRef", target.TargetRef, "currentInstancesCount", currentInstancesCount)
 	recommendedInstances, err := scaler.Scale(ctx, ac.podsLister, autoscalePolicy, currentInstancesCount)
 	if err != nil {
 		klog.Errorf("failed to do homogeneous scaling for target %s, err: %v", target.TargetRef.Name, err)
-		return err
+		return 0, err
 	}
 	if recommendedInstances < 0 {
-		return nil
+		return 0, nil
 	}
+	direction := int(recommendedInstances - currentInstancesCount)
 	// Do update replicas
 	if err := ac.updateTargetReplicas(ctx, &target, binding.Namespace, recommendedInstances); err != nil {
 		klog.Errorf("failed to update target replicas %s, err: %v", target.TargetRef.Name, err)
-		return err
+		return 0, err
 	}
 	klog.InfoS("successfully update target replicas", "targetRef", target.TargetRef, "recommendedInstances", recommendedInstances)
-	return nil
+	return direction, nil
 }
 
 func (ac *AutoscaleController) getAutoscalePolicy(autoscalingPolicyName string, namespace string) (*workload.AutoscalingPolicy, error) {
@@ -370,4 +402,44 @@ func formatAutoscalerMapKey(bindingNamespace, bindingName string, targetRef *cor
 		key += "/" + targetNamespace + "/" + targetKind + "/" + targetRef.Name
 	}
 	return key
+}
+
+// applySyncPolicy updates the controller's reconcile intervals from the Policy's syncPolicy.
+// Fields left unset in the CR use compiled-in defaults.
+func (ac *AutoscaleController) applySyncPolicy(policy *workload.AutoscalingPolicy) {
+	sp := policy.Spec.Behavior.SyncPolicy
+	if sp == nil {
+		ac.syncPeriod = util.DefaultSyncPeriodSeconds * time.Second
+		ac.scaleUpPeriod = util.ScaleUpSyncPeriodSeconds * time.Second
+		ac.scaleDownPeriod = util.ScaleDownSyncPeriodSeconds * time.Second
+		return
+	}
+	if sp.DefaultPeriod != nil {
+		ac.syncPeriod = sp.DefaultPeriod.Duration
+	} else {
+		ac.syncPeriod = util.DefaultSyncPeriodSeconds * time.Second
+	}
+	if sp.ScaleUpPeriod != nil {
+		ac.scaleUpPeriod = sp.ScaleUpPeriod.Duration
+	} else {
+		ac.scaleUpPeriod = util.ScaleUpSyncPeriodSeconds * time.Second
+	}
+	if sp.ScaleDownPeriod != nil {
+		ac.scaleDownPeriod = sp.ScaleDownPeriod.Duration
+	} else {
+		ac.scaleDownPeriod = util.ScaleDownSyncPeriodSeconds * time.Second
+	}
+}
+
+// computeNextInterval returns the next reconcile interval based on the net scaling direction:
+// >0 scale-up, <0 scale-down, 0 stable.
+func (ac *AutoscaleController) computeNextInterval(direction int) time.Duration {
+	switch {
+	case direction > 0:
+		return ac.scaleUpPeriod
+	case direction < 0:
+		return ac.scaleDownPeriod
+	default:
+		return ac.syncPeriod
+	}
 }

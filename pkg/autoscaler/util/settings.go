@@ -17,7 +17,9 @@ limitations under the License.
 package util
 
 const (
-	AutoscalingSyncPeriodSeconds    = 15
+	DefaultSyncPeriodSeconds        = 15
+	ScaleUpSyncPeriodSeconds        = 5
+	ScaleDownSyncPeriodSeconds      = 30
 	SloQuantileSlidingWindowSeconds = 60
 	SloQuantileDataKeepSeconds      = 300
 	SloQuantilePercentile           = 95

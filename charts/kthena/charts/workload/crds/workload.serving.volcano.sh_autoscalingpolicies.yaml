@@ -163,6 +163,29 @@ spec:
                             type: string
                         type: object
                     type: object
+                  syncPolicy:
+                    description: |-
+                      SyncPolicy configures adaptive reconcile intervals based on scaling direction.
+                      When unset, defaults are used: defaultPeriod=15s, scaleUpPeriod=5s, scaleDownPeriod=30s.
+                    properties:
+                      defaultPeriod:
+                        default: 15s
+                        description: DefaultPeriod is the reconcile interval when
+                          no scaling is needed.
+                        type: string
+                      scaleDownPeriod:
+                        default: 30s
+                        description: |-
+                          ScaleDownPeriod is the reconcile interval during scale-down.
+                          Longer intervals reduce API Server load and prevent premature scale-back.
+                        type: string
+                      scaleUpPeriod:
+                        default: 5s
+                        description: |-
+                          ScaleUpPeriod is the reconcile interval during scale-up.
+                          Shorter intervals accelerate replica provisioning.
+                        type: string
+                    type: object
                 type: object
               metrics:
                 description: Metrics defines the list of metrics used to evaluate
