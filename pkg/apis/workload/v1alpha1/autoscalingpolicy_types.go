@@ -57,7 +57,8 @@ type AutoscalingPolicyBehavior struct {
 	// +optional
 	ScaleDown AutoscalingPolicyStablePolicy `json:"scaleDown"`
 	// SyncPolicy configures adaptive reconcile intervals based on scaling direction.
-	// When unset, defaults are used: defaultPeriod=15s, scaleUpPeriod=5s, scaleDownPeriod=30s.
+	// When unset, compiled-in defaults are used (currently 15s/5s/30s — see
+	// pkg/autoscaler/util constants for authoritative values).
 	// +optional
 	SyncPolicy *AutoscalingPolicySyncPolicy `json:"syncPolicy,omitempty"`
 }
