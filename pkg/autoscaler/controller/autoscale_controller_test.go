@@ -83,7 +83,7 @@ func readyPod(ns, name, ip string, lbs map[string]string) *corev1.Pod {
 	}
 }
 
-func newModelServingIndexer(objs ...interface{}) cache.Indexer {
+func newObjectIndexer(objs ...interface{}) cache.Indexer {
 	idx := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 	for _, o := range objs {
 		_ = idx.Add(o)
@@ -95,7 +95,7 @@ func TestToleranceHigh_then_DoScale_expect_NoUpdateActions(t *testing.T) {
 	ns := "ns"
 	ms := &workload.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "ms-a", Namespace: ns}, Spec: workload.ModelServingSpec{Replicas: ptrInt32(3)}}
 	client := clientfake.NewSimpleClientset(ms)
-	msLister := workloadLister.NewModelServingLister(newModelServingIndexer(ms))
+	msLister := workloadLister.NewModelServingLister(newObjectIndexer(ms))
 
 	srv := httptest.NewServer(httpHandlerWithBody("load 1\n"))
 	defer srv.Close()
@@ -123,7 +123,7 @@ func TestHighLoad_then_DoScale_expect_Replicas10(t *testing.T) {
 	ns := "ns"
 	ms := &workload.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "ms-up", Namespace: ns}, Spec: workload.ModelServingSpec{Replicas: ptrInt32(1)}}
 	client := clientfake.NewSimpleClientset(ms)
-	msLister := workloadLister.NewModelServingLister(newModelServingIndexer(ms))
+	msLister := workloadLister.NewModelServingLister(newObjectIndexer(ms))
 
 	srv := httptest.NewServer(httpHandlerWithBody("# TYPE load gauge\nload 10\n"))
 	defer srv.Close()
@@ -156,7 +156,7 @@ func TestTwoBackends_then_DoOptimize_expect_PatchActions(t *testing.T) {
 	msA := &workload.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "ms-a", Namespace: ns}, Spec: workload.ModelServingSpec{Replicas: ptrInt32(1)}}
 	msB := &workload.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "ms-b", Namespace: ns}, Spec: workload.ModelServingSpec{Replicas: ptrInt32(2)}}
 	client := clientfake.NewSimpleClientset(msA, msB)
-	msLister := workloadLister.NewModelServingLister(newModelServingIndexer(msA, msB))
+	msLister := workloadLister.NewModelServingLister(newObjectIndexer(msA, msB))
 
 	srv := httptest.NewServer(httpHandlerWithBody("# TYPE load gauge\nload 10\n"))
 	defer srv.Close()
@@ -194,7 +194,7 @@ func TestTwoBackendsHighLoad_then_DoOptimize_expect_DistributionA5B4(t *testing.
 	msA := &workload.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "ms-a2", Namespace: ns}, Spec: workload.ModelServingSpec{Replicas: ptrInt32(1)}}
 	msB := &workload.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "ms-b2", Namespace: ns}, Spec: workload.ModelServingSpec{Replicas: ptrInt32(2)}}
 	client := clientfake.NewSimpleClientset(msA, msB)
-	msLister := workloadLister.NewModelServingLister(newModelServingIndexer(msA, msB))
+	msLister := workloadLister.NewModelServingLister(newObjectIndexer(msA, msB))
 
 	srv := httptest.NewServer(httpHandlerWithBody("# TYPE load gauge\nload 100\n"))
 	defer srv.Close()
@@ -398,7 +398,7 @@ func TestPatchReplicasDoesNotTouchResourceLimits(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fakeClient := clientfake.NewSimpleClientset(ms.DeepCopy())
-			msLister := workloadLister.NewModelServingLister(newModelServingIndexer(ms.DeepCopy()))
+			msLister := workloadLister.NewModelServingLister(newObjectIndexer(ms.DeepCopy()))
 
 			ac := &AutoscaleController{
 				client:             fakeClient,
@@ -504,7 +504,7 @@ func TestPatchRoleReplicasPreservesOtherRoles(t *testing.T) {
 	}
 
 	fakeClient := clientfake.NewSimpleClientset(ms.DeepCopy())
-	msLister := workloadLister.NewModelServingLister(newModelServingIndexer(ms.DeepCopy()))
+	msLister := workloadLister.NewModelServingLister(newObjectIndexer(ms.DeepCopy()))
 
 	ac := &AutoscaleController{
 		client:             fakeClient,
@@ -602,7 +602,7 @@ func TestPatchSkipsWhenReplicasUnchanged(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fakeClient := clientfake.NewSimpleClientset(ms.DeepCopy())
-			msLister := workloadLister.NewModelServingLister(newModelServingIndexer(ms.DeepCopy()))
+			msLister := workloadLister.NewModelServingLister(newObjectIndexer(ms.DeepCopy()))
 
 			ac := &AutoscaleController{
 				client:             fakeClient,
@@ -729,7 +729,7 @@ func TestPatchDoesNotMutateResourcesInFakeClient(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Fresh fake client for each subtest with the original object
 			fakeClient := clientfake.NewSimpleClientset(ms.DeepCopy())
-			msLister := workloadLister.NewModelServingLister(newModelServingIndexer(ms.DeepCopy()))
+			msLister := workloadLister.NewModelServingLister(newObjectIndexer(ms.DeepCopy()))
 
 			ac := &AutoscaleController{
 				client:             fakeClient,
@@ -980,14 +980,6 @@ func TestNextIntervalAggregation(t *testing.T) {
 	}
 }
 
-func newBindingIndexer(objs ...interface{}) cache.Indexer {
-	idx := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
-	for _, o := range objs {
-		_ = idx.Add(o)
-	}
-	return idx
-}
-
 // TestReconcileInterval exercises AutoscaleController.Reconcile end-to-end,
 // verifying that the returned interval reflects the minimum across all bindings.
 // This catches regressions if the production Reconcile logic changes.
@@ -1084,9 +1076,9 @@ func TestReconcileInterval(t *testing.T) {
 	}
 
 	fakeClient := clientfake.NewSimpleClientset(msStable, msUp)
-	msLister := workloadLister.NewModelServingLister(newModelServingIndexer(msStable, msUp))
-	bindingLister := workloadLister.NewAutoscalingPolicyBindingLister(newBindingIndexer(bindingStable, bindingUp))
-	policyLister := workloadLister.NewAutoscalingPolicyLister(newBindingIndexer(policyUp, policyStable))
+	msLister := workloadLister.NewModelServingLister(newObjectIndexer(msStable, msUp))
+	bindingLister := workloadLister.NewAutoscalingPolicyBindingLister(newObjectIndexer(bindingStable, bindingUp))
+	policyLister := workloadLister.NewAutoscalingPolicyLister(newObjectIndexer(policyUp, policyStable))
 
 	pods := []*corev1.Pod{
 		readyPod(ns, "pod-stable", stableU.Hostname(), map[string]string{}),
