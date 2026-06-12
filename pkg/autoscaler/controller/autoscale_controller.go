@@ -345,14 +345,14 @@ func (ac *AutoscaleController) doOptimize(ctx context.Context, binding *workload
 	}
 	// Compute direction — compare only targets that exist in both
 	// replicasMap and recommendedInstances, matching the update loop below.
-	var currentSum, recommendedSum int32
+	var currentSum, recommendedSum int64
 	for name, current := range replicasMap {
 		if recommended, ok := recommendedInstances[name]; ok {
-			currentSum += current
-			recommendedSum += recommended
+			currentSum += int64(current)
+			recommendedSum += int64(recommended)
 		}
 	}
-	direction := int64(recommendedSum) - int64(currentSum)
+	direction := recommendedSum - currentSum
 
 	// Do update replicas
 	for _, param := range optimizer.Meta.Config.Params {
