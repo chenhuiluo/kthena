@@ -933,7 +933,7 @@ func TestClampWarningsResetOnPolicyReResolve(t *testing.T) {
 		policyVersions: make(map[string]string),
 	}
 	policy := &workload.AutoscalingPolicy{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "policy-a", ResourceVersion: "1"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "policy-a", Generation: 1},
 		Spec: workload.AutoscalingPolicySpec{
 			Behavior: workload.AutoscalingPolicyBehavior{
 				SyncPolicy: &workload.AutoscalingPolicySyncPolicy{
@@ -950,17 +950,84 @@ func TestClampWarningsResetOnPolicyReResolve(t *testing.T) {
 		t.Fatalf("expected clampWarnings to contain %q after first resolve", warnKey)
 	}
 
-	// Second resolve with same ResourceVersion: key stays, no re-warning.
+	// Second resolve with same Generation: key stays, no re-warning.
 	_ = ac.resolveSyncPolicy(policy)
 	if !ac.clampWarnings.Has(warnKey) {
 		t.Fatalf("expected clampWarnings to still contain %q — key should not be cleared for same version", warnKey)
 	}
 
-	// Third resolve after policy update (new ResourceVersion): keys cleared, warning re-fires.
-	policy.ResourceVersion = "2"
+	// Third resolve after policy update (new Generation): keys cleared, warning re-fires.
+	policy.Generation = 2
 	_ = ac.resolveSyncPolicy(policy)
 	if !ac.clampWarnings.Has(warnKey) {
 		t.Fatalf("expected clampWarnings to contain %q after policy update (key should be re-inserted)", warnKey)
+	}
+}
+
+func TestStalePolicyTrackingPrune(t *testing.T) {
+	ac := &AutoscaleController{
+		clampWarnings:  sets.New[string](),
+		policyVersions: make(map[string]string),
+		scalerMap:      make(map[string]*autoscaler.Autoscaler),
+		optimizerMap:   make(map[string]*autoscaler.Optimizer),
+	}
+
+	// Simulate two policies being resolved.
+	policy1 := &workload.AutoscalingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "p1", Generation: 1},
+		Spec: workload.AutoscalingPolicySpec{
+			Behavior: workload.AutoscalingPolicyBehavior{
+				SyncPolicy: &workload.AutoscalingPolicySyncPolicy{
+					ScaleUpPeriod: &metav1.Duration{Duration: 0},
+				},
+			},
+		},
+	}
+	policy2 := &workload.AutoscalingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "p2", Generation: 1},
+		Spec: workload.AutoscalingPolicySpec{
+			Behavior: workload.AutoscalingPolicyBehavior{
+				SyncPolicy: &workload.AutoscalingPolicySyncPolicy{
+					ScaleDownPeriod: &metav1.Duration{Duration: 0},
+				},
+			},
+		},
+	}
+	_ = ac.resolveSyncPolicy(policy1)
+	_ = ac.resolveSyncPolicy(policy2)
+
+	if len(ac.policyVersions) != 2 {
+		t.Fatalf("expected 2 policyVersions entries, got %d", len(ac.policyVersions))
+	}
+	if ac.clampWarnings.Len() != 2 {
+		t.Fatalf("expected 2 clampWarnings entries, got %d", ac.clampWarnings.Len())
+	}
+
+	// Now prune: only p1 is active (p2's binding was deleted).
+	activePolicies := sets.New[string]("ns/p1")
+	for key := range ac.policyVersions {
+		if !activePolicies.Has(key) {
+			delete(ac.policyVersions, key)
+			prefix := key + "/"
+			for _, k := range ac.clampWarnings.UnsortedList() {
+				if strings.HasPrefix(k, prefix) {
+					ac.clampWarnings.Delete(k)
+				}
+			}
+		}
+	}
+
+	if _, ok := ac.policyVersions["ns/p2"]; ok {
+		t.Fatal("expected ns/p2 to be pruned from policyVersions")
+	}
+	if ac.clampWarnings.Has("ns/p2/scaleDownPeriod") {
+		t.Fatal("expected ns/p2 clampWarning to be pruned")
+	}
+	if _, ok := ac.policyVersions["ns/p1"]; !ok {
+		t.Fatal("expected ns/p1 to remain in policyVersions")
+	}
+	if !ac.clampWarnings.Has("ns/p1/scaleUpPeriod") {
+		t.Fatal("expected ns/p1 clampWarning to remain")
 	}
 }
 

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/volcano-sh/kthena/pkg/autoscaler/autoscaler"
@@ -171,6 +172,7 @@ func (ac *AutoscaleController) reconcileOnce(ctx context.Context) time.Duration 
 
 	scalerSet := sets.New[string]()
 	optimizerSet := sets.New[string]()
+	activePolicies := sets.New[string]()
 
 	for _, binding := range bindings {
 		policyName := binding.Spec.PolicyRef.Name
@@ -178,6 +180,8 @@ func (ac *AutoscaleController) reconcileOnce(ctx context.Context) time.Duration 
 			klog.Warningf("invalid autoscaling policy name, binding name: %s", binding.Name)
 			continue
 		}
+		policyKey := binding.Namespace + "/" + policyName
+		activePolicies.Insert(policyKey)
 		if binding.Spec.HomogeneousTarget != nil {
 			scalerSet.Insert(formatAutoscalerMapKey(binding.Namespace, binding.Name, &binding.Spec.HomogeneousTarget.Target.TargetRef))
 		} else if binding.Spec.HeterogeneousTarget != nil {
@@ -196,6 +200,19 @@ func (ac *AutoscaleController) reconcileOnce(ctx context.Context) time.Duration 
 	for key := range ac.optimizerMap {
 		if !optimizerSet.Has(key) {
 			delete(ac.optimizerMap, key)
+		}
+	}
+
+	// Prune stale policy tracking entries.
+	for key := range ac.policyVersions {
+		if !activePolicies.Has(key) {
+			delete(ac.policyVersions, key)
+			prefix := key + "/"
+			for _, k := range ac.clampWarnings.UnsortedList() {
+				if strings.HasPrefix(k, prefix) {
+					ac.clampWarnings.Delete(k)
+				}
+			}
 		}
 	}
 
@@ -464,17 +481,17 @@ type syncPeriods struct {
 // warning once per policy+field (re-logged only when the policy spec changes).
 func (ac *AutoscaleController) resolveSyncPolicy(policy *workload.AutoscalingPolicy) syncPeriods {
 	policyKey := policy.Namespace + "/" + policy.Name
-	rv := policy.ResourceVersion
-	prevRV := ac.policyVersions[policyKey]
-	if prevRV != "" && prevRV != rv {
+	gen := fmt.Sprintf("%d", policy.Generation)
+	prevGen := ac.policyVersions[policyKey]
+	if prevGen != "" && prevGen != gen {
 		prefix := policyKey + "/"
 		for _, k := range ac.clampWarnings.UnsortedList() {
-			if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			if strings.HasPrefix(k, prefix) {
 				ac.clampWarnings.Delete(k)
 			}
 		}
 	}
-	ac.policyVersions[policyKey] = rv
+	ac.policyVersions[policyKey] = gen
 	sp := policy.Spec.Behavior.SyncPolicy
 	if sp == nil {
 		return syncPeriods{
