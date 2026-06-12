@@ -828,7 +828,6 @@ func TestResolveSyncPolicy(t *testing.T) {
 	defaultSync := util.DefaultSyncPeriodSeconds * time.Second
 	defaultUp := util.ScaleUpSyncPeriodSeconds * time.Second
 	defaultDown := util.ScaleDownSyncPeriodSeconds * time.Second
-	minReconcileInterval := 1 * time.Second
 
 	tests := []struct {
 		name              string
