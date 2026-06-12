@@ -429,7 +429,7 @@ type syncPeriods struct {
 
 // resolveSyncPolicy derives reconcile intervals from the Policy's syncPolicy.
 // Fields left unset in the CR use compiled-in defaults. Durations below
-// minReconcileInterval are clamped and a warning is logged.
+// minReconcileInterval are clamped to minReconcileInterval and a warning is logged.
 func resolveSyncPolicy(policy *workload.AutoscalingPolicy) syncPeriods {
 	sp := policy.Spec.Behavior.SyncPolicy
 	if sp == nil {
@@ -447,15 +447,16 @@ func resolveSyncPolicy(policy *workload.AutoscalingPolicy) syncPeriods {
 }
 
 // applyOrDefault returns the duration from d if set and >= minReconcileInterval,
-// or falls back to defaultSeconds. Logs a warning when clamping.
+// clamps to minReconcileInterval if set but below the floor, or falls back to
+// defaultSeconds when nil.
 func applyOrDefault(d *metav1.Duration, defaultSeconds int) time.Duration {
 	def := time.Duration(defaultSeconds) * time.Second
 	if d == nil {
 		return def
 	}
 	if d.Duration < minReconcileInterval {
-		klog.Warningf("syncPolicy duration %v is below minimum %v, using %v", d.Duration, minReconcileInterval, def)
-		return def
+		klog.Warningf("syncPolicy duration %v is below minimum %v, clamping to %v", d.Duration, minReconcileInterval, minReconcileInterval)
+		return minReconcileInterval
 	}
 	return d.Duration
 }

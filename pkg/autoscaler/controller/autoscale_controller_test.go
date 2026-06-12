@@ -828,6 +828,7 @@ func TestResolveSyncPolicy(t *testing.T) {
 	defaultSync := util.DefaultSyncPeriodSeconds * time.Second
 	defaultUp := util.ScaleUpSyncPeriodSeconds * time.Second
 	defaultDown := util.ScaleDownSyncPeriodSeconds * time.Second
+	minReconcileInterval := 1 * time.Second
 
 	tests := []struct {
 		name              string
@@ -876,7 +877,7 @@ func TestResolveSyncPolicy(t *testing.T) {
 			wantScaleDownPer:  60 * time.Second,
 		},
 		{
-			name: "zero duration falls back to default",
+			name: "zero duration clamped to minimum",
 			policy: &workload.AutoscalingPolicy{
 				Spec: workload.AutoscalingPolicySpec{
 					Behavior: workload.AutoscalingPolicyBehavior{
@@ -887,11 +888,11 @@ func TestResolveSyncPolicy(t *testing.T) {
 				},
 			},
 			wantSyncPeriod:    defaultSync,
-			wantScaleUpPeriod: defaultUp,
+			wantScaleUpPeriod: minReconcileInterval, // clamped to 1s, not fallback to 5s
 			wantScaleDownPer:  defaultDown,
 		},
 		{
-			name: "negative duration falls back to default",
+			name: "negative duration clamped to minimum",
 			policy: &workload.AutoscalingPolicy{
 				Spec: workload.AutoscalingPolicySpec{
 					Behavior: workload.AutoscalingPolicyBehavior{
@@ -901,7 +902,7 @@ func TestResolveSyncPolicy(t *testing.T) {
 					},
 				},
 			},
-			wantSyncPeriod:    defaultSync,
+			wantSyncPeriod:    minReconcileInterval, // clamped to 1s, not fallback to 15s
 			wantScaleUpPeriod: defaultUp,
 			wantScaleDownPer:  defaultDown,
 		},
