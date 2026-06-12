@@ -924,7 +924,7 @@ func TestResolveSyncPolicy(t *testing.T) {
 	}
 }
 
-func TestReconcileReturnsMinInterval(t *testing.T) {
+func TestNextIntervalAggregation(t *testing.T) {
 	defaultSync := util.DefaultSyncPeriodSeconds * time.Second
 	defaultUp := util.ScaleUpSyncPeriodSeconds * time.Second
 	defaultDown := util.ScaleDownSyncPeriodSeconds * time.Second
