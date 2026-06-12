@@ -58,9 +58,6 @@ type AutoscaleController struct {
 	podsInformer                       cache.Controller
 	scalerMap                          map[string]*autoscaler.Autoscaler
 	optimizerMap                       map[string]*autoscaler.Optimizer
-	syncPeriod                         time.Duration
-	scaleUpPeriod                      time.Duration
-	scaleDownPeriod                    time.Duration
 }
 
 func NewAutoscaleController(kubeClient kubernetes.Interface, client clientset.Interface) *AutoscaleController {
@@ -93,9 +90,6 @@ func NewAutoscaleController(kubeClient kubernetes.Interface, client clientset.In
 		podsInformer:                       podsInformer.Informer(),
 		scalerMap:                          make(map[string]*autoscaler.Autoscaler),
 		optimizerMap:                       make(map[string]*autoscaler.Optimizer),
-		syncPeriod:                         util.DefaultSyncPeriodSeconds * time.Second,
-		scaleUpPeriod:                      util.ScaleUpSyncPeriodSeconds * time.Second,
-		scaleDownPeriod:                    util.ScaleDownSyncPeriodSeconds * time.Second,
 	}
 	return ac
 }
@@ -146,7 +140,7 @@ func (ac *AutoscaleController) Reconcile(ctx context.Context) time.Duration {
 	bindings, err := ac.autoscalingPoliciesBindingLister.List(labels.Everything())
 	if err != nil {
 		klog.Errorf("failed to list autoscaling policy bindings, err: %v", err)
-		return ac.syncPeriod
+		return util.DefaultSyncPeriodSeconds * time.Second
 	}
 
 	scalerSet := sets.New[string]()
@@ -179,14 +173,15 @@ func (ac *AutoscaleController) Reconcile(ctx context.Context) time.Duration {
 		}
 	}
 
-	minInterval := ac.syncPeriod
+	defaultInterval := util.DefaultSyncPeriodSeconds * time.Second
+	minInterval := defaultInterval
 	for _, binding := range bindings {
-		dir, err := ac.schedule(ctx, binding)
+		dir, periods, err := ac.schedule(ctx, binding)
 		if err != nil {
 			klog.Errorf("failed to process autoscale, err: %v", err)
 			continue
 		}
-		interval := ac.computeNextInterval(dir)
+		interval := nextInterval(dir, periods)
 		if interval < minInterval {
 			minInterval = interval
 		}
@@ -272,34 +267,34 @@ func (ac *AutoscaleController) getTargetReplicas(target *workload.Target, defaul
 	return 0, fmt.Errorf("target ref kind %s, name: %s not supported", targetRef.Kind, targetRef.Name)
 }
 
-func (ac *AutoscaleController) schedule(ctx context.Context, binding *workload.AutoscalingPolicyBinding) (int, error) {
+func (ac *AutoscaleController) schedule(ctx context.Context, binding *workload.AutoscalingPolicyBinding) (int, syncPeriods, error) {
 	klog.V(2).Infof("start to process asp binding %s", klog.KObj(binding))
 	autoscalePolicy, err := ac.getAutoscalePolicy(binding.Spec.PolicyRef.Name, binding.Namespace)
 	if err != nil {
 		klog.Errorf("get autoscale policy error: %v", err)
-		return 0, err
+		return 0, syncPeriods{}, err
 	}
-	ac.applySyncPolicy(autoscalePolicy)
+	periods := resolveSyncPolicy(autoscalePolicy)
 
 	if binding.Spec.HeterogeneousTarget != nil {
 		dir, err := ac.doOptimize(ctx, binding, autoscalePolicy)
 		if err != nil {
 			klog.Errorf("failed to do optimize, err: %v", err)
-			return 0, err
+			return 0, syncPeriods{}, err
 		}
-		return dir, nil
+		return dir, periods, nil
 	} else if binding.Spec.HomogeneousTarget != nil {
 		dir, err := ac.doScale(ctx, binding, autoscalePolicy)
 		if err != nil {
 			klog.Errorf("failed to do scale, err: %v", err)
-			return 0, err
+			return 0, syncPeriods{}, err
 		}
-		return dir, nil
+		return dir, periods, nil
 	} else {
 		klog.Warningf("binding %s has no scalingConfiguration and optimizerConfiguration", binding.Name)
 	}
 
-	return 0, nil
+	return 0, periods, nil
 }
 
 func (ac *AutoscaleController) doOptimize(ctx context.Context, binding *workload.AutoscalingPolicyBinding, autoscalePolicy *workload.AutoscalingPolicy) (int, error) {
@@ -418,20 +413,30 @@ func formatAutoscalerMapKey(bindingNamespace, bindingName string, targetRef *cor
 // API Server and burning CPU.
 const minReconcileInterval = 1 * time.Second
 
-// applySyncPolicy updates the controller's reconcile intervals from the Policy's syncPolicy.
+// syncPeriods holds the per-binding reconcile intervals resolved from a single Policy.
+type syncPeriods struct {
+	syncPeriod      time.Duration
+	scaleUpPeriod   time.Duration
+	scaleDownPeriod time.Duration
+}
+
+// resolveSyncPolicy derives reconcile intervals from the Policy's syncPolicy.
 // Fields left unset in the CR use compiled-in defaults. Durations below
 // minReconcileInterval are clamped and a warning is logged.
-func (ac *AutoscaleController) applySyncPolicy(policy *workload.AutoscalingPolicy) {
+func resolveSyncPolicy(policy *workload.AutoscalingPolicy) syncPeriods {
 	sp := policy.Spec.Behavior.SyncPolicy
 	if sp == nil {
-		ac.syncPeriod = util.DefaultSyncPeriodSeconds * time.Second
-		ac.scaleUpPeriod = util.ScaleUpSyncPeriodSeconds * time.Second
-		ac.scaleDownPeriod = util.ScaleDownSyncPeriodSeconds * time.Second
-		return
+		return syncPeriods{
+			syncPeriod:      util.DefaultSyncPeriodSeconds * time.Second,
+			scaleUpPeriod:   util.ScaleUpSyncPeriodSeconds * time.Second,
+			scaleDownPeriod: util.ScaleDownSyncPeriodSeconds * time.Second,
+		}
 	}
-	ac.syncPeriod = applyOrDefault(sp.DefaultPeriod, util.DefaultSyncPeriodSeconds)
-	ac.scaleUpPeriod = applyOrDefault(sp.ScaleUpPeriod, util.ScaleUpSyncPeriodSeconds)
-	ac.scaleDownPeriod = applyOrDefault(sp.ScaleDownPeriod, util.ScaleDownSyncPeriodSeconds)
+	return syncPeriods{
+		syncPeriod:      applyOrDefault(sp.DefaultPeriod, util.DefaultSyncPeriodSeconds),
+		scaleUpPeriod:   applyOrDefault(sp.ScaleUpPeriod, util.ScaleUpSyncPeriodSeconds),
+		scaleDownPeriod: applyOrDefault(sp.ScaleDownPeriod, util.ScaleDownSyncPeriodSeconds),
+	}
 }
 
 // applyOrDefault returns the duration from d if set and >= minReconcileInterval,
@@ -448,15 +453,15 @@ func applyOrDefault(d *metav1.Duration, defaultSeconds int) time.Duration {
 	return d.Duration
 }
 
-// computeNextInterval returns the next reconcile interval based on the net scaling direction:
-// >0 scale-up, <0 scale-down, 0 stable.
-func (ac *AutoscaleController) computeNextInterval(direction int) time.Duration {
+// nextInterval returns the reconcile interval for a given scaling direction
+// and set of per-binding periods.
+func nextInterval(direction int, p syncPeriods) time.Duration {
 	switch {
 	case direction > 0:
-		return ac.scaleUpPeriod
+		return p.scaleUpPeriod
 	case direction < 0:
-		return ac.scaleDownPeriod
+		return p.scaleDownPeriod
 	default:
-		return ac.syncPeriod
+		return p.syncPeriod
 	}
 }

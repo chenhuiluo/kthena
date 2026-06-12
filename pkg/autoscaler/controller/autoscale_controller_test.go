@@ -798,35 +798,32 @@ func TestPatchDoesNotMutateResourcesInFakeClient(t *testing.T) {
 	}
 }
 
-func TestComputeNextInterval(t *testing.T) {
+func TestNextInterval(t *testing.T) {
 	tests := []struct {
 		name      string
 		direction int
+		periods   syncPeriods
 		want      time.Duration
 	}{
-		{"scale up positive", 3, 5 * time.Second},
-		{"scale up minimal", 1, 5 * time.Second},
-		{"scale down", -2, 30 * time.Second},
-		{"scale down minimal", -1, 30 * time.Second},
-		{"stable zero", 0, 15 * time.Second},
+		{"scale up positive", 3, syncPeriods{15 * time.Second, 5 * time.Second, 30 * time.Second}, 5 * time.Second},
+		{"scale up minimal", 1, syncPeriods{15 * time.Second, 5 * time.Second, 30 * time.Second}, 5 * time.Second},
+		{"scale down", -2, syncPeriods{15 * time.Second, 5 * time.Second, 30 * time.Second}, 30 * time.Second},
+		{"scale down minimal", -1, syncPeriods{15 * time.Second, 5 * time.Second, 30 * time.Second}, 30 * time.Second},
+		{"stable zero", 0, syncPeriods{15 * time.Second, 5 * time.Second, 30 * time.Second}, 15 * time.Second},
+		{"custom periods", 1, syncPeriods{10 * time.Second, 2 * time.Second, 60 * time.Second}, 2 * time.Second},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ac := &AutoscaleController{
-				syncPeriod:      15 * time.Second,
-				scaleUpPeriod:   5 * time.Second,
-				scaleDownPeriod: 30 * time.Second,
-			}
-			got := ac.computeNextInterval(tt.direction)
+			got := nextInterval(tt.direction, tt.periods)
 			if got != tt.want {
-				t.Errorf("computeNextInterval(%d) = %v, want %v", tt.direction, got, tt.want)
+				t.Errorf("nextInterval(%d, %+v) = %v, want %v", tt.direction, tt.periods, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestApplySyncPolicy(t *testing.T) {
+func TestResolveSyncPolicy(t *testing.T) {
 	defaultSync := util.DefaultSyncPeriodSeconds * time.Second
 	defaultUp := util.ScaleUpSyncPeriodSeconds * time.Second
 	defaultDown := util.ScaleDownSyncPeriodSeconds * time.Second
@@ -911,30 +908,24 @@ func TestApplySyncPolicy(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ac := &AutoscaleController{}
-			ac.applySyncPolicy(tt.policy)
-			if ac.syncPeriod != tt.wantSyncPeriod {
-				t.Errorf("syncPeriod = %v, want %v", ac.syncPeriod, tt.wantSyncPeriod)
+			periods := resolveSyncPolicy(tt.policy)
+			if periods.syncPeriod != tt.wantSyncPeriod {
+				t.Errorf("syncPeriod = %v, want %v", periods.syncPeriod, tt.wantSyncPeriod)
 			}
-			if ac.scaleUpPeriod != tt.wantScaleUpPeriod {
-				t.Errorf("scaleUpPeriod = %v, want %v", ac.scaleUpPeriod, tt.wantScaleUpPeriod)
+			if periods.scaleUpPeriod != tt.wantScaleUpPeriod {
+				t.Errorf("scaleUpPeriod = %v, want %v", periods.scaleUpPeriod, tt.wantScaleUpPeriod)
 			}
-			if ac.scaleDownPeriod != tt.wantScaleDownPer {
-				t.Errorf("scaleDownPeriod = %v, want %v", ac.scaleDownPeriod, tt.wantScaleDownPer)
+			if periods.scaleDownPeriod != tt.wantScaleDownPer {
+				t.Errorf("scaleDownPeriod = %v, want %v", periods.scaleDownPeriod, tt.wantScaleDownPer)
 			}
 		})
 	}
 }
 
 func TestReconcileReturnsMinInterval(t *testing.T) {
-	// Verify that when some bindings scale up and others scale down,
-	// Reconcile returns the minimum interval (scaleUpPeriod=5s),
-	// not the default period that would result from summing directions.
-	ac := &AutoscaleController{
-		syncPeriod:      15 * time.Second,
-		scaleUpPeriod:   5 * time.Second,
-		scaleDownPeriod: 30 * time.Second,
-	}
+	defaultSync := util.DefaultSyncPeriodSeconds * time.Second
+	defaultUp := util.ScaleUpSyncPeriodSeconds * time.Second
+	defaultDown := util.ScaleDownSyncPeriodSeconds * time.Second
 
 	tests := []struct {
 		name        string
@@ -944,34 +935,32 @@ func TestReconcileReturnsMinInterval(t *testing.T) {
 		{
 			name:       "mixed directions picks scale up interval",
 			directions: []int{3, -2, 1},
-			wantMin:    5 * time.Second, // min of (5s, 30s, 5s) = 5s
+			wantMin:    defaultUp, // min of (5s, 30s, 5s) = 5s
 		},
 		{
-			name:       "all scale down picks scale down interval",
+			name:       "all scale down capped by default sync interval",
 			directions: []int{-1, -3},
-			wantMin:    30 * time.Second, // min of (30s, 30s) = 30s
+			wantMin:    defaultSync, // min(15s, 30s, 30s) = 15s — default is the floor
 		},
 		{
 			name:       "all stable picks default interval",
 			directions: []int{0, 0},
-			wantMin:    15 * time.Second, // min of (15s, 15s) = 15s
+			wantMin:    defaultSync, // min of (15s, 15s) = 15s
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var intervals []time.Duration
+			defaultPeriods := syncPeriods{defaultSync, defaultUp, defaultDown}
+			minInterval := defaultSync // matches Reconcile's initialization
 			for _, dir := range tt.directions {
-				intervals = append(intervals, ac.computeNextInterval(dir))
-			}
-			minInterval := intervals[0]
-			for _, iv := range intervals[1:] {
-				if iv < minInterval {
-					minInterval = iv
+				interval := nextInterval(dir, defaultPeriods)
+				if interval < minInterval {
+					minInterval = interval
 				}
 			}
 			if minInterval != tt.wantMin {
-				t.Errorf("computed minInterval = %v, want %v (intervals: %v)", minInterval, tt.wantMin, intervals)
+				t.Errorf("computed minInterval = %v, want %v", minInterval, tt.wantMin)
 			}
 		})
 	}
