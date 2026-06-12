@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -958,11 +957,11 @@ func TestNextIntervalAggregation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			defaultPeriods := syncPeriods{defaultSync, defaultUp, defaultDown}
-			minInterval := time.Duration(math.MaxInt64)
+			var minInterval time.Duration
 			hasValidInterval := false
 			for _, dir := range tt.directions {
 				interval := nextInterval(dir, defaultPeriods)
-				if interval < minInterval {
+				if !hasValidInterval || interval < minInterval {
 					minInterval = interval
 				}
 				hasValidInterval = true
