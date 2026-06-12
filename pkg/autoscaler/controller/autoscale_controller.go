@@ -58,6 +58,7 @@ type AutoscaleController struct {
 	podsInformer                       cache.Controller
 	scalerMap                          map[string]*autoscaler.Autoscaler
 	optimizerMap                       map[string]*autoscaler.Optimizer
+	clampWarnings                      sets.Set[string]
 }
 
 func NewAutoscaleController(kubeClient kubernetes.Interface, client clientset.Interface) *AutoscaleController {
@@ -90,6 +91,7 @@ func NewAutoscaleController(kubeClient kubernetes.Interface, client clientset.In
 		podsInformer:                       podsInformer.Informer(),
 		scalerMap:                          make(map[string]*autoscaler.Autoscaler),
 		optimizerMap:                       make(map[string]*autoscaler.Optimizer),
+		clampWarnings:                      sets.New[string](),
 	}
 	return ac
 }
@@ -296,7 +298,7 @@ func (ac *AutoscaleController) schedule(ctx context.Context, binding *workload.A
 		klog.Errorf("get autoscale policy error: %v", err)
 		return 0, syncPeriods{}, err
 	}
-	periods := resolveSyncPolicy(autoscalePolicy)
+	periods := ac.resolveSyncPolicy(autoscalePolicy)
 
 	if binding.Spec.HeterogeneousTarget != nil {
 		dir, err := ac.doOptimize(ctx, binding, autoscalePolicy)
@@ -452,8 +454,11 @@ type syncPeriods struct {
 
 // resolveSyncPolicy derives reconcile intervals from the Policy's syncPolicy.
 // Fields left unset in the CR use compiled-in defaults. Durations below
-// minReconcileInterval are clamped to minReconcileInterval and logged at V(2).
-func resolveSyncPolicy(policy *workload.AutoscalingPolicy) syncPeriods {
+// minReconcileInterval are clamped to minReconcileInterval and logged as
+// warning once per policy (re-logged when the policy spec changes).
+func (ac *AutoscaleController) resolveSyncPolicy(policy *workload.AutoscalingPolicy) syncPeriods {
+	policyKey := policy.Namespace + "/" + policy.Name
+	ac.clampWarnings.Delete(policyKey)
 	sp := policy.Spec.Behavior.SyncPolicy
 	if sp == nil {
 		return syncPeriods{
@@ -463,22 +468,26 @@ func resolveSyncPolicy(policy *workload.AutoscalingPolicy) syncPeriods {
 		}
 	}
 	return syncPeriods{
-		syncPeriod:      applyOrDefault("defaultPeriod", policy, sp.DefaultPeriod, util.DefaultSyncPeriodSeconds),
-		scaleUpPeriod:   applyOrDefault("scaleUpPeriod", policy, sp.ScaleUpPeriod, util.ScaleUpSyncPeriodSeconds),
-		scaleDownPeriod: applyOrDefault("scaleDownPeriod", policy, sp.ScaleDownPeriod, util.ScaleDownSyncPeriodSeconds),
+		syncPeriod:      ac.applyOrDefault(policyKey, "defaultPeriod", sp.DefaultPeriod, util.DefaultSyncPeriodSeconds),
+		scaleUpPeriod:   ac.applyOrDefault(policyKey, "scaleUpPeriod", sp.ScaleUpPeriod, util.ScaleUpSyncPeriodSeconds),
+		scaleDownPeriod: ac.applyOrDefault(policyKey, "scaleDownPeriod", sp.ScaleDownPeriod, util.ScaleDownSyncPeriodSeconds),
 	}
 }
 
 // applyOrDefault returns the duration from d if set and >= minReconcileInterval,
-// clamps to minReconcileInterval if set but below the floor (logged as warning),
-// or falls back to defaultSeconds when nil.
-func applyOrDefault(field string, policy *workload.AutoscalingPolicy, d *metav1.Duration, defaultSeconds int) time.Duration {
+// clamps to minReconcileInterval if set but below the floor (logged as warning
+// once per field+policy), or falls back to defaultSeconds when nil.
+func (ac *AutoscaleController) applyOrDefault(policyKey, field string, d *metav1.Duration, defaultSeconds int) time.Duration {
 	def := time.Duration(defaultSeconds) * time.Second
 	if d == nil {
 		return def
 	}
 	if d.Duration < minReconcileInterval {
-		klog.Warningf("syncPolicy.%s %v in policy %s/%s is below minimum %v, clamping to %v", field, d.Duration, policy.Namespace, policy.Name, minReconcileInterval, minReconcileInterval)
+		warnKey := policyKey + "/" + field
+		if !ac.clampWarnings.Contains(warnKey) {
+			klog.Warningf("syncPolicy.%s %v in policy %s is below minimum %v, clamping to %v", field, d.Duration, policyKey, minReconcileInterval, minReconcileInterval)
+			ac.clampWarnings.Insert(warnKey)
+		}
 		return minReconcileInterval
 	}
 	return d.Duration

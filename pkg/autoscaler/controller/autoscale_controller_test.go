@@ -34,6 +34,7 @@ import (
 	workload "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/autoscaler/autoscaler"
 	"github.com/volcano-sh/kthena/pkg/autoscaler/util"
+	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	resource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -908,7 +909,10 @@ func TestResolveSyncPolicy(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			periods := resolveSyncPolicy(tt.policy)
+			ac := &AutoscaleController{
+				clampWarnings: sets.New[string](),
+			}
+			periods := ac.resolveSyncPolicy(tt.policy)
 			if periods.syncPeriod != tt.wantSyncPeriod {
 				t.Errorf("syncPeriod = %v, want %v", periods.syncPeriod, tt.wantSyncPeriod)
 			}
@@ -1085,6 +1089,7 @@ func TestReconcileInterval(t *testing.T) {
 		podsLister:                      fakePodLister{podsByNs: map[string][]*corev1.Pod{ns: pods}},
 		scalerMap:                       map[string]*autoscalerAutoscaler{},
 		optimizerMap:                    map[string]*autoscalerOptimizer{},
+		clampWarnings:                   sets.New[string](),
 	}
 
 	ctx := context.Background()
