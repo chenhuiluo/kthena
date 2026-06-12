@@ -915,7 +915,7 @@ func TestResolveSyncPolicy(t *testing.T) {
 			if periods.scaleUpPeriod != tt.wantScaleUpPeriod {
 				t.Errorf("scaleUpPeriod = %v, want %v", periods.scaleUpPeriod, tt.wantScaleUpPeriod)
 			}
-			if periods.scaleDownPeriod != tt.wantScaleDownPeriod{
+			if periods.scaleDownPeriod != tt.wantScaleDownPeriod {
 				t.Errorf("scaleDownPeriod = %v, want %v", periods.scaleDownPeriod, tt.wantScaleDownPeriod)
 			}
 		})
