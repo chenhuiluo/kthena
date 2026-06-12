@@ -834,14 +834,14 @@ func TestResolveSyncPolicy(t *testing.T) {
 		policy            *workload.AutoscalingPolicy
 		wantSyncPeriod    time.Duration
 		wantScaleUpPeriod time.Duration
-		wantScaleDownPer  time.Duration
+		wantScaleDownPeriod time.Duration
 	}{
 		{
 			name:              "nil syncPolicy uses defaults",
 			policy:            &workload.AutoscalingPolicy{},
 			wantSyncPeriod:    defaultSync,
 			wantScaleUpPeriod: defaultUp,
-			wantScaleDownPer:  defaultDown,
+			wantScaleDownPeriod:  defaultDown,
 		},
 		{
 			name: "partial config uses defaults for unset fields",
@@ -856,7 +856,7 @@ func TestResolveSyncPolicy(t *testing.T) {
 			},
 			wantSyncPeriod:    defaultSync,
 			wantScaleUpPeriod: 3 * time.Second,
-			wantScaleDownPer:  defaultDown,
+			wantScaleDownPeriod:  defaultDown,
 		},
 		{
 			name: "full config overrides all defaults",
@@ -873,7 +873,7 @@ func TestResolveSyncPolicy(t *testing.T) {
 			},
 			wantSyncPeriod:    10 * time.Second,
 			wantScaleUpPeriod: 2 * time.Second,
-			wantScaleDownPer:  60 * time.Second,
+			wantScaleDownPeriod:  60 * time.Second,
 		},
 		{
 			name: "zero duration clamped to minimum",
@@ -888,7 +888,7 @@ func TestResolveSyncPolicy(t *testing.T) {
 			},
 			wantSyncPeriod:    defaultSync,
 			wantScaleUpPeriod: minReconcileInterval, // clamped to 1s, not fallback to 5s
-			wantScaleDownPer:  defaultDown,
+			wantScaleDownPeriod:  defaultDown,
 		},
 		{
 			name: "negative duration clamped to minimum",
@@ -903,7 +903,7 @@ func TestResolveSyncPolicy(t *testing.T) {
 			},
 			wantSyncPeriod:    minReconcileInterval, // clamped to 1s, not fallback to 15s
 			wantScaleUpPeriod: defaultUp,
-			wantScaleDownPer:  defaultDown,
+			wantScaleDownPeriod:  defaultDown,
 		},
 	}
 
@@ -916,8 +916,8 @@ func TestResolveSyncPolicy(t *testing.T) {
 			if periods.scaleUpPeriod != tt.wantScaleUpPeriod {
 				t.Errorf("scaleUpPeriod = %v, want %v", periods.scaleUpPeriod, tt.wantScaleUpPeriod)
 			}
-			if periods.scaleDownPeriod != tt.wantScaleDownPer {
-				t.Errorf("scaleDownPeriod = %v, want %v", periods.scaleDownPeriod, tt.wantScaleDownPer)
+			if periods.scaleDownPeriod != tt.wantScaleDownPeriod{
+				t.Errorf("scaleDownPeriod = %v, want %v", periods.scaleDownPeriod, tt.wantScaleDownPeriod)
 			}
 		})
 	}
