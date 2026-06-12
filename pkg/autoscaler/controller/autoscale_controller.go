@@ -467,7 +467,7 @@ func resolveSyncPolicy(policy *workload.AutoscalingPolicy) syncPeriods {
 }
 
 // applyOrDefault returns the duration from d if set and >= minReconcileInterval,
-// clamps to minReconcileInterval if set but below the floor (logged at V(2)),
+// clamps to minReconcileInterval if set but below the floor (logged as warning),
 // or falls back to defaultSeconds when nil.
 func applyOrDefault(d *metav1.Duration, defaultSeconds int) time.Duration {
 	def := time.Duration(defaultSeconds) * time.Second
@@ -475,7 +475,7 @@ func applyOrDefault(d *metav1.Duration, defaultSeconds int) time.Duration {
 		return def
 	}
 	if d.Duration < minReconcileInterval {
-		klog.V(2).Infof("syncPolicy duration %v is below minimum %v, clamping to %v", d.Duration, minReconcileInterval, minReconcileInterval)
+		klog.Warningf("syncPolicy duration %v is below minimum %v, clamping to %v", d.Duration, minReconcileInterval, minReconcileInterval)
 		return minReconcileInterval
 	}
 	return d.Duration
