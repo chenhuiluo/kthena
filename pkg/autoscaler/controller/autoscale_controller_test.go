@@ -1098,3 +1098,27 @@ func TestReconcileInterval(t *testing.T) {
 		t.Errorf("Reconcile() = %v, want %v", got, want)
 	}
 }
+
+// TestUtilDefaultsMatchCRDDefaults verifies that the compiled-in defaults in
+// pkg/autoscaler/util stay in sync with the kubebuilder CRD annotations.
+// If these drift, unset fields would get different defaults depending on
+// whether the CRD webhook or the controller fallback path supplies them.
+func TestUtilDefaultsMatchCRDDefaults(t *testing.T) {
+	type crdDefault struct{ seconds int }
+	crdDefaults := map[string]crdDefault{
+		"defaultPeriod":   {15},
+		"scaleUpPeriod":   {5},
+		"scaleDownPeriod": {30},
+	}
+	utilDefaults := map[string]int{
+		"defaultPeriod":   util.DefaultSyncPeriodSeconds,
+		"scaleUpPeriod":   util.ScaleUpSyncPeriodSeconds,
+		"scaleDownPeriod": util.ScaleDownSyncPeriodSeconds,
+	}
+	for field, want := range crdDefaults {
+		got := utilDefaults[field]
+		if got != want.seconds {
+			t.Errorf("util constant %s = %d, but CRD default is %d; these must match", field, got, want.seconds)
+		}
+	}
+}
