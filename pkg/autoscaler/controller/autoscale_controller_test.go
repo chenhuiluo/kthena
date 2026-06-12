@@ -802,7 +802,7 @@ func TestPatchDoesNotMutateResourcesInFakeClient(t *testing.T) {
 func TestNextInterval(t *testing.T) {
 	tests := []struct {
 		name      string
-		direction int
+		direction int64
 		periods   syncPeriods
 		want      time.Duration
 	}{
@@ -931,27 +931,27 @@ func TestNextIntervalAggregation(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		directions  []int
+		directions  []int64
 		wantMin     time.Duration
 	}{
 		{
 			name:       "mixed directions picks scale up interval",
-			directions: []int{3, -2, 1},
+			directions: []int64{3, -2, 1},
 			wantMin:    defaultUp, // min of (5s, 30s, 5s) = 5s
 		},
 		{
 			name:       "all scale down picks scale down interval",
-			directions: []int{-1, -3},
+			directions: []int64{-1, -3},
 			wantMin:    defaultDown, // min(MaxInt64, 30s, 30s) = 30s
 		},
 		{
 			name:       "all stable picks default interval",
-			directions: []int{0, 0},
+			directions: []int64{0, 0},
 			wantMin:    defaultSync, // min of (15s, 15s) = 15s
 		},
 		{
 			name:       "no valid intervals falls back to default",
-			directions: []int{}, // simulates all bindings errored
+			directions: []int64{}, // simulates all bindings errored
 			wantMin:    defaultSync,
 		},
 	}

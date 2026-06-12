@@ -286,7 +286,7 @@ func (ac *AutoscaleController) getTargetReplicas(target *workload.Target, defaul
 	return 0, fmt.Errorf("target ref kind %s, name: %s not supported", targetRef.Kind, targetRef.Name)
 }
 
-func (ac *AutoscaleController) schedule(ctx context.Context, binding *workload.AutoscalingPolicyBinding) (int, syncPeriods, error) {
+func (ac *AutoscaleController) schedule(ctx context.Context, binding *workload.AutoscalingPolicyBinding) (int64, syncPeriods, error) {
 	klog.V(2).Infof("start to process asp binding %s", klog.KObj(binding))
 	autoscalePolicy, err := ac.getAutoscalePolicy(binding.Spec.PolicyRef.Name, binding.Namespace)
 	if err != nil {
@@ -316,7 +316,7 @@ func (ac *AutoscaleController) schedule(ctx context.Context, binding *workload.A
 	return 0, periods, nil
 }
 
-func (ac *AutoscaleController) doOptimize(ctx context.Context, binding *workload.AutoscalingPolicyBinding, autoscalePolicy *workload.AutoscalingPolicy) (int, error) {
+func (ac *AutoscaleController) doOptimize(ctx context.Context, binding *workload.AutoscalingPolicyBinding, autoscalePolicy *workload.AutoscalingPolicy) (int64, error) {
 	key := formatAutoscalerMapKey(binding.Namespace, binding.Name, nil)
 	optimizer, ok := ac.optimizerMap[key]
 	if !ok || optimizer.NeedUpdate(autoscalePolicy, binding) {
@@ -350,7 +350,7 @@ func (ac *AutoscaleController) doOptimize(ctx context.Context, binding *workload
 			recommendedSum += recommended
 		}
 	}
-	direction := int(int64(recommendedSum) - int64(currentSum))
+	direction := int64(recommendedSum) - int64(currentSum)
 
 	// Do update replicas
 	for _, param := range optimizer.Meta.Config.Params {
@@ -368,7 +368,7 @@ func (ac *AutoscaleController) doOptimize(ctx context.Context, binding *workload
 	return direction, nil
 }
 
-func (ac *AutoscaleController) doScale(ctx context.Context, binding *workload.AutoscalingPolicyBinding, autoscalePolicy *workload.AutoscalingPolicy) (int, error) {
+func (ac *AutoscaleController) doScale(ctx context.Context, binding *workload.AutoscalingPolicyBinding, autoscalePolicy *workload.AutoscalingPolicy) (int64, error) {
 	target := binding.Spec.HomogeneousTarget.Target
 	key := formatAutoscalerMapKey(binding.Namespace, binding.Name, &target.TargetRef)
 	scaler, ok := ac.scalerMap[key]
@@ -393,7 +393,7 @@ func (ac *AutoscaleController) doScale(ctx context.Context, binding *workload.Au
 	if recommendedInstances < 0 {
 		return 0, nil
 	}
-	direction := int(int64(recommendedInstances) - int64(currentInstancesCount))
+	direction := int64(recommendedInstances) - int64(currentInstancesCount)
 	// Do update replicas
 	if err := ac.updateTargetReplicas(ctx, &target, binding.Namespace, recommendedInstances); err != nil {
 		klog.Errorf("failed to update target replicas %s, err: %v", target.TargetRef.Name, err)
@@ -476,7 +476,7 @@ func applyOrDefault(d *metav1.Duration, defaultSeconds int) time.Duration {
 
 // nextInterval returns the reconcile interval for a given scaling direction
 // and set of per-binding periods.
-func nextInterval(direction int, p syncPeriods) time.Duration {
+func nextInterval(direction int64, p syncPeriods) time.Duration {
 	switch {
 	case direction > 0:
 		return p.scaleUpPeriod
