@@ -116,9 +116,8 @@ func (ac *AutoscaleController) Run(ctx context.Context) {
 	)
 
 	klog.Info("start autoscale controller")
-	direction := ac.Reconcile(ctx)
-	interval := ac.computeNextInterval(direction)
-	timer := time.NewTimer(interval)
+	nextInterval := ac.Reconcile(ctx)
+	timer := time.NewTimer(nextInterval)
 	defer timer.Stop()
 	for {
 		select {
@@ -129,25 +128,25 @@ func (ac *AutoscaleController) Run(ctx context.Context) {
 			klog.Info("shut down autoscale controller")
 			return
 		case <-timer.C:
-			direction = ac.Reconcile(ctx)
-			interval = ac.computeNextInterval(direction)
-			klog.V(2).InfoS("adaptive reconcile interval", "interval", interval, "direction", direction)
-			timer.Reset(interval)
+			nextInterval = ac.Reconcile(ctx)
+			klog.V(2).InfoS("adaptive reconcile interval", "interval", nextInterval)
+			timer.Reset(nextInterval)
 		}
 	}
 }
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// Returns the net scaling direction: >0 scale-up, <0 scale-down, 0 no change.
-func (ac *AutoscaleController) Reconcile(ctx context.Context) int {
+// Returns the minimum reconcile interval across all bindings so that the most
+// urgent scaling action drives the next wake-up.
+func (ac *AutoscaleController) Reconcile(ctx context.Context) time.Duration {
 	klog.V(4).Info("start to reconcile")
 	ctx, cancel := context.WithTimeout(ctx, util.AutoscaleCtxTimeoutSeconds*time.Second)
 	defer cancel()
 	bindings, err := ac.autoscalingPoliciesBindingLister.List(labels.Everything())
 	if err != nil {
 		klog.Errorf("failed to list autoscaling policy bindings, err: %v", err)
-		return 0
+		return ac.syncPeriod
 	}
 
 	scalerSet := sets.New[string]()
@@ -180,16 +179,19 @@ func (ac *AutoscaleController) Reconcile(ctx context.Context) int {
 		}
 	}
 
-	totalDirection := 0
+	minInterval := ac.syncPeriod
 	for _, binding := range bindings {
 		dir, err := ac.schedule(ctx, binding)
 		if err != nil {
 			klog.Errorf("failed to process autoscale, err: %v", err)
 			continue
 		}
-		totalDirection += dir
+		interval := ac.computeNextInterval(dir)
+		if interval < minInterval {
+			minInterval = interval
+		}
 	}
-	return totalDirection
+	return minInterval
 }
 
 func (ac *AutoscaleController) updateTargetReplicas(ctx context.Context, target *workload.Target, defaultNamespace string, replicas int32) error {
