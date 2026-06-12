@@ -997,15 +997,27 @@ func TestReconcileInterval(t *testing.T) {
 	// shared metric server: returns load=1 so the metric matches target=1 → no scaling
 	stableSrv := httptest.NewServer(httpHandlerWithBody("# TYPE load gauge\nload 1\n"))
 	defer stableSrv.Close()
-	stableU, _ := url.Parse(stableSrv.URL)
-	_, stablePortStr, _ := net.SplitHostPort(stableU.Host)
+	stableU, err := url.Parse(stableSrv.URL)
+	if err != nil {
+		t.Fatalf("parse stable server URL: %v", err)
+	}
+	_, stablePortStr, err := net.SplitHostPort(stableU.Host)
+	if err != nil {
+		t.Fatalf("split stable server host: %v", err)
+	}
 	stablePort := toInt32(stablePortStr)
 
 	// scale-up metric server: returns load=10 so metric >> target=1 → scale up
 	upSrv := httptest.NewServer(httpHandlerWithBody("# TYPE load gauge\nload 10\n"))
 	defer upSrv.Close()
-	upU, _ := url.Parse(upSrv.URL)
-	upHost, scaleUpPortStr, _ := net.SplitHostPort(upU.Host)
+	upU, err := url.Parse(upSrv.URL)
+	if err != nil {
+		t.Fatalf("parse scale-up server URL: %v", err)
+	}
+	upHost, scaleUpPortStr, err := net.SplitHostPort(upU.Host)
+	if err != nil {
+		t.Fatalf("split scale-up server host: %v", err)
+	}
 	scaleUpPort := toInt32(scaleUpPortStr)
 
 	// ModelServing for each binding
