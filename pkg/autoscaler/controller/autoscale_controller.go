@@ -401,6 +401,9 @@ func (ac *AutoscaleController) doScale(ctx context.Context, binding *workload.Au
 		return 0, nil
 	}
 	direction := int64(recommendedInstances) - int64(currentInstancesCount)
+	if direction == 0 {
+		return 0, nil
+	}
 	// Do update replicas
 	if err := ac.updateTargetReplicas(ctx, &target, binding.Namespace, recommendedInstances); err != nil {
 		klog.Errorf("failed to update target replicas %s, err: %v", target.TargetRef.Name, err)
