@@ -25,3 +25,10 @@ const (
 	SloQuantilePercentile           = 95
 	AutoscaleCtxTimeoutSeconds      = 3
 )
+
+// AutoscalingSyncPeriodSeconds is kept as a deprecated alias for
+// DefaultSyncPeriodSeconds to preserve backward compatibility for
+// external consumers. New code should use DefaultSyncPeriodSeconds.
+//
+// Deprecated: Use DefaultSyncPeriodSeconds instead.
+const AutoscalingSyncPeriodSeconds = DefaultSyncPeriodSeconds
