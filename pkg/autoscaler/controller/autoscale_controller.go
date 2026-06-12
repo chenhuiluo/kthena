@@ -460,8 +460,8 @@ func resolveSyncPolicy(policy *workload.AutoscalingPolicy) syncPeriods {
 }
 
 // applyOrDefault returns the duration from d if set and >= minReconcileInterval,
-// clamps to minReconcileInterval if set but below the floor, or falls back to
-// defaultSeconds when nil.
+// clamps to minReconcileInterval if set but below the floor (logged at V(2)),
+// or falls back to defaultSeconds when nil.
 func applyOrDefault(d *metav1.Duration, defaultSeconds int) time.Duration {
 	def := time.Duration(defaultSeconds) * time.Second
 	if d == nil {
