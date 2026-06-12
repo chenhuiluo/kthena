@@ -977,3 +977,124 @@ func TestNextIntervalAggregation(t *testing.T) {
 		})
 	}
 }
+
+func newBindingIndexer(objs ...interface{}) cache.Indexer {
+	idx := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	for _, o := range objs {
+		_ = idx.Add(o)
+	}
+	return idx
+}
+
+// TestReconcileInterval exercises AutoscaleController.Reconcile end-to-end,
+// verifying that the returned interval reflects the minimum across all bindings.
+// This catches regressions if the production Reconcile logic changes.
+func TestReconcileInterval(t *testing.T) {
+	ns := "ns"
+
+	// shared metric server: returns load=1 so the metric matches target=1 → no scaling
+	stableSrv := httptest.NewServer(httpHandlerWithBody("# TYPE load gauge\nload 1\n"))
+	defer stableSrv.Close()
+	stableU, _ := url.Parse(stableSrv.URL)
+	_, stablePortStr, _ := net.SplitHostPort(stableU.Host)
+	stablePort := toInt32(stablePortStr)
+
+	// scale-up metric server: returns load=10 so metric >> target=1 → scale up
+	upSrv := httptest.NewServer(httpHandlerWithBody("# TYPE load gauge\nload 10\n"))
+	defer upSrv.Close()
+	upU, _ := url.Parse(upSrv.URL)
+	upHost, upPortStr, _ := net.SplitHostPort(upU.Host)
+	upPort := toInt32(upPortStr)
+
+	// ModelServing for each binding
+	msStable := &workload.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Name: "ms-stable", Namespace: ns},
+		Spec:       workload.ModelServingSpec{Replicas: ptrInt32(1)},
+	}
+	msUp := &workload.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Name: "ms-up", Namespace: ns},
+		Spec:       workload.ModelServingSpec{Replicas: ptrInt32(1)},
+	}
+
+	// Policy for scale-up binding: custom syncPolicy (scaleUp=3s)
+	customSync := &workload.AutoscalingPolicySyncPolicy{
+		DefaultPeriod:   &metav1.Duration{Duration: 20 * time.Second},
+		ScaleUpPeriod:   &metav1.Duration{Duration: 3 * time.Second},
+		ScaleDownPeriod: &metav1.Duration{Duration: 60 * time.Second},
+	}
+	policyUp := &workload.AutoscalingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "ap-up", Namespace: ns},
+		Spec: workload.AutoscalingPolicySpec{
+			TolerancePercent: 0,
+			Metrics:          []workload.AutoscalingPolicyMetric{{Name: "load", TargetValue: resource.MustParse("1")}},
+			Behavior: workload.AutoscalingPolicyBehavior{
+				SyncPolicy: customSync,
+			},
+		},
+	}
+
+	// Policy for stable binding: tolerance=100 so no scaling → direction 0 → default 15s
+	policyStable := &workload.AutoscalingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "ap-stable", Namespace: ns},
+		Spec: workload.AutoscalingPolicySpec{
+			TolerancePercent: 100,
+			Metrics:          []workload.AutoscalingPolicyMetric{{Name: "load", TargetValue: resource.MustParse("1")}},
+			Behavior:         workload.AutoscalingPolicyBehavior{},
+		},
+	}
+
+	// stable binding: tolerance=100 → no scaling → direction 0 → defaultPeriod 15s
+	stableTarget := workload.Target{
+		TargetRef:     corev1.ObjectReference{Kind: workload.ModelServingKind.Kind, Namespace: ns, Name: "ms-stable"},
+		MetricSources: map[string]workload.MetricSource{"load": {Type: workload.PodMetricSourceType, Pod: &workload.PodMetricSource{Uri: stableU.Path, Port: stablePort}}},
+	}
+	bindingStable := &workload.AutoscalingPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "binding-stable", Namespace: ns},
+		Spec: workload.AutoscalingPolicyBindingSpec{
+			PolicyRef:         corev1.LocalObjectReference{Name: "ap-stable"},
+			HomogeneousTarget: &workload.HomogeneousTarget{Target: stableTarget, MinReplicas: 1, MaxReplicas: 10},
+		},
+	}
+
+	// scale-up binding: metric >> target → direction > 0 → scaleUpPeriod 3s
+	upTarget := workload.Target{
+		TargetRef:     corev1.ObjectReference{Kind: workload.ModelServingKind.Kind, Namespace: ns, Name: "ms-up"},
+		MetricSources: map[string]workload.MetricSource{"load": {Type: workload.PodMetricSourceType, Pod: &workload.PodMetricSource{Uri: upU.Path, Port: upPort}}},
+	}
+	bindingUp := &workload.AutoscalingPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "binding-up", Namespace: ns},
+		Spec: workload.AutoscalingPolicyBindingSpec{
+			PolicyRef:         corev1.LocalObjectReference{Name: "ap-up"},
+			HomogeneousTarget: &workload.HomogeneousTarget{Target: upTarget, MinReplicas: 1, MaxReplicas: 10},
+		},
+	}
+
+	fakeClient := clientfake.NewSimpleClientset(msStable, msUp)
+	msLister := workloadLister.NewModelServingLister(newModelServingIndexer(msStable, msUp))
+	bindingLister := workloadLister.NewAutoscalingPolicyBindingLister(newBindingIndexer(bindingStable, bindingUp))
+	policyLister := workloadLister.NewAutoscalingPolicyLister(newBindingIndexer(policyUp, policyStable))
+
+	pods := []*corev1.Pod{
+		readyPod(ns, "pod-stable", stableU.Hostname(), map[string]string{}),
+		readyPod(ns, "pod-up", upHost, map[string]string{}),
+	}
+
+	ac := &AutoscaleController{
+		client:                          fakeClient,
+		modelServingLister:              msLister,
+		autoscalingPoliciesLister:       policyLister,
+		autoscalingPoliciesBindingLister: bindingLister,
+		podsLister:                      fakePodLister{podsByNs: map[string][]*corev1.Pod{ns: pods}},
+		scalerMap:                       map[string]*autoscalerAutoscaler{},
+		optimizerMap:                    map[string]*autoscalerOptimizer{},
+	}
+
+	ctx := context.Background()
+	got := ac.Reconcile(ctx)
+
+	// scale-up binding → 3s, stable binding → 15s; min is 3s
+	want := 3 * time.Second
+	if got != want {
+		t.Errorf("Reconcile() = %v, want %v", got, want)
+	}
+}
