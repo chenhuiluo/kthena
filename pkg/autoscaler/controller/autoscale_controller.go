@@ -457,7 +457,12 @@ type syncPeriods struct {
 // warning once per policy+field (re-logged when the policy spec changes).
 func (ac *AutoscaleController) resolveSyncPolicy(policy *workload.AutoscalingPolicy) syncPeriods {
 	policyKey := policy.Namespace + "/" + policy.Name
-	ac.clampWarnings.Delete(policyKey)
+	prefix := policyKey + "/"
+	for _, k := range ac.clampWarnings.UnsortedList() {
+		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			ac.clampWarnings.Delete(k)
+		}
+	}
 	sp := policy.Spec.Behavior.SyncPolicy
 	if sp == nil {
 		return syncPeriods{

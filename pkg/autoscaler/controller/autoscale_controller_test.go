@@ -926,6 +926,35 @@ func TestResolveSyncPolicy(t *testing.T) {
 	}
 }
 
+func TestClampWarningsResetOnPolicyReResolve(t *testing.T) {
+	ac := &AutoscaleController{
+		clampWarnings: sets.New[string](),
+	}
+	policy := &workload.AutoscalingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "policy-a"},
+		Spec: workload.AutoscalingPolicySpec{
+			Behavior: workload.AutoscalingPolicyBehavior{
+				SyncPolicy: &workload.AutoscalingPolicySyncPolicy{
+					ScaleUpPeriod: &metav1.Duration{Duration: 0},
+				},
+			},
+		},
+	}
+
+	// First resolve: warning fires and key is recorded.
+	_ = ac.resolveSyncPolicy(policy)
+	warnKey := "ns/policy-a/scaleUpPeriod"
+	if !ac.clampWarnings.Contains(warnKey) {
+		t.Fatalf("expected clampWarnings to contain %q after first resolve", warnKey)
+	}
+
+	// Second resolve: old keys are cleared, so warning fires again.
+	_ = ac.resolveSyncPolicy(policy)
+	if !ac.clampWarnings.Contains(warnKey) {
+		t.Fatalf("expected clampWarnings to contain %q after re-resolve (key should be re-inserted)", warnKey)
+	}
+}
+
 func TestNextIntervalAggregation(t *testing.T) {
 	defaultSync := util.DefaultSyncPeriodSeconds * time.Second
 	defaultUp := util.ScaleUpSyncPeriodSeconds * time.Second
