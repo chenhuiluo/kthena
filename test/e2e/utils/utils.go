@@ -18,7 +18,6 @@ package utils
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -93,40 +92,50 @@ func IsPodReady(pod corev1.Pod) bool {
 // WaitForDeploymentReady polls until the named Deployment has at least replicas ready pods.
 func WaitForDeploymentReady(t *testing.T, ctx context.Context, kubeClient kubernetes.Interface, namespace, name string, replicas int32, timeout time.Duration) {
 	t.Helper()
+	var lastErr error
 	err := wait.PollUntilContextTimeout(ctx, defaultPollingInterval, timeout, true, func(ctx context.Context) (bool, error) {
 		getCtx, cancel := context.WithTimeout(ctx, DefaultAPICallTimeout)
 		defer cancel()
 		deploy, err := kubeClient.AppsV1().Deployments(namespace).Get(getCtx, name, metav1.GetOptions{})
 		if err != nil {
-			if apierrors.IsNotFound(err) || errors.Is(err, context.DeadlineExceeded) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) {
-				return false, nil
-			}
-			return false, err
+			lastErr = err
+			return false, nil
 		}
+		lastErr = nil
 		return deploy.Status.ReadyReplicas >= replicas, nil
 	})
-	require.NoError(t, err, "Deployment %q did not become ready after scaling to %d replicas within %v", name, replicas, timeout)
+	if err != nil {
+		msg := fmt.Sprintf("Deployment %q did not become ready after scaling to %d replicas within %v", name, replicas, timeout)
+		if lastErr != nil {
+			require.NoError(t, fmt.Errorf("%s: %w (last API error: %v)", msg, err, lastErr))
+			return
+		}
+		require.NoError(t, err, msg)
+	}
 }
 
 // WaitForDeploymentReadyE is like WaitForDeploymentReady but returns an error instead of calling t.Fatal.
 // It polls until ReadyReplicas == *Spec.Replicas, or until ReadyReplicas >= 1 when Spec.Replicas is nil.
 func WaitForDeploymentReadyE(ctx context.Context, kubeClient kubernetes.Interface, namespace, name string, timeout time.Duration) error {
+	var lastErr error
 	err := wait.PollUntilContextTimeout(ctx, defaultPollingInterval, timeout, true, func(ctx context.Context) (bool, error) {
 		getCtx, cancel := context.WithTimeout(ctx, DefaultAPICallTimeout)
 		defer cancel()
 		deploy, err := kubeClient.AppsV1().Deployments(namespace).Get(getCtx, name, metav1.GetOptions{})
 		if err != nil {
-			if apierrors.IsNotFound(err) || errors.Is(err, context.DeadlineExceeded) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) {
-				return false, nil
-			}
-			return false, err
+			lastErr = err
+			return false, nil
 		}
+		lastErr = nil
 		if deploy.Spec.Replicas == nil {
 			return deploy.Status.ReadyReplicas >= 1, nil
 		}
 		return deploy.Status.ReadyReplicas == *deploy.Spec.Replicas, nil
 	})
 	if err != nil {
+		if lastErr != nil {
+			return fmt.Errorf("deployment %q did not become ready within %v: %w (last API error: %w)", name, timeout, err, lastErr)
+		}
 		return fmt.Errorf("deployment %q did not become ready within %v: %w", name, timeout, err)
 	}
 	return nil

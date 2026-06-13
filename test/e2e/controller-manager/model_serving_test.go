@@ -89,9 +89,7 @@ func TestModelServingLifecycle(t *testing.T) {
 
 	// Verify the image was updated on all non-terminating pods
 	require.Eventually(t, func() bool {
-		listCtx, cancel := context.WithTimeout(ctx, utils.DefaultAPICallTimeout)
-		defer cancel()
-		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(listCtx, metav1.ListOptions{
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
 			LabelSelector: labelSelector,
 		})
 		if err != nil || len(pods.Items) == 0 {
@@ -126,9 +124,7 @@ func TestModelServingLifecycle(t *testing.T) {
 
 	// Verify the ModelServing is deleted
 	require.Eventually(t, func() bool {
-		getCtx, cancel := context.WithTimeout(ctx, utils.DefaultAPICallTimeout)
-		defer cancel()
-		_, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(getCtx, modelServing.Name, metav1.GetOptions{})
+		_, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
 		if err == nil {
 			return false
 		}
@@ -137,9 +133,7 @@ func TestModelServingLifecycle(t *testing.T) {
 
 	// Verify that associated pods are cleaned up
 	require.Eventually(t, func() bool {
-		listCtx, cancel := context.WithTimeout(ctx, utils.DefaultAPICallTimeout)
-		defer cancel()
-		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(listCtx, metav1.ListOptions{
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
 			LabelSelector: labelSelector,
 		})
 		if err != nil {
@@ -1625,9 +1619,7 @@ type servingGroupState struct {
 }
 
 func collectRunningServingGroupStates(ctx context.Context, kubeClient *kubernetes.Clientset, msName string) (map[int32]servingGroupState, error) {
-	listCtx, cancel := context.WithTimeout(ctx, utils.DefaultAPICallTimeout)
-	defer cancel()
-	pods, err := kubeClient.CoreV1().Pods(testNamespace).List(listCtx, metav1.ListOptions{
+	pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
 		LabelSelector: modelServingLabelSelector(msName),
 	})
 	if err != nil {
@@ -1674,9 +1666,7 @@ func waitForPartitionState(t *testing.T, ctx context.Context, kthenaClient *clie
 
 	var updateRevision string
 	require.Eventually(t, func() bool {
-		getCtx, cancel := context.WithTimeout(ctx, utils.DefaultAPICallTimeout)
-		defer cancel()
-		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(getCtx, msName, metav1.GetOptions{})
+		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, msName, metav1.GetOptions{})
 		if err != nil {
 			return false
 		}
@@ -1717,9 +1707,7 @@ func waitForRollingUpdateConverged(t *testing.T, ctx context.Context, kthenaClie
 
 	var finalMS *workload.ModelServing
 	require.Eventually(t, func() bool {
-		getCtx, cancel := context.WithTimeout(ctx, utils.DefaultAPICallTimeout)
-		defer cancel()
-		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(getCtx, msName, metav1.GetOptions{})
+		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, msName, metav1.GetOptions{})
 		if err != nil {
 			return false
 		}
@@ -1775,9 +1763,7 @@ func verifyAllPodsHaveImage(t *testing.T, ctx context.Context, kubeClient *kuber
 	labelSelector, expectedImage, phase string) {
 	t.Helper()
 	require.Eventually(t, func() bool {
-		listCtx, cancel := context.WithTimeout(ctx, utils.DefaultAPICallTimeout)
-		defer cancel()
-		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(listCtx, metav1.ListOptions{
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
 			LabelSelector: labelSelector,
 		})
 		if err != nil || len(pods.Items) == 0 {
@@ -2338,9 +2324,7 @@ func TestModelServingStatusAwarePriorityScaleDownServingGroup(t *testing.T) {
 
 	t.Log("Waiting for controller to observe the state (3 Ready, 1 NotReady)")
 	require.Eventually(t, func() bool {
-		getCtx, cancel := context.WithTimeout(ctx, utils.DefaultAPICallTimeout)
-		defer cancel()
-		ms, getErr := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(getCtx, modelServing.Name, metav1.GetOptions{})
+		ms, getErr := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
 		if getErr != nil {
 			return false
 		}

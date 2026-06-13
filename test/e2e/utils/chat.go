@@ -373,9 +373,11 @@ func SendChatRequestWithURL(t *testing.T, url string, modelName string, messages
 	return resp
 }
 
-// SendChatRequestWithDataPlaneWait sends a chat completions request and retries ONLY if Envoy returns 404/503.
-// This is used for the very first request of rate limit tests to handle data plane eventual consistency
-// without consuming quota on failed routing attempts.
+// SendChatRequestWithDataPlaneWait polls until the router data plane can route the model.
+// It retries when the HTTP response is 404 (route not yet programmed) or 503 (backend not ready).
+// Any other status — including 200 OK — is returned to the caller immediately without retry.
+// Used as a one-shot warm-up before rate-limit counting loops so transient routing gaps
+// do not consume quota tokens.
 func SendChatRequestWithDataPlaneWait(t *testing.T, modelName string, messages []ChatMessage) *http.Response {
 	var finalResp *http.Response
 	ctx := context.Background()
