@@ -17,9 +17,11 @@ limitations under the License.
 package router
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -27,7 +29,9 @@ import (
 	backendmetrics "github.com/volcano-sh/kthena/pkg/kthena-router/backend/metrics"
 	plugincontext "github.com/volcano-sh/kthena/test/e2e/router/router-plugins/context"
 	"github.com/volcano-sh/kthena/test/e2e/utils"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -35,6 +39,11 @@ const (
 	pluginMockReplicaCount         = 3
 	leastRequestMaxWaitingRequests = 1
 	leastRequestLoadWaitTimeout    = 60 * time.Second
+	gpuCacheUsageBusyMin           = 0.1
+	gpuCacheUsageIdleMax           = 0.05
+	gpuCacheUsageLoadWaitTimeout   = 90 * time.Second
+	gpuCacheUsageLoadConcurrency   = 6
+	gpuCacheUsageLoadMaxTokens     = 256
 )
 
 func listReadyMockPods(t *testing.T, kube kubernetes.Interface, namespace string) []corev1.Pod {
@@ -42,6 +51,59 @@ func listReadyMockPods(t *testing.T, kube kubernetes.Interface, namespace string
 	ready := utils.ListReadyPodsByLabel(t, kube, namespace, "app="+plugincontext.DeploymentName)
 	require.NotEmpty(t, ready, "no ready mock pods")
 	return ready
+}
+
+var pluginMockKVCacheSimArgs = []string{
+	"--model=kthena-plugin-mock",
+	"--served-model-name=router-plugin-model",
+	"--port=8000",
+	"--mode=echo",
+	"--enable-kvcache=true",
+	"--force-dummy-tokenizer=true",
+	"--kv-cache-size=8",
+	"--block-size=8",
+	"--max-num-seqs=2",
+	"--time-to-first-token=2s",
+	"--inter-token-latency=200ms",
+}
+
+// applyPluginMockKVCacheProfile patches the shared plugin mock deployment for gpu-usage e2e
+// and restores the baseline LLM-Mock-plugins.yaml spec on cleanup.
+func applyPluginMockKVCacheProfile(t *testing.T, kube kubernetes.Interface, namespace string) {
+	t.Helper()
+	ctx := context.Background()
+	baseline := utils.LoadYAMLFromFile[appsv1.Deployment](filepath.Join(plugincontext.TestDataDir, "LLM-Mock-plugins.yaml"))
+	baseline.Namespace = namespace
+
+	dep, err := kube.AppsV1().Deployments(namespace).Get(ctx, plugincontext.DeploymentName, metav1.GetOptions{})
+	require.NoError(t, err, "get plugin mock deployment")
+
+	container := &dep.Spec.Template.Spec.Containers[0]
+	container.Args = append([]string(nil), pluginMockKVCacheSimArgs...)
+	container.Env = []corev1.EnvVar{{
+		Name: "POD_IP",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"},
+		},
+	}}
+
+	_, err = kube.AppsV1().Deployments(namespace).Update(ctx, dep, metav1.UpdateOptions{})
+	require.NoError(t, err, "patch plugin mock deployment for kv-cache simulation")
+	require.NoError(t, utils.WaitForDeploymentReadyE(ctx, kube, namespace, plugincontext.DeploymentName, 5*time.Minute),
+		"wait for kv-cache plugin mock rollout")
+
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		latest, err := kube.AppsV1().Deployments(namespace).Get(cleanupCtx, plugincontext.DeploymentName, metav1.GetOptions{})
+		if err != nil {
+			return
+		}
+		latest.Spec = *baseline.Spec.DeepCopy()
+		if _, err := kube.AppsV1().Deployments(namespace).Update(cleanupCtx, latest, metav1.UpdateOptions{}); err != nil {
+			return
+		}
+		_ = utils.WaitForDeploymentReadyE(cleanupCtx, kube, namespace, plugincontext.DeploymentName, 5*time.Minute)
+	})
 }
 
 func waitForSchedulerPluginInMetrics(t *testing.T, metricsURL, pluginName, pluginType string) {
@@ -59,6 +121,7 @@ func waitForSchedulerPluginInMetrics(t *testing.T, metricsURL, pluginName, plugi
 }
 
 type routerPodMetricsSnapshot struct {
+	GPUCacheUsage     float64
 	RequestWaitingNum float64
 	RequestRunningNum float64
 }
@@ -77,6 +140,7 @@ func fetchRouterPodMetricsViaDebug(t *testing.T, debugBaseURL string, pod corev1
 	}
 	var parsed struct {
 		Metrics *struct {
+			GPUCacheUsage     float64 `json:"gpuCacheUsage"`
 			RequestWaitingNum float64 `json:"requestWaitingNum"`
 			RequestRunningNum float64 `json:"requestRunningNum"`
 		} `json:"metrics"`
@@ -85,6 +149,7 @@ func fetchRouterPodMetricsViaDebug(t *testing.T, debugBaseURL string, pod corev1
 		return routerPodMetricsSnapshot{}, false
 	}
 	return routerPodMetricsSnapshot{
+		GPUCacheUsage:     parsed.Metrics.GPUCacheUsage,
 		RequestWaitingNum: parsed.Metrics.RequestWaitingNum,
 		RequestRunningNum: parsed.Metrics.RequestRunningNum,
 	}, true
@@ -130,6 +195,46 @@ func waitForLeastRequestLoadSeparation(t *testing.T, kube kubernetes.Interface, 
 	}, leastRequestLoadWaitTimeout, 2*time.Second,
 		"all busy pods should have request_waiting >= %d and idle pod %s should have request_waiting < %d",
 		maxWaitingRequests, idlePod.Name, maxWaitingRequests)
+}
+
+func waitForGPUCacheUsageSeparation(t *testing.T, kube kubernetes.Interface, kthenaNamespace string, busyPods []corev1.Pod, idlePod corev1.Pod) {
+	t.Helper()
+	require.NotEmpty(t, busyPods)
+
+	routerPod := utils.GetRouterPod(t, kube, kthenaNamespace)
+	localPort := utils.AllocateLocalPort(t)
+	pf, err := utils.SetupPortForwardToPod(routerPod.Namespace, routerPod.Name, localPort, utils.RouterDebugPort)
+	require.NoError(t, err, "port-forward to router debug API")
+	defer pf.Close()
+
+	debugBaseURL := fmt.Sprintf("http://127.0.0.1:%s", localPort)
+	require.Eventually(t, func() bool {
+		allBusyHot := true
+		for _, busyPod := range busyPods {
+			busy, okBusy := fetchRouterPodMetricsViaDebug(t, debugBaseURL, busyPod)
+			if !okBusy || busy.GPUCacheUsage < gpuCacheUsageBusyMin {
+				allBusyHot = false
+				break
+			}
+		}
+		idle, okIdle := fetchRouterPodMetricsViaDebug(t, debugBaseURL, idlePod)
+		if !okIdle {
+			return false
+		}
+		idleCool := idle.GPUCacheUsage < gpuCacheUsageIdleMax
+		if allBusyHot && idleCool {
+			for _, busyPod := range busyPods {
+				busy, _ := fetchRouterPodMetricsViaDebug(t, debugBaseURL, busyPod)
+				t.Logf("gpu-usage load ready: busy %s kv_cache=%.3f waiting=%.0f running=%.0f",
+					busyPod.Name, busy.GPUCacheUsage, busy.RequestWaitingNum, busy.RequestRunningNum)
+			}
+			t.Logf("gpu-usage load ready: idle %s kv_cache=%.3f waiting=%.0f running=%.0f",
+				idlePod.Name, idle.GPUCacheUsage, idle.RequestWaitingNum, idle.RequestRunningNum)
+		}
+		return allBusyHot && idleCool
+	}, gpuCacheUsageLoadWaitTimeout, 2*time.Second,
+		"all busy pods should have gpu cache usage >= %.2f and idle pod %s should have gpu cache usage < %.2f",
+		gpuCacheUsageBusyMin, idlePod.Name, gpuCacheUsageIdleMax)
 }
 
 const (
@@ -195,5 +300,15 @@ const (
     Score:
       enabled:
         - name: random
+          weight: 1`
+
+	schedulerOnlyGPUCacheUsage = `scheduler:
+  pluginConfig: []
+  plugins:
+    Filter:
+      enabled: []
+    Score:
+      enabled:
+        - name: gpu-usage
           weight: 1`
 )
