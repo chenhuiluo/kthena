@@ -54,6 +54,7 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `scaleUp` _[AutoscalingPolicyScaleUpPolicy](#autoscalingpolicyscaleuppolicy)_ | ScaleUp defines the policy configuration for scaling up (increasing replicas). |  |  |
 | `scaleDown` _[AutoscalingPolicyStablePolicy](#autoscalingpolicystablepolicy)_ | ScaleDown defines the policy configuration for scaling down (decreasing replicas). |  |  |
+| `syncPolicy` _[AutoscalingPolicySyncPolicy](#autoscalingpolicysyncpolicy)_ | SyncPolicy configures adaptive reconcile intervals based on scaling direction.<br />When unset, compiled-in defaults are used (defaultPeriod=15s, scaleUpPeriod=5s,<br />scaleDownPeriod=30s). |  |  |
 
 
 #### AutoscalingPolicyBinding
@@ -264,6 +265,20 @@ AutoscalingPolicyStatus defines the observed state of AutoscalingPolicy.
 
 _Appears in:_
 - [AutoscalingPolicy](#autoscalingpolicy)
+
+
+
+#### AutoscalingPolicySyncPolicy
+
+
+
+AutoscalingPolicySyncPolicy configures adaptive reconcile intervals
+based on scaling direction.
+
+
+
+_Appears in:_
+- [AutoscalingPolicyBehavior](#autoscalingpolicybehavior)
 
 
 
