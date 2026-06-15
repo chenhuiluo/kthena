@@ -242,6 +242,7 @@ func (ac *AutoscaleController) reconcileOnce(ctx context.Context) time.Duration 
 // pruneStaleTracking removes configErrors, policyVersions, and clampWarnings
 // entries for bindings/policies that are no longer active.
 func (ac *AutoscaleController) pruneStaleTracking(activeBindings, activePolicies sets.Set[string]) {
+	ac.ensureTrackingInit()
 	for key := range ac.configErrors {
 		if !activeBindings.Has(key) {
 			ac.configErrors.Delete(key)
@@ -250,12 +251,14 @@ func (ac *AutoscaleController) pruneStaleTracking(activeBindings, activePolicies
 	for key := range ac.policyVersions {
 		if !activePolicies.Has(key) {
 			delete(ac.policyVersions, key)
-			prefix := key + "/"
-			for k := range ac.clampWarnings {
-				if strings.HasPrefix(k, prefix) {
-					ac.clampWarnings.Delete(k)
-				}
-			}
+		}
+	}
+	// clampWarnings keys have the form "ns/policyName/fieldName".
+	// Remove entries whose policy prefix ("ns/policyName") is no longer active.
+	for k := range ac.clampWarnings {
+		lastSlash := strings.LastIndex(k, "/")
+		if lastSlash < 0 || !activePolicies.Has(k[:lastSlash]) {
+			ac.clampWarnings.Delete(k)
 		}
 	}
 }
@@ -263,6 +266,7 @@ func (ac *AutoscaleController) pruneStaleTracking(activeBindings, activePolicies
 // recordConfigError logs the error for the binding, suppressing repeated errors
 // to V(2) level so the controller does not spam Errorf on persistent misconfigurations.
 func (ac *AutoscaleController) recordConfigError(binding *workload.AutoscalingPolicyBinding, err error) {
+	ac.ensureTrackingInit()
 	bindingKey := binding.Namespace + "/" + binding.Name
 	if ac.configErrors.Has(bindingKey) {
 		klog.V(2).Infof("repeated config error for binding %s, err: %v", klog.KObj(binding), err)
@@ -275,8 +279,23 @@ func (ac *AutoscaleController) recordConfigError(binding *workload.AutoscalingPo
 // clearConfigError removes the config error tracking entry for a binding after
 // a successful reconcile, so that a future error will fire at Errorf level again.
 func (ac *AutoscaleController) clearConfigError(binding *workload.AutoscalingPolicyBinding) {
+	ac.ensureTrackingInit()
 	bindingKey := binding.Namespace + "/" + binding.Name
 	ac.configErrors.Delete(bindingKey)
+}
+
+// ensureTrackingInit lazily initializes tracking maps/sets so that struct-literal
+// construction (e.g. in tests) does not cause nil-map panics on first mutation.
+func (ac *AutoscaleController) ensureTrackingInit() {
+	if ac.clampWarnings == nil {
+		ac.clampWarnings = sets.New[string]()
+	}
+	if ac.policyVersions == nil {
+		ac.policyVersions = make(map[string]int64)
+	}
+	if ac.configErrors == nil {
+		ac.configErrors = sets.New[string]()
+	}
 }
 
 func (ac *AutoscaleController) updateTargetReplicas(ctx context.Context, target *workload.Target, defaultNamespace string, replicas int32) error {
@@ -522,6 +541,7 @@ type syncPeriods struct {
 // minReconcileInterval are clamped to minReconcileInterval and logged as
 // warning once per policy+field (re-logged only when the policy spec changes).
 func (ac *AutoscaleController) resolveSyncPolicy(policy *workload.AutoscalingPolicy) syncPeriods {
+	ac.ensureTrackingInit()
 	policyKey := policy.Namespace + "/" + policy.Name
 	gen := policy.Generation
 	prevGen := ac.policyVersions[policyKey]

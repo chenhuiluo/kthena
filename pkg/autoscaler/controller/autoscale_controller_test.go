@@ -1269,3 +1269,37 @@ func TestUtilDefaultsMatchCRDDefaults(t *testing.T) {
 		}
 	}
 }
+
+// TestEnsureTrackingInit verifies that methods which mutate tracking maps/sets
+// do not panic when AutoscaleController is constructed via struct literal
+// (nil maps/sets).
+func TestEnsureTrackingInit(t *testing.T) {
+	ac := &AutoscaleController{} // all tracking fields are nil
+
+	binding := &workload.AutoscalingPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "b1"},
+	}
+
+	// These should not panic despite nil maps/sets.
+	ac.recordConfigError(binding, fmt.Errorf("test"))
+	if !ac.configErrors.Has("ns/b1") {
+		t.Fatal("expected configErrors to contain ns/b1 after recordConfigError")
+	}
+
+	ac.clearConfigError(binding)
+	if ac.configErrors.Has("ns/b1") {
+		t.Fatal("expected configErrors to be empty after clearConfigError")
+	}
+
+	activeBindings := sets.New[string]("ns/b1")
+	activePolicies := sets.New[string]("ns/p1")
+	ac.pruneStaleTracking(activeBindings, activePolicies)
+
+	policy := &workload.AutoscalingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "p1", Generation: 1},
+	}
+	_ = ac.resolveSyncPolicy(policy)
+	if ac.policyVersions["ns/p1"] != 1 {
+		t.Fatalf("expected policyVersions[ns/p1]=1, got %d", ac.policyVersions["ns/p1"])
+	}
+}
