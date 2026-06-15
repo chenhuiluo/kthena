@@ -51,22 +51,22 @@ A key design constraint discovered during review: total `Score()` duration is **
 
 | Metric                                          | Type     | Labels  | Description                                                                                  |
 |------------------------------------------------|----------|---------|----------------------------------------------------------------------------------------------|
-| `kthena_router_prefix_cache_hits_total`        | Counter  | `model` | Score calls with ≥1 matching pod (`matchByName` non-empty, `prefix.go:172`)                  |
-| `kthena_router_prefix_cache_misses_total`      | Counter  | `model` | Score calls that hashed a non-empty prompt but found zero matches                            |
-| `kthena_router_prefix_cache_blocks_matched`    | Histogram| `model` | Longest prefix match length (in blocks) per request                                          |
-| `kthena_router_prefix_cache_evictions_total`   | Counter  | `model` | Hash entries evicted from a pod LRU due to capacity pressure                                 |
-| `kthena_router_prefix_cache_entries`           | Gauge    | —       | Current number of cached hash entries (maintained counter)                                   |
+| `kthena_router_prefix_cache_hits_total`        | Counter  | `model` | Number of `Score()` calls in which at least one candidate pod had a matching prefix. Incremented by exactly 1 per hit event — independent of how many pods matched or how many blocks matched. |
+| `kthena_router_prefix_cache_misses_total`      | Counter  | `model` | Number of `Score()` calls that hashed a non-empty prompt but found no matching pod. `hits + misses` is the number of real lookups; `hits / (hits + misses)` is the hit rate. |
+| `kthena_router_prefix_cache_blocks_matched`    | Histogram| `model` | Per `Score()` call, the longest prefix match length (in blocks) among candidate pods — one observation per call, `0` on a miss. Measures how much prefix was reused, complementing the binary hit/miss counters. |
+| `kthena_router_prefix_cache_evictions_total`   | Counter  | `model` | Number of cached hash entries evicted from a per-pod LRU due to capacity pressure. Excludes removals caused by pod deletion (see Notes). |
+| `kthena_router_prefix_cache_entries`           | Gauge    | —       | Current total cached hash entries, summed across all per-pod LRUs at scrape time. Bounded by `(#pods with entries) × MaxHashCacheSize`; once every pod LRU is full the value plateaus (1-for-1 eviction) and changes only as pods are added or deleted. |
 
 #### Metrics: `kvcache-aware`
 
 | Metric                                                 | Type     | Labels                | Description                                                                                    |
 |--------------------------------------------------------|----------|-----------------------|------------------------------------------------------------------------------------------------|
-| `kthena_router_kvcache_aware_hits_total`               | Counter  | `model`               | Score calls with ≥1 block match (`podScores` non-empty, `kvcache_aware.go:232`)                |
-| `kthena_router_kvcache_aware_misses_total`             | Counter  | `model`               | Score calls that produced block hashes but matched zero blocks                                 |
-| `kthena_router_kvcache_aware_blocks_matched`           | Histogram| `model`               | Longest prefix-block match length per request (`lastMatchedBlock+1`)                           |
-| `kthena_router_kvcache_aware_redis_duration_seconds`   | Histogram| `model`               | Time in the batched Redis lookup (`kvcache_aware.go:222-224`)                                  |
-| `kthena_router_kvcache_aware_tokenize_duration_seconds`| Histogram| `model`               | Time spent tokenizing the prompt (`kvcache_aware.go:204-206`)                                  |
-| `kthena_router_kvcache_aware_errors_total`             | Counter  | `model`, `stage`      | Score calls that aborted on error, by stage (`tokenize`, `redis`)                              |
+| `kthena_router_kvcache_aware_hits_total`               | Counter  | `model`               | Number of `Score()` calls in which at least one candidate pod matched ≥1 KV block. Incremented by exactly 1 per hit event — independent of how many pods or blocks matched. |
+| `kthena_router_kvcache_aware_misses_total`             | Counter  | `model`               | Number of `Score()` calls that produced block hashes but matched zero blocks on any pod. `hits / (hits + misses)` is the hit rate. |
+| `kthena_router_kvcache_aware_blocks_matched`           | Histogram| `model`               | Per `Score()` call, the longest contiguous prefix-block match length (`lastMatchedBlock + 1`); one observation per call, `0` on a miss. |
+| `kthena_router_kvcache_aware_redis_duration_seconds`   | Histogram| `model`               | Latency of the batched Redis block-lookup performed during a `Score()` call. |
+| `kthena_router_kvcache_aware_tokenize_duration_seconds`| Histogram| `model`               | Latency of tokenizing the prompt during a `Score()` call. |
+| `kthena_router_kvcache_aware_errors_total`             | Counter  | `model`, `stage`      | Number of `Score()` calls aborted by an error, labelled by failing stage (`tokenize` or `redis`). Counted separately from misses so transient failures do not distort the hit rate. |
 
 > **Note on `errors_total`:** Several `Score()` paths return `nil` that are *not* cache misses — tokenization failure (`kvcache_aware.go:209-212`) and Redis failure (`kvcache_aware.go:225-227`). Folding these into `misses_total` would corrupt the hit-rate signal, so they are counted separately and labelled by stage. This directly serves the bottleneck-diagnosis goal.
 
