@@ -191,12 +191,12 @@ func (p *PrefixCache) Score(ctx *framework.Context, pods []*datastore.PodInfo) m
 	}
 
 	if ctx.MetricsRecorder != nil {
-		ctx.MetricsRecorder.RecordPrefixCacheBlocksMatched(longestMatch)
-		if len(matchByName) > 0 {
-			ctx.MetricsRecorder.RecordPrefixCacheHit()
-		} else {
-			ctx.MetricsRecorder.RecordPrefixCacheMiss()
+		// Fraction of the prompt's blocks matched by the best pod; 0 on a miss.
+		matchRatio := 0.0
+		if totalHashes > 0 {
+			matchRatio = float64(longestMatch) / float64(totalHashes)
 		}
+		ctx.MetricsRecorder.RecordPrefixCacheMatchRatio(matchRatio)
 	}
 
 	return scoreResults

@@ -246,12 +246,12 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 	podScores, longestMatch := t.calculatePodScoresAndMatch(blockHashes, blockToPods)
 	if ctx.MetricsRecorder != nil {
 		ctx.MetricsRecorder.RecordKVCacheRedisDuration(redisDuration)
-		ctx.MetricsRecorder.RecordKVCacheBlocksMatched(longestMatch)
-		if len(podScores) > 0 {
-			ctx.MetricsRecorder.RecordKVCacheHit()
-		} else {
-			ctx.MetricsRecorder.RecordKVCacheMiss()
+		// Fraction of the prompt's blocks matched by the best pod; 0 on a miss.
+		matchRatio := 0.0
+		if len(blockHashes) > 0 {
+			matchRatio = float64(longestMatch) / float64(len(blockHashes))
 		}
+		ctx.MetricsRecorder.RecordKVCacheMatchRatio(matchRatio)
 	}
 	scoreResults := make(map[*datastore.PodInfo]int, len(podScores))
 	for _, pod := range pods {

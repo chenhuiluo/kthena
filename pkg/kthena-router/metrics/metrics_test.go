@@ -37,6 +37,39 @@ func histCount(t *testing.T, vec *prometheus.HistogramVec, lvs ...string) uint64
 	return m.GetHistogram().GetSampleCount()
 }
 
+func histSum(t *testing.T, vec *prometheus.HistogramVec, lvs ...string) float64 {
+	t.Helper()
+	obs, err := vec.GetMetricWithLabelValues(lvs...)
+	if err != nil {
+		t.Fatalf("GetMetricWithLabelValues: %v", err)
+	}
+	m := &dto.Metric{}
+	if err := obs.(prometheus.Metric).Write(m); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	return m.GetHistogram().GetSampleSum()
+}
+
+// histBucket returns the cumulative count of the bucket whose upper bound equals le.
+func histBucket(t *testing.T, vec *prometheus.HistogramVec, le float64, lvs ...string) uint64 {
+	t.Helper()
+	obs, err := vec.GetMetricWithLabelValues(lvs...)
+	if err != nil {
+		t.Fatalf("GetMetricWithLabelValues: %v", err)
+	}
+	m := &dto.Metric{}
+	if err := obs.(prometheus.Metric).Write(m); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	for _, b := range m.GetHistogram().GetBucket() {
+		if b.GetUpperBound() == le {
+			return b.GetCumulativeCount()
+		}
+	}
+	t.Fatalf("bucket le=%v not found", le)
+	return 0
+}
+
 func counterVal(t *testing.T, vec *prometheus.CounterVec, lvs ...string) float64 {
 	t.Helper()
 	c, err := vec.GetMetricWithLabelValues(lvs...)
@@ -50,34 +83,32 @@ func counterVal(t *testing.T, vec *prometheus.CounterVec, lvs ...string) float64
 	return m.GetCounter().GetValue()
 }
 
-func TestPrefixCacheHitMiss(t *testing.T) {
+func TestPrefixCacheMatchRatio(t *testing.T) {
 	m := DefaultMetrics
-	const model = "metricstest-prefix-hitmiss"
+	const model = "metricstest-prefix-matchratio"
 
-	hitsBefore := counterVal(t, &m.PrefixCacheHitsTotal, model)
-	missBefore := counterVal(t, &m.PrefixCacheMissesTotal, model)
+	countBefore := histCount(t, &m.PrefixCacheMatchRatio, model)
+	sumBefore := histSum(t, &m.PrefixCacheMatchRatio, model)
+	missBefore := histBucket(t, &m.PrefixCacheMatchRatio, 0, model)
 
-	m.RecordPrefixCacheHit(model)
-	m.RecordPrefixCacheHit(model)
-	m.RecordPrefixCacheMiss(model)
+	m.RecordPrefixCacheMatchRatio(model, 0.5)
+	m.RecordPrefixCacheMatchRatio(model, 0) // miss
 
-	if got := counterVal(t, &m.PrefixCacheHitsTotal, model) - hitsBefore; got != 2 {
-		t.Errorf("prefix hits delta = %v, want 2", got)
+	if got := histCount(t, &m.PrefixCacheMatchRatio, model) - countBefore; got != 2 {
+		t.Errorf("match_ratio sample count delta = %d, want 2", got)
 	}
-	if got := counterVal(t, &m.PrefixCacheMissesTotal, model) - missBefore; got != 1 {
-		t.Errorf("prefix misses delta = %v, want 1", got)
+	if got := histSum(t, &m.PrefixCacheMatchRatio, model) - sumBefore; got != 0.5 {
+		t.Errorf("match_ratio sample sum delta = %v, want 0.5", got)
+	}
+	// The le=0 bucket counts misses, so hit/miss is derivable from the histogram.
+	if got := histBucket(t, &m.PrefixCacheMatchRatio, 0, model) - missBefore; got != 1 {
+		t.Errorf("match_ratio le=0 (miss) delta = %d, want 1", got)
 	}
 }
 
-func TestPrefixCacheBlocksMatchedAndEviction(t *testing.T) {
+func TestPrefixCacheEviction(t *testing.T) {
 	m := DefaultMetrics
-	const model = "metricstest-prefix-blocks"
-
-	before := histCount(t, &m.PrefixCacheBlocksMatched, model)
-	m.RecordPrefixCacheBlocksMatched(model, 5)
-	if got := histCount(t, &m.PrefixCacheBlocksMatched, model) - before; got != 1 {
-		t.Errorf("blocks_matched sample count delta = %d, want 1", got)
-	}
+	const model = "metricstest-prefix-eviction"
 
 	evBefore := counterVal(t, &m.PrefixCacheEvictionsTotal, model)
 	m.RecordPrefixCacheEviction(model)
@@ -99,23 +130,23 @@ func TestPrefixCacheEntriesProvider(t *testing.T) {
 	}
 }
 
-func TestKVCacheHitMissAndError(t *testing.T) {
+func TestKVCacheMatchRatioAndError(t *testing.T) {
 	m := DefaultMetrics
-	const model = "metricstest-kv-hitmiss"
+	const model = "metricstest-kv-matchratio"
 
-	hitsBefore := counterVal(t, &m.KVCacheHitsTotal, model)
-	missBefore := counterVal(t, &m.KVCacheMissesTotal, model)
+	countBefore := histCount(t, &m.KVCacheMatchRatio, model)
+	missBefore := histBucket(t, &m.KVCacheMatchRatio, 0, model)
 	redisErrBefore := counterVal(t, &m.KVCacheErrorsTotal, model, StageRedis)
 
-	m.RecordKVCacheHit(model)
-	m.RecordKVCacheMiss(model)
+	m.RecordKVCacheMatchRatio(model, 1.0)
+	m.RecordKVCacheMatchRatio(model, 0) // miss
 	m.RecordKVCacheError(model, StageRedis)
 
-	if got := counterVal(t, &m.KVCacheHitsTotal, model) - hitsBefore; got != 1 {
-		t.Errorf("kvcache hits delta = %v, want 1", got)
+	if got := histCount(t, &m.KVCacheMatchRatio, model) - countBefore; got != 2 {
+		t.Errorf("kvcache match_ratio sample count delta = %d, want 2", got)
 	}
-	if got := counterVal(t, &m.KVCacheMissesTotal, model) - missBefore; got != 1 {
-		t.Errorf("kvcache misses delta = %v, want 1", got)
+	if got := histBucket(t, &m.KVCacheMatchRatio, 0, model) - missBefore; got != 1 {
+		t.Errorf("kvcache match_ratio le=0 (miss) delta = %d, want 1", got)
 	}
 	if got := counterVal(t, &m.KVCacheErrorsTotal, model, StageRedis) - redisErrBefore; got != 1 {
 		t.Errorf("kvcache redis errors delta = %v, want 1", got)
@@ -145,21 +176,16 @@ func TestRequestRecorderDelegation(t *testing.T) {
 	const model = "metricstest-recorder"
 	r := NewRequestMetricsRecorder(m, model, "/v1/chat/completions")
 
-	hitsBefore := counterVal(t, &m.PrefixCacheHitsTotal, model)
-	kvHitsBefore := counterVal(t, &m.KVCacheHitsTotal, model)
-	blocksBefore := histCount(t, &m.KVCacheBlocksMatched, model)
+	prefixBefore := histCount(t, &m.PrefixCacheMatchRatio, model)
+	kvBefore := histCount(t, &m.KVCacheMatchRatio, model)
 
-	r.RecordPrefixCacheHit()
-	r.RecordKVCacheHit()
-	r.RecordKVCacheBlocksMatched(9)
+	r.RecordPrefixCacheMatchRatio(0.25)
+	r.RecordKVCacheMatchRatio(0.75)
 
-	if got := counterVal(t, &m.PrefixCacheHitsTotal, model) - hitsBefore; got != 1 {
-		t.Errorf("recorder prefix hit delta = %v, want 1", got)
+	if got := histCount(t, &m.PrefixCacheMatchRatio, model) - prefixBefore; got != 1 {
+		t.Errorf("recorder prefix match_ratio delta = %d, want 1", got)
 	}
-	if got := counterVal(t, &m.KVCacheHitsTotal, model) - kvHitsBefore; got != 1 {
-		t.Errorf("recorder kvcache hit delta = %v, want 1", got)
-	}
-	if got := histCount(t, &m.KVCacheBlocksMatched, model) - blocksBefore; got != 1 {
-		t.Errorf("recorder kvcache blocks_matched delta = %d, want 1", got)
+	if got := histCount(t, &m.KVCacheMatchRatio, model) - kvBefore; got != 1 {
+		t.Errorf("recorder kvcache match_ratio delta = %d, want 1", got)
 	}
 }

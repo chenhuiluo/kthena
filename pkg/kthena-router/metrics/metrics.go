@@ -98,17 +98,13 @@ type Metrics struct {
 	TokenizerUnsupportedEngineTotal prometheus.CounterVec
 
 	// prefix-cache score plugin metrics
-	PrefixCacheHitsTotal       prometheus.CounterVec
-	PrefixCacheMissesTotal     prometheus.CounterVec
-	PrefixCacheBlocksMatched   prometheus.HistogramVec
+	PrefixCacheMatchRatio      prometheus.HistogramVec
 	PrefixCacheEvictionsTotal  prometheus.CounterVec
 	PrefixCacheEntries         prometheus.GaugeFunc
 	prefixCacheEntriesProvider atomic.Value // func() float64
 
 	// kvcache-aware score plugin metrics
-	KVCacheHitsTotal        prometheus.CounterVec
-	KVCacheMissesTotal      prometheus.CounterVec
-	KVCacheBlocksMatched    prometheus.HistogramVec
+	KVCacheMatchRatio       prometheus.HistogramVec
 	KVCacheRedisDuration    prometheus.HistogramVec
 	KVCacheTokenizeDuration prometheus.HistogramVec
 	KVCacheErrorsTotal      prometheus.CounterVec
@@ -258,27 +254,11 @@ func NewMetrics() *Metrics {
 			[]string{LabelModel, LabelEngine},
 		),
 
-		PrefixCacheHitsTotal: *promauto.NewCounterVec(
-			prometheus.CounterOpts{
-				Name: "kthena_router_prefix_cache_hits_total",
-				Help: "Number of prefix-cache score calls with at least one matching pod",
-			},
-			[]string{LabelModel},
-		),
-
-		PrefixCacheMissesTotal: *promauto.NewCounterVec(
-			prometheus.CounterOpts{
-				Name: "kthena_router_prefix_cache_misses_total",
-				Help: "Number of prefix-cache score calls that hashed a non-empty prompt but found zero matches",
-			},
-			[]string{LabelModel},
-		),
-
-		PrefixCacheBlocksMatched: *promauto.NewHistogramVec(
+		PrefixCacheMatchRatio: *promauto.NewHistogramVec(
 			prometheus.HistogramOpts{
-				Name:    "kthena_router_prefix_cache_blocks_matched",
-				Help:    "Longest prefix match length (in blocks) per prefix-cache score call",
-				Buckets: []float64{0, 1, 2, 4, 8, 16, 32, 64, 128},
+				Name:    "kthena_router_prefix_cache_match_ratio",
+				Help:    "Fraction of the prompt's blocks matched by the best pod per prefix-cache match attempt (0 = miss)",
+				Buckets: []float64{0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0},
 			},
 			[]string{LabelModel},
 		),
@@ -291,27 +271,11 @@ func NewMetrics() *Metrics {
 			[]string{LabelModel},
 		),
 
-		KVCacheHitsTotal: *promauto.NewCounterVec(
-			prometheus.CounterOpts{
-				Name: "kthena_router_kvcache_aware_hits_total",
-				Help: "Number of kvcache-aware score calls with at least one block match",
-			},
-			[]string{LabelModel},
-		),
-
-		KVCacheMissesTotal: *promauto.NewCounterVec(
-			prometheus.CounterOpts{
-				Name: "kthena_router_kvcache_aware_misses_total",
-				Help: "Number of kvcache-aware score calls that produced block hashes but matched zero blocks",
-			},
-			[]string{LabelModel},
-		),
-
-		KVCacheBlocksMatched: *promauto.NewHistogramVec(
+		KVCacheMatchRatio: *promauto.NewHistogramVec(
 			prometheus.HistogramOpts{
-				Name:    "kthena_router_kvcache_aware_blocks_matched",
-				Help:    "Longest prefix-block match length per kvcache-aware score call",
-				Buckets: []float64{0, 1, 2, 4, 8, 16, 32, 64, 128},
+				Name:    "kthena_router_kvcache_aware_match_ratio",
+				Help:    "Fraction of the prompt's blocks matched by the best pod per kvcache-aware match attempt (0 = miss)",
+				Buckets: []float64{0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0},
 			},
 			[]string{LabelModel},
 		),
@@ -319,7 +283,7 @@ func NewMetrics() *Metrics {
 		KVCacheRedisDuration: *promauto.NewHistogramVec(
 			prometheus.HistogramOpts{
 				Name:    "kthena_router_kvcache_aware_redis_duration_seconds",
-				Help:    "Time spent in the batched Redis lookup during kvcache-aware scoring",
+				Help:    "Time spent in the batched Redis lookup during a kvcache-aware match attempt",
 				Buckets: []float64{0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5},
 			},
 			[]string{LabelModel},
@@ -328,7 +292,7 @@ func NewMetrics() *Metrics {
 		KVCacheTokenizeDuration: *promauto.NewHistogramVec(
 			prometheus.HistogramOpts{
 				Name:    "kthena_router_kvcache_aware_tokenize_duration_seconds",
-				Help:    "Time spent tokenizing the prompt during kvcache-aware scoring",
+				Help:    "Time spent tokenizing the prompt during a kvcache-aware match attempt",
 				Buckets: []float64{0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5},
 			},
 			[]string{LabelModel},
@@ -337,7 +301,7 @@ func NewMetrics() *Metrics {
 		KVCacheErrorsTotal: *promauto.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "kthena_router_kvcache_aware_errors_total",
-				Help: "Number of kvcache-aware score calls that aborted on error, by stage",
+				Help: "Number of kvcache-aware match attempts that aborted on error, by stage",
 			},
 			[]string{LabelModel, LabelStage},
 		),
@@ -374,32 +338,16 @@ func (m *Metrics) SetPrefixCacheEntriesProvider(provider func() float64) {
 	m.prefixCacheEntriesProvider.Store(provider)
 }
 
-func (m *Metrics) RecordPrefixCacheHit(model string) {
-	m.PrefixCacheHitsTotal.WithLabelValues(model).Inc()
-}
-
-func (m *Metrics) RecordPrefixCacheMiss(model string) {
-	m.PrefixCacheMissesTotal.WithLabelValues(model).Inc()
-}
-
-func (m *Metrics) RecordPrefixCacheBlocksMatched(model string, blocks int) {
-	m.PrefixCacheBlocksMatched.WithLabelValues(model).Observe(float64(blocks))
+func (m *Metrics) RecordPrefixCacheMatchRatio(model string, ratio float64) {
+	m.PrefixCacheMatchRatio.WithLabelValues(model).Observe(ratio)
 }
 
 func (m *Metrics) RecordPrefixCacheEviction(model string) {
 	m.PrefixCacheEvictionsTotal.WithLabelValues(model).Inc()
 }
 
-func (m *Metrics) RecordKVCacheHit(model string) {
-	m.KVCacheHitsTotal.WithLabelValues(model).Inc()
-}
-
-func (m *Metrics) RecordKVCacheMiss(model string) {
-	m.KVCacheMissesTotal.WithLabelValues(model).Inc()
-}
-
-func (m *Metrics) RecordKVCacheBlocksMatched(model string, blocks int) {
-	m.KVCacheBlocksMatched.WithLabelValues(model).Observe(float64(blocks))
+func (m *Metrics) RecordKVCacheMatchRatio(model string, ratio float64) {
+	m.KVCacheMatchRatio.WithLabelValues(model).Observe(ratio)
 }
 
 func (m *Metrics) RecordKVCacheRedisDuration(model string, duration time.Duration) {
@@ -646,28 +594,12 @@ func (r *RequestMetricsRecorder) RecordFairnessQueueDuration(userID string, dura
 	r.metrics.RecordFairnessQueueDuration(r.model, userID, duration)
 }
 
-func (r *RequestMetricsRecorder) RecordPrefixCacheHit() {
-	r.metrics.RecordPrefixCacheHit(r.model)
+func (r *RequestMetricsRecorder) RecordPrefixCacheMatchRatio(ratio float64) {
+	r.metrics.RecordPrefixCacheMatchRatio(r.model, ratio)
 }
 
-func (r *RequestMetricsRecorder) RecordPrefixCacheMiss() {
-	r.metrics.RecordPrefixCacheMiss(r.model)
-}
-
-func (r *RequestMetricsRecorder) RecordPrefixCacheBlocksMatched(blocks int) {
-	r.metrics.RecordPrefixCacheBlocksMatched(r.model, blocks)
-}
-
-func (r *RequestMetricsRecorder) RecordKVCacheHit() {
-	r.metrics.RecordKVCacheHit(r.model)
-}
-
-func (r *RequestMetricsRecorder) RecordKVCacheMiss() {
-	r.metrics.RecordKVCacheMiss(r.model)
-}
-
-func (r *RequestMetricsRecorder) RecordKVCacheBlocksMatched(blocks int) {
-	r.metrics.RecordKVCacheBlocksMatched(r.model, blocks)
+func (r *RequestMetricsRecorder) RecordKVCacheMatchRatio(ratio float64) {
+	r.metrics.RecordKVCacheMatchRatio(r.model, ratio)
 }
 
 func (r *RequestMetricsRecorder) RecordKVCacheRedisDuration(duration time.Duration) {
