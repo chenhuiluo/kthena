@@ -1550,17 +1550,24 @@ func TestSglangMetricsShared(t *testing.T, testCtx *routercontext.RouterTestCont
 
 	const sglangMockModel = "Qwen/Qwen3-8B"
 	chatURL := "http://127.0.0.1:30300/v1/chat/completions"
-	chatResp := utils.SendChatRequestWithURL(t, chatURL, sglangMockModel, []utils.ChatMessage{
-		utils.NewChatMessage("user", "hello"),
-	})
-	require.Equal(t, http.StatusOK, chatResp.StatusCode, "sglang-mock chat request failed")
-	chatResp.Body.Close()
+	// Echo mode returns the user message as completion tokens; a short prompt yields only one
+	// token and does not populate sglang:inter_token_latency_seconds (needs >= 2 output tokens).
+	chatResp := utils.SendChatRequestWithRetry(t, chatURL, sglangMockModel, []utils.ChatMessage{
+		utils.NewChatMessage("user", "hello world this is a longer echo test message for metrics"),
+	}, nil)
+	require.Equal(t, http.StatusOK, chatResp.StatusCode, "sglang-mock chat request failed: %s", chatResp.Body)
 
 	metricsURL := "http://127.0.0.1:30300/metrics"
 	engine := sglang.NewSglangEngine()
 	require.Eventually(t, func() bool {
 		allMetrics, err := backendmetrics.ParseMetricsURL(metricsURL)
 		if err != nil {
+			return false
+		}
+		if _, ok := allMetrics[sglang.TTFT]; !ok {
+			return false
+		}
+		if _, ok := allMetrics[sglang.TPOT]; !ok {
 			return false
 		}
 		histogramMetrics, _ := engine.GetHistogramPodMetrics(allMetrics, nil)
