@@ -1548,12 +1548,31 @@ func TestSglangMetricsShared(t *testing.T, testCtx *routercontext.RouterTestCont
 	require.NoError(t, err, "Failed to setup port-forward to sglang-mock pod")
 	defer pf.Close()
 
+	const sglangMockModel = "Qwen/Qwen3-8B"
+	chatURL := "http://127.0.0.1:30300/v1/chat/completions"
+	chatResp := utils.SendChatRequestWithURL(t, chatURL, sglangMockModel, []utils.ChatMessage{
+		utils.NewChatMessage("user", "hello"),
+	})
+	require.Equal(t, http.StatusOK, chatResp.StatusCode, "sglang-mock chat request failed")
+	chatResp.Body.Close()
+
 	metricsURL := "http://127.0.0.1:30300/metrics"
+	engine := sglang.NewSglangEngine()
+	require.Eventually(t, func() bool {
+		allMetrics, err := backendmetrics.ParseMetricsURL(metricsURL)
+		if err != nil {
+			return false
+		}
+		histogramMetrics, _ := engine.GetHistogramPodMetrics(allMetrics, nil)
+		_, hasTTFT := histogramMetrics[routerutils.TTFT]
+		_, hasTPOT := histogramMetrics[routerutils.TPOT]
+		return hasTTFT && hasTPOT
+	}, 15*time.Second, 500*time.Millisecond, "histogram metrics not populated after chat request")
+
 	allMetrics, err := backendmetrics.ParseMetricsURL(metricsURL)
 	require.NoError(t, err, "Failed to fetch metrics from sglang-mock via port-forward")
 	require.NotEmpty(t, allMetrics, "No metrics returned from sglang-mock")
 
-	engine := sglang.NewSglangEngine()
 	countMetrics := engine.GetCountMetricsInfo(allMetrics)
 	assert.Contains(t, countMetrics, routerutils.KVCacheUsage,
 		"Missing gpu_usage (sglang:token_usage) in count metrics")

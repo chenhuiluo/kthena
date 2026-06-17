@@ -19,3 +19,4 @@ spec:
             name: sglang:token_usage
             port: 30000
             uri: /metrics
+
