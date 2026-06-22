@@ -257,7 +257,7 @@ func NewMetrics() *Metrics {
 		PrefixCacheMatchRatio: *promauto.NewHistogramVec(
 			prometheus.HistogramOpts{
 				Name:    "kthena_router_prefix_cache_match_ratio",
-				Help:    "Fraction of the prompt's blocks matched by the best pod per prefix-cache match attempt (0 = miss)",
+				Help:    "Fraction of the prompt's blocks the best-matching candidate pod had already cached, per prefix-cache match attempt (0 = miss)",
 				Buckets: []float64{0, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0},
 			},
 			[]string{LabelModel},
@@ -266,7 +266,7 @@ func NewMetrics() *Metrics {
 		PrefixCacheEvictionsTotal: *promauto.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "kthena_router_prefix_cache_evictions_total",
-				Help: "Number of hash entries evicted from a pod LRU due to capacity pressure",
+				Help: "Number of (prefix block, pod) entries evicted from a per-pod cache when it reached capacity; excludes entries removed when a pod is deleted",
 			},
 			[]string{LabelModel},
 		),
@@ -274,7 +274,7 @@ func NewMetrics() *Metrics {
 		KVCacheMatchRatio: *promauto.NewHistogramVec(
 			prometheus.HistogramOpts{
 				Name:    "kthena_router_kvcache_aware_match_ratio",
-				Help:    "Fraction of the prompt's blocks matched by the best pod per kvcache-aware match attempt (0 = miss)",
+				Help:    "Fraction of the prompt's blocks whose KV cache the best-matching candidate pod already held, per kvcache-aware match attempt (0 = miss)",
 				Buckets: []float64{0, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0},
 			},
 			[]string{LabelModel},
@@ -301,7 +301,7 @@ func NewMetrics() *Metrics {
 		KVCacheErrorsTotal: *promauto.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "kthena_router_kvcache_aware_errors_total",
-				Help: "Number of kvcache-aware match attempts that aborted on error, by stage",
+				Help: "Number of kvcache-aware match attempts aborted by an error, labelled by failing stage (tokenize or redis)",
 			},
 			[]string{LabelModel, LabelStage},
 		),
@@ -320,7 +320,7 @@ func NewMetrics() *Metrics {
 	m.PrefixCacheEntries = promauto.NewGaugeFunc(
 		prometheus.GaugeOpts{
 			Name: "kthena_router_prefix_cache_entries",
-			Help: "Current number of cached hash entries across all pod LRUs in the prefix-cache store",
+			Help: "Total prefix-cache occupancy: number of (prefix block, pod) entries currently stored across all pods; a block cached on N pods is counted N times (once per pod)",
 		},
 		func() float64 {
 			if p, ok := m.prefixCacheEntriesProvider.Load().(func() float64); ok && p != nil {
