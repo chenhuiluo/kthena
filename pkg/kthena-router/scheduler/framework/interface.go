@@ -46,14 +46,6 @@ type Context struct {
 	// 2. PD aggregated mode, BestPods is selected for inference.
 	BestPods []*datastore.PodInfo
 
-	// PreIncremented indicates the scheduler already incremented the on-flight
-	// counter for the primary candidate (speculative pre-increment) so that
-	// concurrent Schedule() calls see the updated load immediately.
-	PreIncremented bool
-	// PreIncrementedIdx is the index into BestPods (or DecodePods/PrefillPods)
-	// whose counter was pre-incremented. Only meaningful when PreIncremented is true.
-	PreIncrementedIdx int
-
 	// MetricsRecorder for recording scheduler plugin metrics
 	MetricsRecorder *metrics.RequestMetricsRecorder
 }

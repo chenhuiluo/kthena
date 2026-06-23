@@ -132,7 +132,6 @@ func CalculateFairnessPriority(source FairnessPrioritySource, userID, modelName 
 
 // Request represents a request item in the priority queue
 type Request struct {
-	ReqID        string
 	UserID       string  // User ID for fairness scheduling
 	ModelName    string  // Target model for per-model fair queuing
 	SessionID    string  // Session identifier for multi-turn conversations
@@ -270,8 +269,8 @@ func (pq *RequestPriorityQueue) PushRequest(r *Request) error {
 	pq.metricIncSize(r.ModelName, r.UserID)
 
 	if pq.sessionBoost && r.SessionBoost {
-		klog.V(4).Infof("[SessionBoost] session boost: reqID=%s sessionID=%s promoted, queueLen=%d",
-			r.ReqID, r.SessionID, len(pq.heap))
+		klog.V(4).Infof("[SessionBoost] session boost: sessionID=%s promoted, queueLen=%d",
+			r.SessionID, len(pq.heap))
 	}
 
 	// Signal that a new item is available

@@ -342,7 +342,7 @@ func (pq *RequestPriorityQueue) tryBackpressureDequeue(ctx context.Context) {
 
 		pq.admitSessionBoost(req)
 
-		klog.V(4).Infof("[SessionBoost] backpressure dequeue: reqID=%s user=%s model=%s sessionBoost=%v inflight=%d/%d",
-			req.ReqID, req.UserID, req.ModelName, req.SessionBoost, pq.inflightCount.Load(), maxInflight)
+		klog.V(4).Infof("[SessionBoost] backpressure dequeue: user=%s model=%s sessionBoost=%v inflight=%d/%d",
+			req.UserID, req.ModelName, req.SessionBoost, pq.inflightCount.Load(), maxInflight)
 	}
 }

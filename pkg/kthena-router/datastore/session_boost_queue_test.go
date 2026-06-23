@@ -45,7 +45,6 @@ func TestSessionBoostQueue_BasicPriorityOrdering(t *testing.T) {
 	now := time.Now()
 
 	normalReq := &Request{
-		ReqID:       "req-normal",
 		UserID:      "user-A",
 		ModelName:   "model-1",
 		SessionID:   "conv-999",
@@ -53,7 +52,6 @@ func TestSessionBoostQueue_BasicPriorityOrdering(t *testing.T) {
 		RequestTime: now,
 	}
 	boostReq := &Request{
-		ReqID:       "req-boosted",
 		UserID:      "user-B",
 		ModelName:   "model-1",
 		SessionID:   "conv-123",
@@ -72,8 +70,8 @@ func TestSessionBoostQueue_BasicPriorityOrdering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pop failed: %v", err)
 	}
-	if first.ReqID != "req-boosted" {
-		t.Errorf("Expected boosted request first, got %s", first.ReqID)
+	if first.UserID != "user-B" {
+		t.Errorf("Expected boosted request first, got %s", first.UserID)
 	}
 	if !first.SessionBoost {
 		t.Error("Boosted request should have SessionBoost=true")
@@ -83,8 +81,8 @@ func TestSessionBoostQueue_BasicPriorityOrdering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pop failed: %v", err)
 	}
-	if second.ReqID != "req-normal" {
-		t.Errorf("Expected normal request second, got %s", second.ReqID)
+	if second.UserID != "user-A" {
+		t.Errorf("Expected normal request second, got %s", second.UserID)
 	}
 	if second.SessionBoost {
 		t.Error("Normal request should have SessionBoost=false")
@@ -100,9 +98,9 @@ func TestSessionBoostQueue_FIFOWithinBoostStatus(t *testing.T) {
 
 	// Three non-boosted requests should come out in FIFO order
 	reqs := []*Request{
-		{ReqID: "req-1", UserID: "u1", ModelName: "m", RequestTime: now},
-		{ReqID: "req-2", UserID: "u2", ModelName: "m", RequestTime: now.Add(time.Millisecond)},
-		{ReqID: "req-3", UserID: "u3", ModelName: "m", RequestTime: now.Add(2 * time.Millisecond)},
+		{UserID: "u1", ModelName: "m", RequestTime: now},
+		{UserID: "u2", ModelName: "m", RequestTime: now.Add(time.Millisecond)},
+		{UserID: "u3", ModelName: "m", RequestTime: now.Add(2 * time.Millisecond)},
 	}
 	for _, r := range reqs {
 		if err := q.PushRequest(r); err != nil {
@@ -110,13 +108,13 @@ func TestSessionBoostQueue_FIFOWithinBoostStatus(t *testing.T) {
 		}
 	}
 
-	for i, expected := range []string{"req-1", "req-2", "req-3"} {
+	for i, expected := range []string{"u1", "u2", "u3"} {
 		got, err := q.popWhenAvailable(context.Background())
 		if err != nil {
 			t.Fatalf("Pop %d failed: %v", i, err)
 		}
-		if got.ReqID != expected {
-			t.Errorf("Position %d: expected %s, got %s", i, expected, got.ReqID)
+		if got.UserID != expected {
+			t.Errorf("Position %d: expected %s, got %s", i, expected, got.UserID)
 		}
 	}
 }
@@ -135,7 +133,6 @@ func TestSessionBoostQueue_BoostExpires(t *testing.T) {
 
 	now := time.Now()
 	req := &Request{
-		ReqID:       "req-1",
 		UserID:      "user-A",
 		ModelName:   "model-1",
 		SessionID:   "conv-123",
@@ -164,10 +161,10 @@ func TestSessionBoostQueue_MultipleSessions(t *testing.T) {
 
 	now := time.Now()
 	requests := []*Request{
-		{ReqID: "normal-1", UserID: "u1", ModelName: "m", SessionID: "conv-X", RequestTime: now},
-		{ReqID: "boost-A", UserID: "u2", ModelName: "m", SessionID: "conv-A", RequestTime: now.Add(time.Millisecond)},
-		{ReqID: "boost-B", UserID: "u3", ModelName: "m", SessionID: "conv-B", RequestTime: now.Add(2 * time.Millisecond)},
-		{ReqID: "normal-2", UserID: "u4", ModelName: "m", SessionID: "", RequestTime: now.Add(3 * time.Millisecond)},
+		{UserID: "u1", ModelName: "m", SessionID: "conv-X", RequestTime: now},
+		{UserID: "u2", ModelName: "m", SessionID: "conv-A", RequestTime: now.Add(time.Millisecond)},
+		{UserID: "u3", ModelName: "m", SessionID: "conv-B", RequestTime: now.Add(2 * time.Millisecond)},
+		{UserID: "u4", ModelName: "m", SessionID: "", RequestTime: now.Add(3 * time.Millisecond)},
 	}
 
 	for _, r := range requests {
@@ -190,19 +187,19 @@ func TestSessionBoostQueue_MultipleSessions(t *testing.T) {
 	}
 
 	// Among boosted: FIFO order (boost-A arrived before boost-B)
-	if first.ReqID != "boost-A" {
-		t.Errorf("Expected boost-A first (earlier arrival), got %s", first.ReqID)
+	if first.UserID != "u2" {
+		t.Errorf("Expected boost-A first (earlier arrival), got %s", first.UserID)
 	}
-	if second.ReqID != "boost-B" {
-		t.Errorf("Expected boost-B second, got %s", second.ReqID)
+	if second.UserID != "u3" {
+		t.Errorf("Expected boost-B second, got %s", second.UserID)
 	}
 
 	// Among normal: FIFO order
-	if third.ReqID != "normal-1" {
-		t.Errorf("Expected normal-1 third, got %s", third.ReqID)
+	if third.UserID != "u1" {
+		t.Errorf("Expected normal-1 third, got %s", third.UserID)
 	}
-	if fourth.ReqID != "normal-2" {
-		t.Errorf("Expected normal-2 fourth, got %s", fourth.ReqID)
+	if fourth.UserID != "u4" {
+		t.Errorf("Expected normal-2 fourth, got %s", fourth.UserID)
 	}
 }
 
@@ -219,9 +216,9 @@ func TestSessionBoostQueue_BackpressureMode(t *testing.T) {
 	defer q.Close()
 
 	now := time.Now()
-	req1 := &Request{ReqID: "req-1", UserID: "u1", ModelName: "m", RequestTime: now, NotifyChan: make(chan struct{})}
-	req2 := &Request{ReqID: "req-2", UserID: "u2", ModelName: "m", RequestTime: now.Add(time.Millisecond), NotifyChan: make(chan struct{})}
-	req3 := &Request{ReqID: "req-3", UserID: "u3", ModelName: "m", RequestTime: now.Add(2 * time.Millisecond), NotifyChan: make(chan struct{})}
+	req1 := &Request{UserID: "u1", ModelName: "m", RequestTime: now, NotifyChan: make(chan struct{})}
+	req2 := &Request{UserID: "u2", ModelName: "m", RequestTime: now.Add(time.Millisecond), NotifyChan: make(chan struct{})}
+	req3 := &Request{UserID: "u3", ModelName: "m", RequestTime: now.Add(2 * time.Millisecond), NotifyChan: make(chan struct{})}
 
 	for _, r := range []*Request{req1, req2, req3} {
 		if err := q.PushRequest(r); err != nil {
@@ -278,7 +275,6 @@ func TestSessionBoostQueue_GracePeriod_BoostedArrives(t *testing.T) {
 
 	now := time.Now()
 	req1 := &Request{
-		ReqID:       "req-1",
 		UserID:      "user-A",
 		ModelName:   "model-1",
 		SessionID:   "session-1",
@@ -302,7 +298,6 @@ func TestSessionBoostQueue_GracePeriod_BoostedArrives(t *testing.T) {
 	// Mark session completed and push a non-boosted request
 	q.MarkSessionCompleted("session-1")
 	nonBoosted := &Request{
-		ReqID:       "req-non-boosted",
 		UserID:      "user-B",
 		ModelName:   "model-1",
 		SessionID:   "other-session",
@@ -319,7 +314,6 @@ func TestSessionBoostQueue_GracePeriod_BoostedArrives(t *testing.T) {
 	// During grace, push a session-boosted follow-up
 	time.Sleep(20 * time.Millisecond)
 	boostedFollowUp := &Request{
-		ReqID:       "req-boosted-followup",
 		UserID:      "user-A",
 		ModelName:   "model-1",
 		SessionID:   "session-1",
@@ -354,7 +348,6 @@ func TestSessionBoostQueue_GracePeriod_NoBoostArrives(t *testing.T) {
 
 	now := time.Now()
 	req1 := &Request{
-		ReqID:       "req-1",
 		UserID:      "user-A",
 		ModelName:   "model-1",
 		RequestTime: now,
@@ -375,7 +368,6 @@ func TestSessionBoostQueue_GracePeriod_NoBoostArrives(t *testing.T) {
 	}
 
 	normalReq := &Request{
-		ReqID:       "req-normal",
 		UserID:      "user-B",
 		ModelName:   "model-1",
 		RequestTime: now.Add(time.Millisecond),
@@ -412,7 +404,6 @@ func TestSessionBoostQueue_DirectMode(t *testing.T) {
 
 	now := time.Now()
 	normalReq := &Request{
-		ReqID:       "req-normal",
 		UserID:      "user-A",
 		ModelName:   "model-1",
 		SessionID:   "other",
@@ -420,7 +411,6 @@ func TestSessionBoostQueue_DirectMode(t *testing.T) {
 		NotifyChan:  make(chan struct{}),
 	}
 	boostReq := &Request{
-		ReqID:       "req-boosted",
 		UserID:      "user-B",
 		ModelName:   "model-1",
 		SessionID:   "session-1",
@@ -468,14 +458,12 @@ func TestSessionBoostQueue_CancelledRequestsSkipped(t *testing.T) {
 	cancel() // Cancel immediately
 
 	cancelledReq := &Request{
-		ReqID:       "req-cancelled",
 		UserID:      "user-A",
 		ModelName:   "model-1",
 		RequestTime: now,
 		CancelCh:    cancelCtx.Done(),
 	}
 	normalReq := &Request{
-		ReqID:       "req-normal",
 		UserID:      "user-B",
 		ModelName:   "model-1",
 		RequestTime: now.Add(time.Millisecond),
@@ -492,8 +480,8 @@ func TestSessionBoostQueue_CancelledRequestsSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pop failed: %v", err)
 	}
-	if popped.ReqID != "req-normal" {
-		t.Errorf("Expected normal request (cancelled should be skipped), got %s", popped.ReqID)
+	if popped.UserID != "user-B" {
+		t.Errorf("Expected normal request (cancelled should be skipped), got %s", popped.UserID)
 	}
 }
 
@@ -506,7 +494,6 @@ func TestSessionBoostQueue_EmptySessionID(t *testing.T) {
 
 	now := time.Now()
 	req := &Request{
-		ReqID:       "req-1",
 		UserID:      "user-A",
 		ModelName:   "model-1",
 		SessionID:   "", // No session ID
@@ -538,7 +525,6 @@ func TestSessionBoostQueue_Len(t *testing.T) {
 	now := time.Now()
 	for i := 0; i < 5; i++ {
 		req := &Request{
-			ReqID:       "req-" + string(rune('0'+i)),
 			UserID:      "user",
 			ModelName:   "model",
 			RequestTime: now.Add(time.Duration(i) * time.Millisecond),

@@ -665,12 +665,8 @@ func (r *Router) proxy(
 		podObj := pod.GetPod()
 		podName := types.NamespacedName{Namespace: podObj.Namespace, Name: podObj.Name}
 
-		// Track this request as in-flight to the chosen pod. Skip for the
-		// pre-incremented candidate — the scheduler already bumped its counter
-		// to close the TOCTOU window between scoring and dispatching.
-		if !(ctx.PreIncremented && i == ctx.PreIncrementedIdx) {
-			r.store.IncrPodOnFlightRequests(podName)
-		}
+		// Track this request as in-flight to the chosen pod.
+		r.store.IncrPodOnFlightRequests(podName)
 
 		// Increment upstream request count with both modelServer and modelRoute
 		r.metrics.IncActiveUpstreamRequests(modelServerName, modelRouteName)
@@ -1014,22 +1010,11 @@ func (r *Router) proxyToPDDisaggregated(
 		// at the precise point each phase starts and ends.
 		prefillPodName := types.NamespacedName{Namespace: prefillPod.Namespace, Name: prefillPod.Name}
 		decodePodName := types.NamespacedName{Namespace: decodePod.Namespace, Name: decodePod.Name}
-		// For the pre-incremented pair the scheduler already bumped both counters,
-		// so the Incr hooks become no-ops to avoid double-counting.
-		preIncr := ctx.PreIncremented && i == ctx.PreIncrementedIdx
 		hooks := &connectors.OnFlightHooks{
-			IncrPrefill: func() {
-				if !preIncr {
-					r.store.IncrPodOnFlightRequests(prefillPodName)
-				}
-			},
+			IncrPrefill: func() { r.store.IncrPodOnFlightRequests(prefillPodName) },
 			DecrPrefill: func() { r.store.DecrPodOnFlightRequests(prefillPodName) },
-			IncrDecode: func() {
-				if !preIncr {
-					r.store.IncrPodOnFlightRequests(decodePodName)
-				}
-			},
-			DecrDecode: func() { r.store.DecrPodOnFlightRequests(decodePodName) },
+			IncrDecode:  func() { r.store.IncrPodOnFlightRequests(decodePodName) },
+			DecrDecode:  func() { r.store.DecrPodOnFlightRequests(decodePodName) },
 		}
 
 		// Execute the PD disaggregated proxy operation
@@ -1107,7 +1092,6 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 		pri = math.MaxFloat64
 	}
 	queueReq := &datastore.Request{
-		ReqID:       requestID,
 		UserID:      userId,
 		ModelName:   modelName,
 		SessionID:   sessionID,
