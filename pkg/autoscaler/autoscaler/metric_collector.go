@@ -155,18 +155,13 @@ func (collector *MetricCollector) planMetricSources(
 			klog.Warningf("metric source missing for metric %s in target %s", metricName, collector.Target.TargetRef.Name)
 			continue
 		}
-		sourceType := source.Type
-		if sourceType == "" {
-			sourceType = v1alpha1.PodMetricSourceType
-		}
-
-		switch sourceType {
-		case v1alpha1.PodMetricSourceType:
+		switch {
+		case source.Pod != nil:
 			addPodMetricToGroups(podGroups, metricName, source.Pod)
-		case v1alpha1.PrometheusMetricSourceType:
+		case source.Prometheus != nil:
 			collector.resolvePrometheusMetric(ctx, metricName, source.Prometheus, externalMetrics)
 		default:
-			klog.Warningf("unknown metric source type %q for metric %s", sourceType, metricName)
+			klog.Warningf("metric source backend config missing for metric %s", metricName)
 		}
 	}
 	return

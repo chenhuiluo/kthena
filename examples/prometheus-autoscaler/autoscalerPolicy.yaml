@@ -36,7 +36,6 @@ spec:
         name: podinfo-ms
       metricSources:
         podinfo_rps:
-          type: Prometheus
           prometheus:
             serverURL: http://kube-prometheus-stack-prometheus.test.svc.cluster.local:9090
             # Scope the query to this ModelServing's pods only. The ServiceMonitor

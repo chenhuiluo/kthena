@@ -140,9 +140,8 @@ spec:
       metricSources:
         # The key must match a metric name declared in spec.metrics above.
         num_requests_waiting:
-          type: Pod
           pod:
-            name: num_requests_waiting
+            name: kthena:num_requests_waiting
             uri: /metrics
             port: 8000
     minReplicas: 2
@@ -184,9 +183,8 @@ spec:
         metricSources:
           # The key must match a metric name declared in spec.metrics above.
           num_requests_waiting:
-            type: Pod
             pod:
-              name: num_requests_waiting
+              name: kthena:num_requests_waiting
               uri: /metrics
               port: 8000
       minReplicas: 1
@@ -198,9 +196,8 @@ spec:
           name: cpu-serving-instance
         metricSources:
           num_requests_waiting:
-            type: Pod
             pod:
-              name: num_requests_waiting
+              name: kthena:num_requests_waiting
               uri: /metrics
               port: 8000
       minReplicas: 2

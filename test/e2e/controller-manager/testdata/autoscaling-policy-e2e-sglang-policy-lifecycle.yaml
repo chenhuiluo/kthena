@@ -20,7 +20,6 @@ spec:
         name: autoscale-policy-lifecycle-ms
       metricSources:
         sglang:token_usage:
-          type: Pod
           pod:
             name: sglang:token_usage
             port: 30000

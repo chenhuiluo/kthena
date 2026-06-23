@@ -31,7 +31,6 @@ spec:
               matchLabels:
                 modelserving.volcano.sh/role: leader
             name: vllm:iteration_tokens_total
-          type: Pod
       targetRef:
         kind: ModelServing
         name: test-model-backend1

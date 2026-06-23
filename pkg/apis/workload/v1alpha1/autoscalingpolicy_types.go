@@ -185,9 +185,10 @@ type AutoscalingPolicyStatus struct {
 // TargetScalingStatus reports the observed scaling state of a single scalable
 // unit (a whole ModelServing, or one role within it).
 type TargetScalingStatus struct {
-	// Name identifies the unit. For HomogeneousTarget it is the ModelServing
-	// name; for a role it is the role name.
-	Name string `json:"name"`
+	// Name identifies the unit when this status appears in a list.
+	// It is required for HeterogeneousStatus entries and DisaggregatedStatus roles,
+	// and may be empty for HomogeneousStatus because the target is implied.
+	Name string `json:"name,omitempty"`
 
 	// CurrentReplicas is the number of replicas currently observed.
 	CurrentReplicas int32 `json:"currentReplicas"`
@@ -251,26 +252,16 @@ type AutoscalingPolicyList struct {
 	Items           []AutoscalingPolicy `json:"items"`
 }
 
-// MetricSourceType selects the backend from which a metric value is fetched.
-// +kubebuilder:validation:Enum=Pod;Prometheus
-type MetricSourceType string
-
-const (
-	PodMetricSourceType        MetricSourceType = "Pod"
-	PrometheusMetricSourceType MetricSourceType = "Prometheus"
-)
-
 // MetricSource is a discriminated union selecting the metric backend.
 //
-// Exactly one backend config must be provided and it must match Type:
-//   - Type: Pod        -> set the pod field only.
-//   - Type: Prometheus -> set the prometheus field only.
+// Exactly one backend config must be provided:
+//   - Pod        -> set the pod field only.
+//   - Prometheus -> set the prometheus field only.
 //
 // Example (scrape the metric directly from each pod's /metrics endpoint):
 //
 //	metricSources:
 //	  gpu_cache_usage:
-//	    type: Pod
 //	    pod:
 //	      name: vllm:gpu_cache_usage_perc
 //	      uri: /metrics
@@ -280,19 +271,13 @@ const (
 //
 //	metricSources:
 //	  http_rps:
-//	    type: Prometheus
 //	    prometheus:
 //	      serverURL: http://prometheus.monitoring.svc:9090
 //	      query: sum(rate(http_requests_total[2m]))
 //
-// +kubebuilder:validation:XValidation:rule="self.type != 'Prometheus' || has(self.prometheus)",message="prometheus config is required when type is Prometheus"
-// +kubebuilder:validation:XValidation:rule="self.type != 'Pod' || has(self.pod)",message="pod config is required when type is Pod"
-// +kubebuilder:validation:XValidation:rule="self.type != 'Prometheus' || !has(self.pod)",message="pod config must not be set when type is Prometheus"
-// +kubebuilder:validation:XValidation:rule="self.type != 'Pod' || !has(self.prometheus)",message="prometheus config must not be set when type is Pod"
+// +kubebuilder:validation:XValidation:rule="has(self.pod) || has(self.prometheus)",message="one metric source backend config is required"
+// +kubebuilder:validation:XValidation:rule="!(has(self.pod) && has(self.prometheus))",message="pod and prometheus configs are mutually exclusive"
 type MetricSource struct {
-	// Type selects the metric source backend.
-	// +kubebuilder:default="Pod"
-	Type MetricSourceType `json:"type"`
 	// Pod configures direct pod endpoint scraping.
 	// +optional
 	Pod *PodMetricSource `json:"pod,omitempty"`
@@ -372,23 +357,6 @@ type PrometheusMetricSource struct {
 type PrometheusAuth struct {
 }
 
-// PrometheusTLSConfig holds TLS settings for Prometheus HTTPS connections.
-//
-// NOTE: Not yet implemented; reserved for future use. The runtime currently
-// uses default TLS verification regardless of these fields.
-type PrometheusTLSConfig struct {
-	// InsecureSkipVerify disables TLS certificate verification.
-	//
-	// Not yet implemented; reserved for future use.
-	// +optional
-	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
-	// CASecret references a Secret key containing a PEM-encoded CA bundle.
-	//
-	// Not yet implemented; reserved for future use.
-	// +optional
-	CASecret *corev1.SecretKeySelector `json:"caSecret,omitempty"`
-}
-
 // Target defines a ModelServing deployment that can be monitored and scaled.
 //
 // Example:
@@ -399,7 +367,6 @@ type PrometheusTLSConfig struct {
 //	    name: podinfo-ms
 //	  metricSources:
 //	    podinfo_rps:
-//	      type: Prometheus
 //	      prometheus:
 //	        serverURL: http://prometheus.monitoring.svc:9090
 //	        query: sum(rate(http_requests_total[2m]))
@@ -430,7 +397,6 @@ type Target struct {
 //	      name: podinfo-ms
 //	    metricSources:
 //	      podinfo_rps:
-//	        type: Prometheus
 //	        prometheus:
 //	          serverURL: http://prometheus.monitoring.svc:9090
 //	          query: sum(rate(http_requests_total[2m]))

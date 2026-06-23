@@ -234,16 +234,14 @@ spec:
                           additionalProperties:
                             description: "MetricSource is a discriminated union selecting
                               the metric backend.\n\nExactly one backend config must
-                              be provided and it must match Type:\n  - Type: Pod        ->
-                              set the pod field only.\n  - Type: Prometheus -> set
-                              the prometheus field only.\n\nExample (scrape the metric
-                              directly from each pod's /metrics endpoint):\n\n\tmetricSources:\n\t
-                              \ gpu_cache_usage:\n\t    type: Pod\n\t    pod:\n\t
-                              \     name: vllm:gpu_cache_usage_perc\n\t      uri:
-                              /metrics\n\t      port: 8000\n\nExample (read the metric
-                              from an external Prometheus server):\n\n\tmetricSources:\n\t
-                              \ http_rps:\n\t    type: Prometheus\n\t    prometheus:\n\t
-                              \     serverURL: http://prometheus.monitoring.svc:9090\n\t
+                              be provided:\n  - Pod        -> set the pod field only.\n
+                              \ - Prometheus -> set the prometheus field only.\n\nExample
+                              (scrape the metric directly from each pod's /metrics
+                              endpoint):\n\n\tmetricSources:\n\t  gpu_cache_usage:\n\t
+                              \   pod:\n\t      name: vllm:gpu_cache_usage_perc\n\t
+                              \     uri: /metrics\n\t      port: 8000\n\nExample (read
+                              the metric from an external Prometheus server):\n\n\tmetricSources:\n\t
+                              \ http_rps:\n\t    prometheus:\n\t      serverURL: http://prometheus.monitoring.svc:9090\n\t
                               \     query: sum(rate(http_requests_total[2m]))"
                             properties:
                               pod:
@@ -343,27 +341,12 @@ spec:
                                 - query
                                 - serverURL
                                 type: object
-                              type:
-                                default: Pod
-                                description: Type selects the metric source backend.
-                                enum:
-                                - Pod
-                                - Prometheus
-                                type: string
-                            required:
-                            - type
                             type: object
                             x-kubernetes-validations:
-                            - message: prometheus config is required when type is
-                                Prometheus
-                              rule: self.type != 'Prometheus' || has(self.prometheus)
-                            - message: pod config is required when type is Pod
-                              rule: self.type != 'Pod' || has(self.pod)
-                            - message: pod config must not be set when type is Prometheus
-                              rule: self.type != 'Prometheus' || !has(self.pod)
-                            - message: prometheus config must not be set when type
-                                is Pod
-                              rule: self.type != 'Pod' || !has(self.prometheus)
+                            - message: one metric source backend config is required
+                              rule: has(self.pod) || has(self.prometheus)
+                            - message: pod and prometheus configs are mutually exclusive
+                              rule: '!(has(self.pod) && has(self.prometheus))'
                           description: |-
                             MetricSources declares how each metric is fetched for this role.
                             Keys must match role-level metrics when present, otherwise top-level
@@ -522,18 +505,16 @@ spec:
                               additionalProperties:
                                 description: "MetricSource is a discriminated union
                                   selecting the metric backend.\n\nExactly one backend
-                                  config must be provided and it must match Type:\n
-                                  \ - Type: Pod        -> set the pod field only.\n
-                                  \ - Type: Prometheus -> set the prometheus field
-                                  only.\n\nExample (scrape the metric directly from
-                                  each pod's /metrics endpoint):\n\n\tmetricSources:\n\t
-                                  \ gpu_cache_usage:\n\t    type: Pod\n\t    pod:\n\t
-                                  \     name: vllm:gpu_cache_usage_perc\n\t      uri:
-                                  /metrics\n\t      port: 8000\n\nExample (read the
-                                  metric from an external Prometheus server):\n\n\tmetricSources:\n\t
-                                  \ http_rps:\n\t    type: Prometheus\n\t    prometheus:\n\t
-                                  \     serverURL: http://prometheus.monitoring.svc:9090\n\t
-                                  \     query: sum(rate(http_requests_total[2m]))"
+                                  config must be provided:\n  - Pod        -> set
+                                  the pod field only.\n  - Prometheus -> set the prometheus
+                                  field only.\n\nExample (scrape the metric directly
+                                  from each pod's /metrics endpoint):\n\n\tmetricSources:\n\t
+                                  \ gpu_cache_usage:\n\t    pod:\n\t      name: vllm:gpu_cache_usage_perc\n\t
+                                  \     uri: /metrics\n\t      port: 8000\n\nExample
+                                  (read the metric from an external Prometheus server):\n\n\tmetricSources:\n\t
+                                  \ http_rps:\n\t    prometheus:\n\t      serverURL:
+                                  http://prometheus.monitoring.svc:9090\n\t      query:
+                                  sum(rate(http_requests_total[2m]))"
                                 properties:
                                   pod:
                                     description: Pod configures direct pod endpoint
@@ -634,28 +615,13 @@ spec:
                                     - query
                                     - serverURL
                                     type: object
-                                  type:
-                                    default: Pod
-                                    description: Type selects the metric source backend.
-                                    enum:
-                                    - Pod
-                                    - Prometheus
-                                    type: string
-                                required:
-                                - type
                                 type: object
                                 x-kubernetes-validations:
-                                - message: prometheus config is required when type
-                                    is Prometheus
-                                  rule: self.type != 'Prometheus' || has(self.prometheus)
-                                - message: pod config is required when type is Pod
-                                  rule: self.type != 'Pod' || has(self.pod)
-                                - message: pod config must not be set when type is
-                                    Prometheus
-                                  rule: self.type != 'Prometheus' || !has(self.pod)
-                                - message: prometheus config must not be set when
-                                    type is Pod
-                                  rule: self.type != 'Pod' || !has(self.prometheus)
+                                - message: one metric source backend config is required
+                                  rule: has(self.pod) || has(self.prometheus)
+                                - message: pod and prometheus configs are mutually
+                                    exclusive
+                                  rule: '!(has(self.pod) && has(self.prometheus))'
                               description: |-
                                 MetricSources declares how to fetch specific metrics for this target.
                                 Keys must match AutoscalingPolicy.spec.metrics[].name.
@@ -745,15 +711,13 @@ spec:
                         additionalProperties:
                           description: "MetricSource is a discriminated union selecting
                             the metric backend.\n\nExactly one backend config must
-                            be provided and it must match Type:\n  - Type: Pod        ->
-                            set the pod field only.\n  - Type: Prometheus -> set the
-                            prometheus field only.\n\nExample (scrape the metric directly
-                            from each pod's /metrics endpoint):\n\n\tmetricSources:\n\t
-                            \ gpu_cache_usage:\n\t    type: Pod\n\t    pod:\n\t      name:
-                            vllm:gpu_cache_usage_perc\n\t      uri: /metrics\n\t      port:
-                            8000\n\nExample (read the metric from an external Prometheus
-                            server):\n\n\tmetricSources:\n\t  http_rps:\n\t    type:
-                            Prometheus\n\t    prometheus:\n\t      serverURL: http://prometheus.monitoring.svc:9090\n\t
+                            be provided:\n  - Pod        -> set the pod field only.\n
+                            \ - Prometheus -> set the prometheus field only.\n\nExample
+                            (scrape the metric directly from each pod's /metrics endpoint):\n\n\tmetricSources:\n\t
+                            \ gpu_cache_usage:\n\t    pod:\n\t      name: vllm:gpu_cache_usage_perc\n\t
+                            \     uri: /metrics\n\t      port: 8000\n\nExample (read
+                            the metric from an external Prometheus server):\n\n\tmetricSources:\n\t
+                            \ http_rps:\n\t    prometheus:\n\t      serverURL: http://prometheus.monitoring.svc:9090\n\t
                             \     query: sum(rate(http_requests_total[2m]))"
                           properties:
                             pod:
@@ -853,26 +817,12 @@ spec:
                               - query
                               - serverURL
                               type: object
-                            type:
-                              default: Pod
-                              description: Type selects the metric source backend.
-                              enum:
-                              - Pod
-                              - Prometheus
-                              type: string
-                          required:
-                          - type
                           type: object
                           x-kubernetes-validations:
-                          - message: prometheus config is required when type is Prometheus
-                            rule: self.type != 'Prometheus' || has(self.prometheus)
-                          - message: pod config is required when type is Pod
-                            rule: self.type != 'Pod' || has(self.pod)
-                          - message: pod config must not be set when type is Prometheus
-                            rule: self.type != 'Prometheus' || !has(self.pod)
-                          - message: prometheus config must not be set when type is
-                              Pod
-                            rule: self.type != 'Pod' || !has(self.prometheus)
+                          - message: one metric source backend config is required
+                            rule: has(self.pod) || has(self.prometheus)
+                          - message: pod and prometheus configs are mutually exclusive
+                            rule: '!(has(self.pod) && has(self.prometheus))'
                         description: |-
                           MetricSources declares how to fetch specific metrics for this target.
                           Keys must match AutoscalingPolicy.spec.metrics[].name.
@@ -1094,13 +1044,13 @@ spec:
                           type: string
                         name:
                           description: |-
-                            Name identifies the unit. For HomogeneousTarget it is the ModelServing
-                            name; for a role it is the role name.
+                            Name identifies the unit when this status appears in a list.
+                            It is required for HeterogeneousStatus entries and DisaggregatedStatus roles,
+                            and may be empty for HomogeneousStatus because the target is implied.
                           type: string
                       required:
                       - currentReplicas
                       - desiredReplicas
-                      - name
                       type: object
                     type: array
                 required:
@@ -1137,13 +1087,13 @@ spec:
                       type: string
                     name:
                       description: |-
-                        Name identifies the unit. For HomogeneousTarget it is the ModelServing
-                        name; for a role it is the role name.
+                        Name identifies the unit when this status appears in a list.
+                        It is required for HeterogeneousStatus entries and DisaggregatedStatus roles,
+                        and may be empty for HomogeneousStatus because the target is implied.
                       type: string
                   required:
                   - currentReplicas
                   - desiredReplicas
-                  - name
                   type: object
                 type: array
               homogeneousStatus:
@@ -1172,13 +1122,13 @@ spec:
                     type: string
                   name:
                     description: |-
-                      Name identifies the unit. For HomogeneousTarget it is the ModelServing
-                      name; for a role it is the role name.
+                      Name identifies the unit when this status appears in a list.
+                      It is required for HeterogeneousStatus entries and DisaggregatedStatus roles,
+                      and may be empty for HomogeneousStatus because the target is implied.
                     type: string
                 required:
                 - currentReplicas
                 - desiredReplicas
-                - name
                 type: object
               observedGeneration:
                 description: ObservedGeneration is the most recent generation observed

@@ -63,7 +63,6 @@ func buildDefaultPodMetricSources(autoscalingPolicy *workload.AutoscalingPolicyS
 	}
 	for _, metric := range autoscalingPolicy.Metrics {
 		sources[metric.Name] = workload.MetricSource{
-			Type: workload.PodMetricSourceType,
 			Pod: &workload.PodMetricSource{
 				Name: metric.Name,
 				LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{

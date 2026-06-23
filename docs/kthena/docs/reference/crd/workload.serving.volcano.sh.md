@@ -330,7 +330,6 @@ Example (scale podinfo-ms between 1 and 6 replicas based on RPS):
 	      name: podinfo-ms
 	    metricSources:
 	      podinfo_rps:
-	        type: Prometheus
 	        prometheus:
 	          serverURL: http://prometheus.monitoring.svc:9090
 	          query: sum(rate(http_requests_total[2m]))
@@ -370,15 +369,14 @@ _Appears in:_
 
 MetricSource is a discriminated union selecting the metric backend.
 
-Exactly one backend config must be provided and it must match Type:
-  - Type: Pod        -> set the pod field only.
-  - Type: Prometheus -> set the prometheus field only.
+Exactly one backend config must be provided:
+  - Pod        -> set the pod field only.
+  - Prometheus -> set the prometheus field only.
 
 Example (scrape the metric directly from each pod's /metrics endpoint):
 
 	metricSources:
 	  gpu_cache_usage:
-	    type: Pod
 	    pod:
 	      name: vllm:gpu_cache_usage_perc
 	      uri: /metrics
@@ -388,7 +386,6 @@ Example (read the metric from an external Prometheus server):
 
 	metricSources:
 	  http_rps:
-	    type: Prometheus
 	    prometheus:
 	      serverURL: http://prometheus.monitoring.svc:9090
 	      query: sum(rate(http_requests_total[2m]))
@@ -401,27 +398,8 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `type` _[MetricSourceType](#metricsourcetype)_ | Type selects the metric source backend. | Pod | Enum: [Pod Prometheus] <br /> |
 | `pod` _[PodMetricSource](#podmetricsource)_ | Pod configures direct pod endpoint scraping. |  |  |
 | `prometheus` _[PrometheusMetricSource](#prometheusmetricsource)_ | Prometheus configures an external Prometheus server as the metric source. |  |  |
-
-
-#### MetricSourceType
-
-_Underlying type:_ _string_
-
-MetricSourceType selects the backend from which a metric value is fetched.
-
-_Validation:_
-- Enum: [Pod Prometheus]
-
-_Appears in:_
-- [MetricSource](#metricsource)
-
-| Field | Description |
-| --- | --- |
-| `Pod` |  |
-| `Prometheus` |  |
 
 
 #### ModelBackend
@@ -855,8 +833,6 @@ _Appears in:_
 | `auth` _[PrometheusAuth](#prometheusauth)_ | Auth holds optional authentication configuration for the Prometheus server. |  |  |
 
 
-
-
 #### RecoveryPolicy
 
 _Underlying type:_ _string_
@@ -1056,7 +1032,6 @@ Example:
 	    name: podinfo-ms
 	  metricSources:
 	    podinfo_rps:
-	      type: Prometheus
 	      prometheus:
 	        serverURL: http://prometheus.monitoring.svc:9090
 	        query: sum(rate(http_requests_total[2m]))
@@ -1088,7 +1063,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `name` _string_ | Name identifies the unit. For HomogeneousTarget it is the ModelServing<br />name; for a role it is the role name. |  |  |
+| `name` _string_ | Name identifies the unit when this status appears in a list.<br />It is required for HeterogeneousStatus entries and DisaggregatedStatus roles,<br />and may be empty for HomogeneousStatus because the target is implied. |  |  |
 | `currentReplicas` _integer_ | CurrentReplicas is the number of replicas currently observed. |  |  |
 | `desiredReplicas` _integer_ | DesiredReplicas is the number of replicas the controller computed from<br />metrics, before ratio enforcement. |  |  |
 | `mode` _string_ | Mode reports whether the unit is currently in "Stable" or "Panic" mode. |  |  |
