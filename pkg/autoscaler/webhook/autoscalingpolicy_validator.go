@@ -124,10 +124,7 @@ func (v *AutoscalingPolicyValidator) validateAutoscalingPolicy(policy *registryv
 // validateTarget validates the target configuration of an AutoscalingPolicy.
 //
 // Exactly one of homogeneousTarget, heterogeneousTarget, or disaggregatedTarget
-// must be set. This rule is enforced here (in the webhook) rather than via a CEL
-// rule on AutoscalingPolicySpec, because AutoscalingPolicySpec is also embedded
-// into ModelBooster, where the target is derived by the controller and left
-// unset by users.
+// must be set.
 func (v *AutoscalingPolicyValidator) validateTarget(policy *registryv1.AutoscalingPolicy) field.ErrorList {
 	var allErrs field.ErrorList
 	specPath := field.NewPath("spec")

@@ -27,9 +27,7 @@ import (
 // At most one of HomogeneousTarget, HeterogeneousTarget, or DisaggregatedTarget
 // may be set. When the spec is used standalone (as an AutoscalingPolicy custom
 // resource), exactly one target must be set; this is enforced by the
-// autoscalingpolicy validating webhook rather than a CEL rule, because
-// AutoscalingPolicySpec is also embedded into ModelBooster where the target is
-// derived by the controller and therefore left unset by users.
+// autoscalingpolicy validating webhook rather than a CEL rule.
 type AutoscalingPolicySpec struct {
 	// TolerancePercent defines the percentage of deviation tolerated before scaling actions are triggered.
 	// current_replicas represents the current number of instances, while target_replicas represents the expected number of instances calculated from monitoring metrics.

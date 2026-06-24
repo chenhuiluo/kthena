@@ -28,12 +28,6 @@ The validation webhook enforces the following rules for ModelBooster resources:
 - Container image references cannot contain spaces
 - Basic format validation is performed on image strings
 
-### Autoscaling Policy Resource Validation
-
-- Ensures metric target values are positive
-- Rejects duplicate metric names
-- Validates scale up and scale down policy periods
-
 ## Default Values (Mutator Webhook)
 
 The mutating webhook applies ModelBooster defaults when certain fields are omitted.
@@ -44,10 +38,8 @@ The mutating webhook applies ModelBooster defaults when certain fields are omitt
 
 - **Validation**:
     - `/validate/modelbooster`
-    - `/validate/autoscalingpolicy`
 - **Mutation**:
     - `/mutate/modelbooster`
-    - `/mutate/autoscalingpolicy`
 - **Health Check**: `/healthz`
 
 ### Default Settings
@@ -105,7 +97,7 @@ To add new default values to the mutating webhook:
 
 ### Adding Support for New Resources
 
-To extend the webhooks to support additional resource types:
+To extend the webhooks to support additional ModelBooster-related resource types:
 
 1. **Create new handler functions** following the pattern in `validator.go` and `mutator.go`
 2. **Register new endpoints** in `cmd/kthena-controller-manager/main.go`:

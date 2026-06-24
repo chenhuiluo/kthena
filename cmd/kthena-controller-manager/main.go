@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/spf13/pflag"
+	autoscalerwebhook "github.com/volcano-sh/kthena/pkg/autoscaler/webhook"
 	"github.com/volcano-sh/kthena/pkg/controller"
 	modelboosterwebhook "github.com/volcano-sh/kthena/pkg/model-booster-controller/webhook"
 	modelservingwebhook "github.com/volcano-sh/kthena/pkg/model-serving-controller/webhook"
@@ -184,8 +185,8 @@ func setupWebhook(ctx context.Context, wc webhookConfig) error {
 
 	modelValidator := modelboosterwebhook.NewModelValidator()
 	modelMutator := modelboosterwebhook.NewModelMutator()
-	autoscalingPolicyValidator := modelboosterwebhook.NewAutoscalingPolicyValidator()
-	autoscalingPolicyMutator := modelboosterwebhook.NewAutoscalingPolicyMutator()
+	autoscalingPolicyValidator := autoscalerwebhook.NewAutoscalingPolicyValidator()
+	autoscalingPolicyMutator := autoscalerwebhook.NewAutoscalingPolicyMutator()
 	mux.HandleFunc("/validate/modelbooster", modelValidator.Handle)
 	mux.HandleFunc("/mutate/modelbooster", modelMutator.Handle)
 	mux.HandleFunc("/validate/autoscalingpolicy", autoscalingPolicyValidator.Handle)
