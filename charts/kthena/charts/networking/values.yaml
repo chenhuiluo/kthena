@@ -50,6 +50,32 @@ kthenaRouter:
     inputTokenWeight: 1.0
     # outputTokenWeight is the weight multiplier for output tokens in priority calculation (default: 2.0)
     outputTokenWeight: 2.0
+    # maxConcurrent is the global total inflight request limit admitted to backends.
+    # It is reused by session-boost mode; size it as the estimated per-pod concurrency
+    # (e.g. vLLM's --max-num-seqs) multiplied by the number of backend pods.
+    # 0 or unset uses the router default (16).
+    maxConcurrent: 0
+    # sessionBoost is a mode of the fairness queue (it requires fairness.enabled=true).
+    # When enabled, the fairness queue switches from per-user fair queuing to
+    # session-aware boosting to maximize prefix cache hits for multi-turn
+    # conversations. The two modes are mutually exclusive.
+    sessionBoost:
+      # enabled controls whether session-boost mode is active on the fairness queue
+      enabled: false
+      # header is the HTTP header used to identify conversation sessions
+      header: "X-Session-ID"
+      # maxSessions is the maximum number of recently-completed sessions kept "warm"
+      # for boosting. It bounds an LRU cache: when exceeded, the least-recently-used
+      # session is evicted automatically. Size it by the number of concurrent
+      # conversations you want to keep boosted (default: 4096).
+      maxSessions: 4096
+      # gracePeriod is the wait time after a request completes for a same-session
+      # follow-up to arrive. Disabled by default (0s); enable only if you understand
+      # the latency trade-off for non-boosted requests.
+      gracePeriod: "0s"
+      # pollInterval is the interval at which the queue polls backend pod metrics
+      # to check available capacity (default: 100ms)
+      pollInterval: "100ms"
   # accessLog configuration for request logging
   accessLog:
     # enabled controls whether access logging is active

@@ -70,10 +70,13 @@ type FairnessQueueConfig struct {
 	// sessions. Only meaningful when SessionBoostEnabled is true.
 	SessionIDHeader string
 
-	// SessionBoostTTL is the duration after which a session boost expires. Requests
-	// from the same session that arrive within this window after the previous
-	// request completed are boosted.
-	SessionBoostTTL time.Duration
+	// SessionBoostMaxSessions is the maximum number of recently-completed sessions
+	// the queue remembers for boosting. It bounds an LRU cache: when the limit is
+	// exceeded, the least-recently-used session is evicted. Sizing this by the
+	// number of conversations to keep "warm" is more intuitive than a time-based
+	// TTL and mirrors how inference engines evict their prefix cache. When <= 0, a
+	// default of defaultSessionBoostMaxSessions is used.
+	SessionBoostMaxSessions int
 
 	// SessionBoostGracePeriod is the duration to wait after a release before
 	// dequeuing the next request in backpressure mode. This gives the same session
@@ -90,6 +93,11 @@ type FairnessQueueConfig struct {
 // session-boost mode when MaxConcurrent is not set (<= 0).
 const defaultSessionBoostMaxConcurrent = 16
 
+// defaultSessionBoostMaxSessions is the LRU capacity (number of recently-completed
+// sessions remembered for boosting) used when SessionBoostMaxSessions is not set
+// (<= 0). Each entry is tiny (a session ID), so the default is generous.
+const defaultSessionBoostMaxSessions = 4096
+
 // DefaultFairnessQueueConfig returns backward-compatible defaults.
 func DefaultFairnessQueueConfig() FairnessQueueConfig {
 	return FairnessQueueConfig{
@@ -100,7 +108,7 @@ func DefaultFairnessQueueConfig() FairnessQueueConfig {
 		TokenWeight:               1.0,
 		RequestNumWeight:          0.0,
 		SessionBoostEnabled:       false,
-		SessionBoostTTL:           60 * time.Second,
+		SessionBoostMaxSessions:   defaultSessionBoostMaxSessions,
 		SessionBoostGracePeriod:   0,
 		BackpressurePollInterval:  100 * time.Millisecond,
 	}
@@ -195,11 +203,11 @@ func NewRequestPriorityQueueWithConfig(metricsInstance *metrics.Metrics, cfg Fai
 	}
 	if cfg.SessionBoostEnabled {
 		pq.sessionBoost = true
-		ttl := cfg.SessionBoostTTL
-		if ttl <= 0 {
-			ttl = DefaultFairnessQueueConfig().SessionBoostTTL
+		maxSessions := cfg.SessionBoostMaxSessions
+		if maxSessions <= 0 {
+			maxSessions = defaultSessionBoostMaxSessions
 		}
-		pq.sessionTracker = NewSessionTracker(ttl)
+		pq.sessionTracker = NewSessionTracker(maxSessions)
 		pq.releaseCh = make(chan struct{}, 1)
 		if len(checker) > 0 && checker[0] != nil {
 			pq.backendChecker = checker[0]

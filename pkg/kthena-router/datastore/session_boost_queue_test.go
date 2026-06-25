@@ -119,17 +119,17 @@ func TestSessionBoostQueue_FIFOWithinBoostStatus(t *testing.T) {
 	}
 }
 
-func TestSessionBoostQueue_BoostExpires(t *testing.T) {
+func TestSessionBoostQueue_BoostEvictedByLRU(t *testing.T) {
 	cfg := sessionBoostConfig()
-	cfg.SessionBoostTTL = 50 * time.Millisecond
-	cfg.SessionBoostGracePeriod = 0
-	cfg.BackpressurePollInterval = 100 * time.Millisecond
-	cfg.MaxConcurrent = 1
+	cfg.SessionBoostMaxSessions = 2 // remember only the 2 most-recently-completed sessions
 	q := newSessionBoostQueue(cfg)
 	defer q.Close()
 
+	// conv-123 completes first; two newer sessions then complete and push it out
+	// of the LRU cache.
 	q.MarkSessionCompleted("conv-123")
-	time.Sleep(60 * time.Millisecond)
+	q.MarkSessionCompleted("conv-456")
+	q.MarkSessionCompleted("conv-789")
 
 	now := time.Now()
 	req := &Request{
@@ -147,7 +147,37 @@ func TestSessionBoostQueue_BoostExpires(t *testing.T) {
 		t.Fatalf("Pop failed: %v", err)
 	}
 	if popped.SessionBoost {
-		t.Error("Request should not have SessionBoost after TTL expired")
+		t.Error("Request should not have SessionBoost after its session was evicted from the LRU cache")
+	}
+}
+
+// TestSessionTracker_LRU verifies bounded capacity, eviction order, and that
+// re-completing a session refreshes its recency (promotes it away from eviction).
+func TestSessionTracker_LRU(t *testing.T) {
+	st := NewSessionTracker(2)
+
+	st.MarkCompleted("a")
+	st.MarkCompleted("b")
+	if !st.HasRecentCompletion("a") || !st.HasRecentCompletion("b") {
+		t.Fatal("both a and b should be tracked")
+	}
+
+	// Re-complete "a" so it becomes most-recently-used; "b" is now the LRU entry.
+	st.MarkCompleted("a")
+	// Completing "c" exceeds capacity and should evict "b" (the LRU), not "a".
+	st.MarkCompleted("c")
+
+	if st.HasRecentCompletion("b") {
+		t.Error("b should have been evicted as the least-recently-used session")
+	}
+	if !st.HasRecentCompletion("a") {
+		t.Error("a should still be tracked after being promoted")
+	}
+	if !st.HasRecentCompletion("c") {
+		t.Error("c should be tracked")
+	}
+	if got := st.ActiveSessions(); got != 2 {
+		t.Errorf("expected 2 tracked sessions, got %d", got)
 	}
 }
 
@@ -208,7 +238,6 @@ func TestSessionBoostQueue_BackpressureMode(t *testing.T) {
 	checker := func() bool { return backendHasCapacity }
 
 	cfg := sessionBoostConfig()
-	cfg.SessionBoostTTL = 5 * time.Second
 	cfg.SessionBoostGracePeriod = 0
 	cfg.BackpressurePollInterval = 10 * time.Millisecond
 	cfg.MaxConcurrent = 2 // global total inflight limit
@@ -266,7 +295,6 @@ func TestSessionBoostQueue_GracePeriod_BoostedArrives(t *testing.T) {
 	checker := func() bool { return true }
 
 	cfg := sessionBoostConfig()
-	cfg.SessionBoostTTL = 5 * time.Second
 	cfg.SessionBoostGracePeriod = 200 * time.Millisecond
 	cfg.BackpressurePollInterval = 50 * time.Millisecond
 	cfg.MaxConcurrent = 1
@@ -339,7 +367,6 @@ func TestSessionBoostQueue_GracePeriod_NoBoostArrives(t *testing.T) {
 	checker := func() bool { return true }
 
 	cfg := sessionBoostConfig()
-	cfg.SessionBoostTTL = 5 * time.Second
 	cfg.SessionBoostGracePeriod = 100 * time.Millisecond
 	cfg.BackpressurePollInterval = 50 * time.Millisecond
 	cfg.MaxConcurrent = 1

@@ -17,6 +17,7 @@ limitations under the License.
 package datastore
 
 import (
+	"container/list"
 	"context"
 	"sync"
 	"time"
@@ -36,69 +37,85 @@ import (
 // can accept a new request without queuing.
 type BackendWaitingChecker func() bool
 
-// SessionTracker tracks recently completed sessions for priority boosting.
-// It maps correlation IDs to their last completion time, allowing follow-up
-// requests in the same session to be prioritized for prefix cache utilization.
+// SessionTracker tracks recently completed sessions for priority boosting using
+// a bounded LRU cache. It remembers the N most-recently-completed sessions (N is
+// the configured capacity); follow-up requests belonging to one of those sessions
+// are boosted so they can reuse the still-warm prefix cache on the backend.
+//
+// An LRU bound is used instead of a time-based TTL because it directly mirrors how
+// inference engines (e.g. vLLM) evict their KV/prefix cache: the least-recently-used
+// sessions fall out first. This means operators only need to size the cache by the
+// number of concurrent conversations they want to keep warm, rather than guessing a
+// duration. Under high load, stale sessions are evicted quickly; under low load,
+// keeping a few extra entries is harmless because boosting only matters when the
+// queue is contended.
 type SessionTracker struct {
-	mu       sync.RWMutex
-	sessions map[string]time.Time // sessionID -> last completion time
-	ttl      time.Duration
+	mu       sync.Mutex
+	capacity int
+	// ll holds session IDs ordered by recency: front = most recently completed,
+	// back = least recently used (next to be evicted).
+	ll    *list.List
+	items map[string]*list.Element // sessionID -> element in ll
 }
 
-// NewSessionTracker creates a new session tracker with the given TTL.
-func NewSessionTracker(ttl time.Duration) *SessionTracker {
+// NewSessionTracker creates a new session tracker that remembers up to capacity
+// most-recently-completed sessions. A non-positive capacity falls back to the
+// default.
+func NewSessionTracker(capacity int) *SessionTracker {
+	if capacity <= 0 {
+		capacity = defaultSessionBoostMaxSessions
+	}
 	return &SessionTracker{
-		sessions: make(map[string]time.Time),
-		ttl:      ttl,
+		capacity: capacity,
+		ll:       list.New(),
+		items:    make(map[string]*list.Element),
 	}
 }
 
-// MarkCompleted records that a request from the given session has completed.
+// MarkCompleted records that a request from the given session has completed,
+// promoting it to the most-recently-used position. When the cache exceeds its
+// capacity, the least-recently-used session is evicted.
 func (st *SessionTracker) MarkCompleted(sessionID string) {
 	if sessionID == "" {
 		return
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	st.sessions[sessionID] = time.Now()
+	if el, ok := st.items[sessionID]; ok {
+		st.ll.MoveToFront(el)
+		return
+	}
+	el := st.ll.PushFront(sessionID)
+	st.items[sessionID] = el
+	if st.ll.Len() > st.capacity {
+		oldest := st.ll.Back()
+		if oldest != nil {
+			st.ll.Remove(oldest)
+			delete(st.items, oldest.Value.(string))
+			klog.V(4).Infof("[SessionTracker] evicted LRU session %q, tracked=%d/%d",
+				oldest.Value.(string), st.ll.Len(), st.capacity)
+		}
+	}
 }
 
-// HasRecentCompletion checks if the given session ID has a completion within the TTL window.
+// HasRecentCompletion reports whether the given session ID is currently tracked
+// (i.e. it is among the N most-recently-completed sessions). It is a pure read and
+// does not change recency ordering.
 func (st *SessionTracker) HasRecentCompletion(sessionID string) bool {
 	if sessionID == "" {
 		return false
 	}
-	st.mu.RLock()
-	defer st.mu.RUnlock()
-	completionTime, exists := st.sessions[sessionID]
-	if !exists {
-		return false
-	}
-	return time.Since(completionTime) <= st.ttl
-}
-
-// Cleanup removes expired sessions. Should be called periodically.
-func (st *SessionTracker) Cleanup() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	now := time.Now()
-	expired := 0
-	for id, t := range st.sessions {
-		if now.Sub(t) > st.ttl {
-			delete(st.sessions, id)
-			expired++
-		}
-	}
-	if expired > 0 {
-		klog.V(4).Infof("[SessionTracker] cleanup: removed %d expired sessions, remaining=%d", expired, len(st.sessions))
-	}
+	_, exists := st.items[sessionID]
+	return exists
 }
 
 // ActiveSessions returns the number of sessions currently tracked.
 func (st *SessionTracker) ActiveSessions() int {
-	st.mu.RLock()
-	defer st.mu.RUnlock()
-	return len(st.sessions)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.ll.Len()
 }
 
 // MarkSessionCompleted records that a request from the given session has completed,
@@ -123,9 +140,6 @@ func (pq *RequestPriorityQueue) GetInflightCount() int64 {
 // runSessionBoostMode is the session-boost dequeue loop. It uses backend backpressure
 // when a checker is configured, otherwise dequeues directly (no rate limiting).
 func (pq *RequestPriorityQueue) runSessionBoostMode(ctx context.Context) {
-	// Start session tracker cleanup goroutine
-	go pq.runSessionCleanup(ctx)
-
 	if pq.backendChecker != nil {
 		pq.runBackpressureMode(ctx)
 		return
@@ -168,28 +182,6 @@ func (pq *RequestPriorityQueue) runDirectMode(ctx context.Context) {
 			continue
 		}
 		pq.admitSessionBoost(req)
-	}
-}
-
-// runSessionCleanup periodically cleans up expired sessions from the session tracker.
-func (pq *RequestPriorityQueue) runSessionCleanup(ctx context.Context) {
-	cleanupInterval := pq.config.SessionBoostTTL
-	if cleanupInterval < 10*time.Second {
-		cleanupInterval = 10 * time.Second
-	}
-	ticker := time.NewTicker(cleanupInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-pq.stopCh:
-			return
-		case <-ticker.C:
-			if pq.sessionTracker != nil {
-				pq.sessionTracker.Cleanup()
-			}
-		}
 	}
 }
 

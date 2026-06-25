@@ -87,6 +87,25 @@ spec:
               value: {{ .Values.kthenaRouter.fairness.inputTokenWeight | quote }}
             - name: FAIRNESS_OUTPUT_TOKEN_WEIGHT
               value: {{ .Values.kthenaRouter.fairness.outputTokenWeight | quote }}
+            {{- if .Values.kthenaRouter.fairness.maxConcurrent }}
+            - name: FAIRNESS_MAX_CONCURRENT
+              value: {{ .Values.kthenaRouter.fairness.maxConcurrent | quote }}
+            {{- end }}
+            # Session boost is a mode of the fairness queue
+            {{- with .Values.kthenaRouter.fairness.sessionBoost }}
+            {{- if .enabled }}
+            - name: ENABLE_SESSION_BOOST
+              value: "true"
+            - name: SESSION_BOOST_HEADER
+              value: {{ .header | quote }}
+            - name: SESSION_BOOST_MAX_SESSIONS
+              value: {{ .maxSessions | quote }}
+            - name: SESSION_BOOST_GRACE_PERIOD
+              value: {{ .gracePeriod | quote }}
+            - name: SESSION_BOOST_POLL_INTERVAL
+              value: {{ .pollInterval | quote }}
+            {{- end }}
+            {{- end }}
             {{- end }}
             # Access log configuration
             - name: ACCESS_LOG_ENABLED

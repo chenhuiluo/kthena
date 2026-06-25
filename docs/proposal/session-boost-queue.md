@@ -77,9 +77,9 @@ Session boost is a mode of the shared per-model request priority queue that sits
 │                                                          │
 │  ┌──────────────────┐     ┌─────────────────────────┐    │
 │  │ SessionTracker   │◀────│ MarkSessionCompleted()  │    │
-│  │                  │     │ (after response sent)   │    │
-│  │ map[corrID]time  │     └─────────────────────────┘    │
-│  │ TTL: 60s default │                                    │
+│  │ (bounded LRU)    │     │ (after response sent)   │    │
+│  │ keys: sessionID  │     └─────────────────────────┘    │
+│  │ cap: 4096 default│                                    │
 │  └────────┬─────────┘                                    │
 │            │                                             │
 │            │ HasRecentCompletion(corrID)?                │
@@ -127,12 +127,12 @@ User A, Session "conv-123":
   │  boost)  │    │   order) │    │              │    │                │
   └──────────┘    └──────────┘    └──────────────┘    └───────┬────────┘
                                                               │
-                            SessionTracker["conv-123"] = now  │
+                          SessionTracker.MarkCompleted("conv-123")  │
                                                               │
   Turn 2: "Can you give more details on pods?"                │
   ┌──────────┐                                                │
   │  Enqueue  │ ◀── HasRecentCompletion("conv-123") = true ───┘
-  │  (BOOST   │     (within TTL)
+  │  (BOOST   │     (still in LRU cache)
   │   =true)  │
   └────┬─────┘
        │
@@ -174,7 +174,7 @@ Timeline:
 | `ENABLE_FAIRNESS_SCHEDULING`  | `false`        | Enable the fairness queue. Required for session boost, which runs as a mode of this queue                                                                                                     |
 | `ENABLE_SESSION_BOOST`        | `false`        | Enable session-boost mode on the fairness queue (requires `ENABLE_FAIRNESS_SCHEDULING=true`)                                                                                                  |
 | `SESSION_BOOST_HEADER`        | `X-Session-ID` | HTTP header used to identify conversation sessions                                                                                                                                            |
-| `SESSION_BOOST_TTL`           | `60s`          | Duration after which a session boost expires                                                                                                                                                  |
+| `SESSION_BOOST_MAX_SESSIONS`  | `4096`         | Maximum number of recently-completed sessions kept warm for boosting. Bounds an LRU cache; the least-recently-used session is evicted when exceeded. Sized by session count, not time         |
 | `SESSION_BOOST_GRACE_PERIOD`  | `0`            | Wait time after release for same-session follow-up. Disabled by default; enable only when you understand the latency trade-off                                                                |
 | `SESSION_BOOST_POLL_INTERVAL` | `100ms`        | Backend capacity polling interval                                                                                                                                                             |
 | `FAIRNESS_MAX_CONCURRENT`     | `16`           | Reused from fairness scheduling as the global (total) inflight limit in session-boost mode. Operators size it from the estimated per-pod concurrency multiplied by the number of backend pods |
@@ -197,7 +197,7 @@ type FairnessQueueConfig struct {
 
     SessionBoostEnabled      bool          // Switch from user-fairness to session-boost mode
     SessionIDHeader          string        // HTTP header for session identification
-    SessionBoostTTL          time.Duration // How long a session boost is valid
+    SessionBoostMaxSessions  int           // LRU capacity: max recently-completed sessions kept warm
     SessionBoostGracePeriod  time.Duration // Wait for same-session follow-up (default: 0, disabled)
     BackpressurePollInterval time.Duration // Backend polling frequency
 }
@@ -240,7 +240,7 @@ Operators can customize the header name to match their client conventions:
 export SESSION_BOOST_HEADER="X-Session-ID"
 ```
 
-When a request with the configured session header (e.g., `X-Session-ID: conv-abc-123`) completes successfully, the session tracker records the completion time. Any subsequent request within the TTL window that carries the same session identifier will be marked as session-boosted and promoted to the head of the queue.
+When a request with the configured session header (e.g., `X-Session-ID: conv-abc-123`) completes successfully, the session tracker records the session in a bounded LRU cache, promoting it to the most-recently-used position. Any subsequent request that carries the same session identifier, while the session is still in the cache (i.e. not yet evicted by newer sessions), will be marked as session-boosted and promoted to the head of the queue. Bounding by session count rather than a time-based TTL mirrors how inference engines evict their prefix cache and removes the need to tune a duration.
 
 #### Backpressure Control
 

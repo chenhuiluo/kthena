@@ -13,16 +13,15 @@ Without session boost, a follow-up request may be queued behind unrelated reques
 When session boost is enabled, the router does the following:
 
 1. Extracts the session identifier from the HTTP header configured via `SESSION_BOOST_HEADER` environment variable.
-2. Checks whether the same session completed a request recently (within TTL).
+2. Checks whether the same session is currently tracked as recently completed. The router keeps the most-recently-completed sessions in a bounded **LRU cache** (sized by `SESSION_BOOST_MAX_SESSIONS`); the least-recently-used session is evicted automatically when the cache is full.
 3. If yes, marks the new request as **boosted** and promotes it ahead of non-boosted requests in the queue.
-4. After a request completes, optionally enters a brief **grace period** (disabled by default) to give a potential follow-up from the same session time to arrive.
 
 The following diagram summarizes this flow:
 
 ```mermaid
 flowchart TD
     A[Incoming request] --> B[Extract session ID from SESSION_BOOST_HEADER]
-    B --> C{Session completed<br/>recently? within TTL}
+    B --> C{Session recently<br/>completed? in LRU cache}
     C -- Yes --> D[Mark request as boosted<br/>promote ahead of non-boosted]
     C -- No --> E[Enqueue as normal request]
     D --> F{Backend has capacity?<br/>inflight limit + pod metrics}
@@ -31,12 +30,11 @@ flowchart TD
     F -- No --> H[Wait / backpressure]
     H --> F
     G --> I[Request completes]
-    I --> J[Mark session completed<br/>start/refresh TTL]
-    J --> K{Grace period enabled?}
-    K -- Yes --> L[Briefly hold dequeue slot<br/>for same-session follow-up]
-    K -- No --> M[Immediately dequeue next request]
-    L --> M
+    I --> J[Mark session completed<br/>promote in LRU cache]
+    J --> M[Dequeue next request]
 ```
+
+> An optional **grace period** can briefly hold the dequeue slot after a request completes to wait for a same-session follow-up. It is **disabled by default** and is an advanced, scenario-specific tuning knob—see [Advanced: Grace Period](#advanced-grace-period-use-with-caution) at the end of this guide.
 
 ## When to Use Session Boost
 
@@ -63,17 +61,20 @@ Session boost is **not** needed when:
 
 ### Helm Values
 
-The simplest way to enable session boost is through Helm values:
+The simplest way to enable session boost is through Helm values. Because session boost is a **mode of the fairness queue**, its settings live under `fairness.sessionBoost`:
 
 ```yaml
 networking:
   kthenaRouter:
     fairness:
-      enabled: true            # Required: session boost is a mode of the fairness queue
-    sessionBoost:
-      enabled: true
-      header: "X-Session-ID"
-      ttl: "60s"
+      enabled: true              # Required: session boost is a mode of the fairness queue
+      sessionBoost:
+        enabled: true
+        header: "X-Session-ID"
+        maxSessions: 4096        # LRU cache of recently-completed sessions kept warm
+        # pollInterval: "100ms"
+      # maxConcurrent: 32        # Global total inflight limit in session-boost mode.
+      #                          # Size it yourself: estimated per-pod concurrency x pod count.
 ```
 
 Apply with Helm:
@@ -97,10 +98,8 @@ env:
   value: "true"
 - name: SESSION_BOOST_HEADER
   value: "X-Session-ID"
-- name: SESSION_BOOST_TTL
-  value: "60s"
-# - name: SESSION_BOOST_GRACE_PERIOD
-#   value: "50ms"              # Disabled by default; enable only if you understand the trade-off
+- name: SESSION_BOOST_MAX_SESSIONS
+  value: "4096"
 - name: SESSION_BOOST_POLL_INTERVAL
   value: "100ms"
 # - name: FAIRNESS_MAX_CONCURRENT
@@ -115,10 +114,11 @@ env:
 | `ENABLE_FAIRNESS_SCHEDULING`  | Enable the fairness queue (required for session boost)                            | `false`      | Session boost is a mode of this queue; it is ignored unless this is `true`                                                                                                                                                                  |
 | `ENABLE_SESSION_BOOST`        | Enable session-boost mode on the fairness queue                                   | `false`      | Requires `ENABLE_FAIRNESS_SCHEDULING=true`                                                                                                                                                                                                  |
 | `SESSION_BOOST_HEADER`        | HTTP header used to identify conversation sessions                                | *(required)* | Must match what your clients send                                                                                                                                                                                                           |
-| `SESSION_BOOST_TTL`           | Duration after which a session's boost expires                                    | `60s`        | Longer values help slow human conversations; shorter values suit fast automated pipelines                                                                                                                                                   |
-| `SESSION_BOOST_GRACE_PERIOD`  | Wait time after a request completes for a same-session follow-up to arrive        | `0`          | Disabled by default. Only enable (e.g., `50ms`) if you understand the latency trade-off for non-boosted requests                                                                                                                            |
+| `SESSION_BOOST_MAX_SESSIONS`  | Max number of recently-completed sessions kept "warm" for boosting (LRU-bounded)  | `4096`       | When the cache is full, the least-recently-used session is evicted automatically. Size it by the number of concurrent conversations you want to keep boosted—no time-based tuning required                                                  |
 | `SESSION_BOOST_POLL_INTERVAL` | Interval at which the queue polls backend pod metrics to check available capacity | `100ms`      | Lower values react faster to capacity changes but increase metrics polling load                                                                                                                                                             |
 | `FAIRNESS_MAX_CONCURRENT`     | Total inflight requests admitted to backends (session-boost mode)                 | `16`         | Reused from fairness scheduling. It is a **global** limit, not per-pod. In session-boost mode you must size it yourself based on the estimated per-pod concurrency (e.g., vLLM's `--max-num-seqs`) multiplied by the number of backend pods |
+
+> `SESSION_BOOST_GRACE_PERIOD` is intentionally omitted from the table above. It is an advanced, scenario-specific knob that is disabled by default; see [Advanced: Grace Period](#advanced-grace-period-use-with-caution).
 
 ## Client Integration
 
@@ -158,24 +158,21 @@ curl -X POST http://kthena-router/v1/chat/completions \
 
 ## How It Works
 
+### Session Tracking (LRU)
+
+The router remembers which sessions recently completed using a bounded **LRU (least-recently-used) cache** rather than a time-based expiry. Each time a request from a session completes, that session is promoted to the most-recently-used position. When the cache exceeds `SESSION_BOOST_MAX_SESSIONS` entries, the least-recently-used session is evicted.
+
+This design is intentional: inference engines such as vLLM evict their prefix (KV) cache the same way—least-recently-used blocks are dropped first under memory pressure. Bounding the boost cache by **session count** therefore mirrors the backend's own warmth model, and it removes the need to guess a time-to-live (TTL). You only size the cache by *how many concurrent conversations* you want to keep boosted:
+
+- Under **high load**, stale sessions are evicted quickly as newer ones complete, so only genuinely warm sessions stay boosted.
+- Under **low load**, a few extra entries linger harmlessly—boosting only changes ordering when the queue is actually contended.
+
 ### Priority Ordering
 
 The session boost queue uses a simple two-level priority:
 
-1. **Boosted requests** (session completed recently) are always dequeued before non-boosted requests.
+1. **Boosted requests** (session tracked in the LRU cache) are always dequeued before non-boosted requests.
 2. **Within the same boost level**, requests are served in FIFO order (earliest arrival first).
-
-### Grace Period
-
-The grace period is **disabled by default** (`SESSION_BOOST_GRACE_PERIOD=0`). When disabled, the queue immediately dequeues the next request after a completion without waiting.
-
-When explicitly enabled (e.g., `SESSION_BOOST_GRACE_PERIOD=50ms`), the queue briefly holds the dequeue slot for a potential follow-up from the same session:
-
-- If a boosted request arrives during the grace period, it is dequeued immediately.
-- If no boosted request arrives before the grace period expires, the next non-boosted request proceeds normally.
-- If the head of the queue is already a boosted request, the grace period is skipped entirely.
-
-Only enable the grace period if you understand the trade-off: it adds latency to non-boosted requests in exchange for a higher chance of a same-session follow-up arriving in time. This is mainly useful for fast automated pipelines (RAG, agents) where follow-up requests arrive within milliseconds of the previous response.
 
 ### Backpressure Control
 
@@ -206,8 +203,7 @@ Start with the defaults unless you have a specific performance issue.
 
 Recommended tuning:
 
-- **Human chat applications** (slow follow-ups): increase `SESSION_BOOST_TTL` to `120s` or higher so the boost persists between human typing intervals.
-- **Automated pipelines** (fast follow-ups): keep `SESSION_BOOST_TTL` at `60s`. Consider enabling `SESSION_BOOST_GRACE_PERIOD` (e.g., `50ms`) if your pipeline issues follow-up requests within milliseconds and you want to maximize prefix cache hits.
+- **Many concurrent conversations**: increase `SESSION_BOOST_MAX_SESSIONS` so that active sessions are not evicted from the LRU cache before their follow-up arrives. The default (`4096`) suits most deployments; raise it if you serve a larger number of simultaneous conversations.
 - **High-throughput backends**: the default total inflight limit (`FAIRNESS_MAX_CONCURRENT=16`) is conservative. Size it yourself as roughly the per-pod concurrency (e.g., vLLM's `--max-num-seqs`) times the number of backend pods. Reduce for conservative admission control; increase for backends that handle high parallelism.
 - **Latency-sensitive workloads**: reduce `SESSION_BOOST_POLL_INTERVAL` to `50ms` for faster reaction to backend capacity changes.
 
@@ -250,19 +246,75 @@ Send a multi-turn conversation and measure TTFT for the second turn:
 Verify that:
 1. Both `ENABLE_FAIRNESS_SCHEDULING` and `ENABLE_SESSION_BOOST` are set to `true` in the router environment. Session boost is ignored (with a warning) if fairness scheduling is disabled.
 2. The client sends the configured header (set via `SESSION_BOOST_HEADER`) with a consistent value across turns.
-3. The follow-up request arrives within `SESSION_BOOST_TTL` of the previous request's completion.
+3. The session is still tracked—that is, it has not been evicted from the LRU cache by `SESSION_BOOST_MAX_SESSIONS` newer sessions completing in the meantime.
 
 ### TTFT is not improving despite boost
 
 Session boost only controls queue ordering. If the boosted request is routed to a different pod than the one holding the warm prefix cache, no TTFT improvement occurs. Combine session boost with session sticky routing for full benefit.
 
-### Grace period causes slight latency for non-boosted requests
-
-The grace period is disabled by default. If you have explicitly enabled it and it adds unwanted delay for single-turn traffic, set `SESSION_BOOST_GRACE_PERIOD=0` to disable it.
-
 ### High memory usage from session tracking
 
-Each tracked session consumes minimal memory (session ID + timestamp). Sessions are automatically evicted after TTL. If you have millions of concurrent sessions, consider reducing `SESSION_BOOST_TTL`.
+Each tracked session consumes minimal memory (just a session ID). The tracker is a bounded LRU cache, so total memory is capped at `SESSION_BOOST_MAX_SESSIONS` entries regardless of how much traffic flows through the router. If memory is a concern, reduce `SESSION_BOOST_MAX_SESSIONS`.
+
+## Advanced: Grace Period (Use With Caution)
+
+:::warning
+The grace period is an **advanced, scenario-specific** tuning knob. It is **disabled by default** and most deployments should leave it off. Enabling it deliberately **delays unrelated requests**, so only turn it on if you fully understand the conditions and trade-offs described below.
+:::
+
+### What it does
+
+By default, when a request completes the queue immediately dequeues the next request. The grace period (`SESSION_BOOST_GRACE_PERIOD`) instead makes the queue **briefly hold the freed dequeue slot** after a completion, waiting for a follow-up from the *same* session to arrive so it can ride the still-warm prefix cache:
+
+- If a boosted (same-session) request arrives during the grace window, it is dequeued immediately.
+- If no boosted request arrives before the window expires, the next non-boosted request proceeds as normal.
+- If the head of the queue is already a boosted request, the grace period is skipped entirely.
+
+### When it might help
+
+Grace period is only worth considering when **all** of the following hold:
+
+- Your traffic is dominated by **fast automated pipelines** (RAG chains, agents) that emit a follow-up request within **milliseconds** of receiving the previous response.
+- Maximizing prefix cache hit rate is more important than the latency of unrelated requests.
+- You have measured that follow-ups are frequently arriving *just after* the dequeue slot was given to another request.
+
+For human-driven chat (follow-ups arrive seconds apart) the grace period provides no benefit—the follow-up never arrives within the tiny window—and only adds latency.
+
+### The trade-off and risk
+
+The grace period adds latency to **non-boosted** requests in exchange for a higher chance of catching a same-session follow-up. If you set the window too large, or enable it under human/interactive or single-turn traffic, you will **slow down unrelated requests for no gain**. Keep the window very small (tens of milliseconds at most).
+
+### How to enable
+
+Only after confirming the conditions above, set a small value:
+
+```yaml
+networking:
+  kthenaRouter:
+    fairness:
+      enabled: true
+      sessionBoost:
+        enabled: true
+        gracePeriod: "50ms"   # Advanced: keep this very small; disabled (0s) by default
+```
+
+Or via environment variable:
+
+```yaml
+env:
+- name: SESSION_BOOST_GRACE_PERIOD
+  value: "50ms"   # Advanced; default is 0 (disabled)
+```
+
+### How to disable
+
+Set it back to `0` (the default) to restore immediate dequeue:
+
+```bash
+SESSION_BOOST_GRACE_PERIOD=0
+```
+
+If you observe unexpected latency on single-turn or interactive traffic after enabling the grace period, disabling it is the first thing to try.
 
 ## Related Guides
 

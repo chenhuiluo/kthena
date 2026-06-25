@@ -77,6 +77,27 @@ networking:
       inputTokenWeight: 1.0
       # -- Weight multiplier for output tokens.
       outputTokenWeight: 2.0
+      # -- Global total inflight request limit admitted to backends.<br/>
+      # Reused by session-boost mode; size it as estimated per-pod concurrency x pod count.<br/>
+      # `0` or unset uses the router default (16).
+      maxConcurrent: 0
+      # sessionBoost is a mode of the fairness queue (requires `fairness.enabled=true`).
+      sessionBoost:
+        # -- Enable session-boost mode on the fairness queue.<br/>
+        # Switches the queue from per-user fairness to session-aware boosting
+        # (the two modes are mutually exclusive).
+        enabled: false
+        # -- HTTP header used to identify conversation sessions.
+        header: "X-Session-ID"
+        # -- Maximum number of recently-completed sessions kept warm for boosting.<br/>
+        # Bounds an LRU cache; the least-recently-used session is evicted automatically.<br/>
+        # Size it by the number of concurrent conversations to keep boosted.
+        maxSessions: 4096
+        # -- Wait time after a request completes for a same-session follow-up.<br/>
+        # Disabled by default (`0s`).
+        gracePeriod: "0s"
+        # -- Interval at which the queue polls backend pod metrics for capacity.
+        pollInterval: "100ms"
     gatewayAPI:
       # -- Enable Gateway API related features.
       enabled: false

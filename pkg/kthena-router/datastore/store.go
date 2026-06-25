@@ -502,11 +502,11 @@ func applySessionBoostConfigFromEnv(cfg *FairnessQueueConfig) {
 		cfg.SessionIDHeader = v
 	}
 
-	if v := os.Getenv("SESSION_BOOST_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			cfg.SessionBoostTTL = d
+	if v := os.Getenv("SESSION_BOOST_MAX_SESSIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.SessionBoostMaxSessions = n
 		} else {
-			klog.Warningf("Invalid SESSION_BOOST_TTL: %q, using default %v", v, cfg.SessionBoostTTL)
+			klog.Warningf("Invalid SESSION_BOOST_MAX_SESSIONS: %q, using default %d", v, cfg.SessionBoostMaxSessions)
 		}
 	}
 
