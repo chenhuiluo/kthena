@@ -42,7 +42,7 @@ type Status struct {
 	History                   *algorithm.History
 }
 
-// NewStatus 根据 Behavior 配置初始化 5 个滑动窗口。
+// NewStatus 根据 Behavior 配置创建 Status，包含恐慌模式状态机和 5 个滑动窗口。
 // 各窗口的周期（freshMilliseconds）来自 Behavior 的不同字段：
 //   MaxRecommendation     ← ScaleDown.StabilizationWindow
 //   MinRecommendation     ← ScaleUp.StablePolicy.StabilizationWindow

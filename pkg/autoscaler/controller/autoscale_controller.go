@@ -213,20 +213,11 @@ func (ac *AutoscaleController) Reconcile(ctx context.Context) {
 	}
 }
 
-// updateTargetReplicas 将新的副本数写回 ModelServing CRD。有两种 Patch 模式：
-//
-// 模式1 — Merge Patch（SubTarget 为 nil）：
-//
-//	直接修改 spec.replicas（顶层副本数）。适用于整个 ModelServing 只有一个角色的场景。
-//	Patch 内容：{"spec":{"replicas":N}}
-//
-// 模式2 — JSON Patch（SubTarget 指定 Role 名称）：
-//
-//	修改 spec.template.roles[index].replicas。PD 分离场景走这条路径——
-//	Prefill 和 Decode 是同一 ModelServing 中的不同 Role，需要精确定位到某个 Role 的 replicas。
-//	Patch 内容：[{"op":"test","path":"/spec/template/roles/{index}/name","value":"{roleName}"},
-//	             {"op":"add","path":"/spec/template/roles/{index}/replicas","value":N}]
-//	其中 "test" 操作实现了字段级乐观锁：如果 Role 名称已被修改（如被人手动改了），patch 会失败。
+// updateTargetReplicas 将新的副本数写回 ModelServing CRD。
+// 当前实现使用 Merge Patch，直接修改 spec.replicas。
+// PD 分离场景下，Prefill 和 Decode 各自对应独立的 ModelServing，因此各自走 Merge Patch 即可。
+// 如果未来需要同一 ModelServing 下多 Role 独立伸缩，需增加 JSON Patch 路径
+// （通过 SubTarget 指定 Role 名称，精确定位 spec.template.roles[index].replicas）。
 func (ac *AutoscaleController) updateTargetReplicas(ctx context.Context, target *workload.Target, defaultNamespace string, replicas int32) error {
 	targetRef := target.TargetRef
 	namespaceScope := targetRef.Namespace
@@ -252,8 +243,7 @@ func (ac *AutoscaleController) updateTargetReplicas(ctx context.Context, target 
 	return err
 }
 
-// getTargetReplicas 读取目标当前的副本数。
-// 同样分两种情况：SubTarget 为 nil 时读 spec.replicas；否则读 spec.template.roles[name].replicas。
+// getTargetReplicas 读取目标当前的副本数（spec.replicas）。
 func (ac *AutoscaleController) getTargetReplicas(target *workload.Target, defaultNamespace string) (int32, error) {
 	targetRef := target.TargetRef
 	namespaceScope := targetRef.Namespace

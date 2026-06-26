@@ -40,7 +40,7 @@ type Metrics = map[string]float64
 //   - 容忍带 Tolerance：|ratio - 1.0| <= 0.10 内不伸缩（防抖静区）
 //   - 缺失 Pod 不对称处理：扩容方向悲观（按0贡献），缩容方向乐观（按目标值贡献）
 //   - 方向反转保护：修正后如果方向反了，直接保持当前值
-//   - 多指标取 max：确保任一 SLO 违规都触发扩容
+//   - 多指标取 max：确保任一指标超标都触发扩容
 type RecommendedInstancesAlgorithm struct {
 	MinInstances          int32
 	MaxInstances          int32
