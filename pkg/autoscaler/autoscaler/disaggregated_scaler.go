@@ -250,24 +250,22 @@ func (autoscaler *DisaggregatedAutoscaler) Scale(ctx context.Context, podLister 
 }
 
 // GetDisaggregatedMetricTargets resolves effective metric targets for each role.
-// Policy-level metrics are shared by all non-fixed roles; otherwise each
-// non-fixed role must provide its own metrics list. Fixed roles intentionally
-// receive no metric targets because their min/max bounds already define the
-// desired replica count.
+// Role-level metrics override policy-level metrics; when a role omits metrics,
+// it inherits spec.metrics. Fixed roles intentionally receive no metric targets
+// because their min/max bounds already define the desired replica count.
 func GetDisaggregatedMetricTargets(policy *workload.AutoscalingPolicy) map[string]algorithm.Metrics {
 	metricTargetsByRole := make(map[string]algorithm.Metrics)
 	if policy == nil || policy.Spec.DisaggregatedTarget == nil {
 		return metricTargetsByRole
 	}
-	sharedMetrics := policy.Spec.Metrics
 	for roleName, roleParam := range policy.Spec.DisaggregatedTarget.Roles {
 		if isFixedRole(roleParam) {
 			metricTargetsByRole[roleName] = algorithm.Metrics{}
 			continue
 		}
-		metrics := sharedMetrics
+		metrics := roleParam.Metrics
 		if len(metrics) == 0 {
-			metrics = roleParam.Metrics
+			metrics = policy.Spec.Metrics
 		}
 		metricTargets := algorithm.Metrics{}
 		for _, metric := range metrics {

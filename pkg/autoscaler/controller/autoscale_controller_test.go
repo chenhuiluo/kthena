@@ -336,13 +336,12 @@ func TestDoDisaggregatedScale_RatioRaisesDecode(t *testing.T) {
 
 func TestUpdateTargetRoleReplicas_UsesMinimalJSONPatch(t *testing.T) {
 	ns := "default"
-	ms := &workload.ModelServing{
+	baseMS := &workload.ModelServing{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-ms", Namespace: ns},
 		Spec: workload.ModelServingSpec{
 			Template: workload.ServingGroup{Roles: []workload.Role{
 				{
 					Name:          "prefill",
-					Replicas:      ptrInt32(1),
 					EntryTemplate: workload.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "model", Image: "model:v1", Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0.2")}}}}}},
 				},
 				{
@@ -353,49 +352,134 @@ func TestUpdateTargetRoleReplicas_UsesMinimalJSONPatch(t *testing.T) {
 			}},
 		},
 	}
-	fakeClient := clientfake.NewSimpleClientset(ms.DeepCopy())
-	ac := &AutoscaleController{
-		client:             fakeClient,
-		modelServingLister: workloadLister.NewModelServingLister(newModelServingIndexer(ms.DeepCopy())),
-	}
-	target := &workload.DisaggregatedTarget{TargetRef: corev1.ObjectReference{Kind: workload.ModelServingKind.Kind, Namespace: ns, Name: "test-ms"}}
-	if err := ac.updateTargetRoleReplicas(context.Background(), target, ns, map[string]int32{"prefill": 3, "decode": 4}); err != nil {
-		t.Fatalf("updateTargetRoleReplicas error: %v", err)
+
+	tests := []struct {
+		name           string
+		desired        map[string]int32
+		wantPatchRoles map[string]int
+	}{
+		{
+			name:           "creates missing replicas and updates existing replicas",
+			desired:        map[string]int32{"prefill": 3, "decode": 4},
+			wantPatchRoles: map[string]int{"prefill": 0, "decode": 1},
+		},
+		{
+			name:    "skips patch when all replicas are unchanged",
+			desired: map[string]int32{"prefill": 1, "decode": 2},
+		},
 	}
 
-	var patchAction k8stesting.PatchAction
-	for _, action := range fakeClient.Actions() {
-		if action.GetVerb() == "patch" {
-			patchAction = action.(k8stesting.PatchAction)
-			break
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			modelServing := baseMS.DeepCopy()
+			fakeClient := clientfake.NewSimpleClientset(modelServing.DeepCopy())
+			ac := &AutoscaleController{
+				client:             fakeClient,
+				modelServingLister: workloadLister.NewModelServingLister(newModelServingIndexer(modelServing.DeepCopy())),
+			}
+			target := &workload.DisaggregatedTarget{TargetRef: corev1.ObjectReference{Kind: workload.ModelServingKind.Kind, Namespace: ns, Name: "test-ms"}}
+			if err := ac.updateTargetRoleReplicas(context.Background(), target, ns, tt.desired); err != nil {
+				t.Fatalf("updateTargetRoleReplicas error: %v", err)
+			}
+
+			var patchAction k8stesting.PatchAction
+			for _, action := range fakeClient.Actions() {
+				if action.GetVerb() == "patch" {
+					patchAction = action.(k8stesting.PatchAction)
+					break
+				}
+			}
+			if len(tt.wantPatchRoles) == 0 {
+				if patchAction != nil {
+					t.Fatalf("expected no patch action, got %s", string(patchAction.GetPatch()))
+				}
+				return
+			}
+			if patchAction == nil {
+				t.Fatal("expected patch action")
+			}
+			patchBody := string(patchAction.GetPatch())
+			forbiddenFields := []string{"cpu", "memory", "resources", "limits", "requests", "image", "containers", "entryTemplate"}
+			for _, field := range forbiddenFields {
+				if strings.Contains(patchBody, field) {
+					t.Fatalf("patch body contains forbidden field %q: %s", field, patchBody)
+				}
+			}
+			for _, roleIndex := range tt.wantPatchRoles {
+				if !strings.Contains(patchBody, fmt.Sprintf("/spec/template/roles/%d/replicas", roleIndex)) {
+					t.Fatalf("patch body does not update role index %d replicas: %s", roleIndex, patchBody)
+				}
+			}
+
+			var patchOps []jsonPatchOperation
+			if err := json.Unmarshal(patchAction.GetPatch(), &patchOps); err != nil {
+				t.Fatalf("failed to unmarshal patch body: %v", err)
+			}
+			if len(patchOps) != len(tt.wantPatchRoles)*2 {
+				t.Fatalf("expected test+add operations for %d roles, got %d operations: %#v", len(tt.wantPatchRoles), len(patchOps), patchOps)
+			}
+			seenRoles := map[string]bool{}
+			for i := 0; i < len(patchOps); i += 2 {
+				testOp := patchOps[i]
+				addOp := patchOps[i+1]
+				roleName, ok := testOp.Value.(string)
+				if !ok {
+					t.Fatalf("expected role-name test value to be string, got %#v", testOp)
+				}
+				wantIndex, ok := tt.wantPatchRoles[roleName]
+				if !ok {
+					t.Fatalf("unexpected role %q in patch operations: %#v", roleName, patchOps)
+				}
+				if testOp.Op != "test" || testOp.Path != fmt.Sprintf("/spec/template/roles/%d/name", wantIndex) {
+					t.Fatalf("expected operation %d to test %s role name, got %#v", i, roleName, testOp)
+				}
+				if addOp.Op != "add" || addOp.Path != fmt.Sprintf("/spec/template/roles/%d/replicas", wantIndex) {
+					t.Fatalf("expected operation %d to add %s replicas, got %#v", i+1, roleName, addOp)
+				}
+				seenRoles[roleName] = true
+			}
+			for roleName := range tt.wantPatchRoles {
+				if !seenRoles[roleName] {
+					t.Fatalf("expected patch operations for role %s, got %#v", roleName, patchOps)
+				}
+			}
+		})
 	}
-	if patchAction == nil {
-		t.Fatal("expected patch action")
-	}
-	patchBody := string(patchAction.GetPatch())
-	forbiddenFields := []string{"cpu", "memory", "resources", "limits", "requests", "image", "containers", "entryTemplate"}
-	for _, field := range forbiddenFields {
-		if strings.Contains(patchBody, field) {
-			t.Fatalf("patch body contains forbidden field %q: %s", field, patchBody)
-		}
-	}
-	if !strings.Contains(patchBody, "/spec/template/roles/0/replicas") || !strings.Contains(patchBody, "/spec/template/roles/1/replicas") {
-		t.Fatalf("patch body does not update both role replicas: %s", patchBody)
+}
+
+func TestCheckModelServingTargetRefChecksGroup(t *testing.T) {
+	tests := []struct {
+		name      string
+		targetRef corev1.ObjectReference
+		wantErr   bool
+	}{
+		{
+			name:      "empty apiVersion keeps backward compatibility",
+			targetRef: corev1.ObjectReference{Kind: workload.ModelServingKind.Kind, Name: "test-ms"},
+		},
+		{
+			name:      "model serving group is accepted",
+			targetRef: corev1.ObjectReference{APIVersion: workload.SchemeGroupVersion.String(), Kind: workload.ModelServingKind.Kind, Name: "test-ms"},
+		},
+		{
+			name:      "wrong group is rejected",
+			targetRef: corev1.ObjectReference{APIVersion: "networking.serving.volcano.sh/v1alpha1", Kind: workload.ModelServingKind.Kind, Name: "test-ms"},
+			wantErr:   true,
+		},
+		{
+			name:      "wrong kind is rejected",
+			targetRef: corev1.ObjectReference{APIVersion: workload.SchemeGroupVersion.String(), Kind: "Other", Name: "test-ms"},
+			wantErr:   true,
+		},
 	}
 
-	var patchOps []jsonPatchOperation
-	if err := json.Unmarshal(patchAction.GetPatch(), &patchOps); err != nil {
-		t.Fatalf("failed to unmarshal patch body: %v", err)
-	}
-	if len(patchOps) != 4 {
-		t.Fatalf("expected test+add operations for two roles, got %d operations: %#v", len(patchOps), patchOps)
-	}
-	if patchOps[0].Op != "test" || patchOps[0].Path != "/spec/template/roles/0/name" || patchOps[0].Value != "prefill" {
-		t.Fatalf("expected first operation to test prefill role name, got %#v", patchOps[0])
-	}
-	if patchOps[2].Op != "test" || patchOps[2].Path != "/spec/template/roles/1/name" || patchOps[2].Value != "decode" {
-		t.Fatalf("expected third operation to test decode role name, got %#v", patchOps[2])
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := checkModelServingTargetRef(tt.targetRef)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("checkModelServingTargetRef() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -601,7 +685,6 @@ func TestPatchReplicasDoesNotTouchResourceLimits(t *testing.T) {
 				t.Fatalf("updateTargetReplicas error: %v", err)
 			}
 
-			// Find the patch action
 			var patchAction k8stesting.PatchAction
 			for _, action := range fakeClient.Actions() {
 				if action.GetVerb() == "patch" {
@@ -620,7 +703,6 @@ func TestPatchReplicasDoesNotTouchResourceLimits(t *testing.T) {
 			patchBody := string(patchAction.GetPatch())
 			t.Logf("Patch body: %s", patchBody)
 
-			// The patch body must NOT contain any resource-related fields
 			forbiddenFields := []string{"cpu", "memory", "resources", "limits", "requests", "image", "containers", "entryTemplate"}
 			for _, field := range forbiddenFields {
 				if strings.Contains(patchBody, field) {
@@ -628,7 +710,6 @@ func TestPatchReplicasDoesNotTouchResourceLimits(t *testing.T) {
 				}
 			}
 
-			// The patch body MUST contain the replicas value
 			if !strings.Contains(patchBody, fmt.Sprintf("%d", tt.newReplicas)) {
 				t.Errorf("patch body does not contain the expected replicas value %d.\nPatch: %s", tt.newReplicas, patchBody)
 			}

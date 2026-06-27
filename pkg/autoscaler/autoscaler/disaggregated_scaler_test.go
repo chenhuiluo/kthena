@@ -65,6 +65,31 @@ func TestGetDisaggregatedMetricTargets_UsesSharedMetrics(t *testing.T) {
 	}
 }
 
+func TestGetDisaggregatedMetricTargets_RoleMetricsOverrideSharedMetrics(t *testing.T) {
+	policy := &workload.AutoscalingPolicy{
+		Spec: workload.AutoscalingPolicySpec{
+			Metrics: []workload.AutoscalingPolicyMetric{{Name: "shared_load", TargetValue: resource.MustParse("10")}},
+			DisaggregatedTarget: &workload.DisaggregatedTarget{
+				Roles: map[string]workload.RoleScalingParam{
+					"prefill": {Metrics: []workload.AutoscalingPolicyMetric{{Name: "prefill_load", TargetValue: resource.MustParse("5")}}},
+					"decode":  {},
+				},
+			},
+		},
+	}
+
+	got := GetDisaggregatedMetricTargets(policy)
+	if got["prefill"]["prefill_load"] != 5 {
+		t.Fatalf("prefill role target = %v, want 5", got["prefill"]["prefill_load"])
+	}
+	if _, inherited := got["prefill"]["shared_load"]; inherited {
+		t.Fatalf("prefill should override shared metrics, got %#v", got["prefill"])
+	}
+	if got["decode"]["shared_load"] != 10 {
+		t.Fatalf("decode shared target = %v, want 10", got["decode"]["shared_load"])
+	}
+}
+
 func TestGetDisaggregatedMetricTargets_FixedRoleDoesNotInheritSharedMetrics(t *testing.T) {
 	policy := &workload.AutoscalingPolicy{
 		Spec: workload.AutoscalingPolicySpec{

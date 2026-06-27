@@ -224,7 +224,6 @@ func (v *AutoscalingPolicyValidator) validateDisaggregatedTarget(policy *registr
 	}
 
 	disaggregatedPath := field.NewPath("spec").Child("disaggregatedTarget")
-	useSharedMetrics := len(policy.Spec.Metrics) > 0
 	// Single-role policies are valid for role-level autoscaling. A ratio constraint
 	// is the only case that requires two roles, because it references a role pair.
 	if len(target.Roles) < 1 {
@@ -235,43 +234,45 @@ func (v *AutoscalingPolicyValidator) validateDisaggregatedTarget(policy *registr
 	}
 
 	for roleName, roleParam := range target.Roles {
+		if roleName == "" {
+			allErrs = append(allErrs, field.Invalid(disaggregatedPath.Child("roles"), roleName, "role name must be a role from ModelServing.spec.template.roles[].name not be empty"))
+			continue
+		}
 		rolePath := disaggregatedPath.Child("roles").Key(roleName)
 		fixedRole := isFixedRoleScalingParam(roleParam)
 		if roleParam.MinReplicas > roleParam.MaxReplicas {
 			allErrs = append(allErrs, field.Invalid(rolePath.Child("minReplicas"), roleParam.MinReplicas, "minReplicas must be <= maxReplicas"))
 		}
-		if useSharedMetrics && len(roleParam.Metrics) > 0 {
-			allErrs = append(allErrs, field.Invalid(rolePath.Child("metrics"), roleParam.Metrics, "spec.metrics and per-role metrics are mutually exclusive"))
-		}
 		// Fixed roles are declared with equal min/max bounds. They are intentionally
 		// exempt from the metrics requirement because the autoscaler never computes a
 		// recommendation for them; it always returns the fixed replica count.
-		if !useSharedMetrics && !fixedRole && len(roleParam.Metrics) == 0 {
+		if !fixedRole && len(roleParam.Metrics) == 0 && len(policy.Spec.Metrics) == 0 {
 			allErrs = append(allErrs, field.Required(rolePath.Child("metrics"), "metrics must be set on every non-fixed role when spec.metrics is empty"))
 		}
 
 		effectiveMetricNames := make(map[string]struct{})
-		// Shared policy metrics apply only to autoscaled roles. Fixed roles may omit
-		// metricSources even when spec.metrics is set because they do not collect metrics.
-		if useSharedMetrics && !fixedRole {
+		if len(roleParam.Metrics) == 0 && !fixedRole {
 			for _, metric := range policy.Spec.Metrics {
 				effectiveMetricNames[metric.Name] = struct{}{}
 			}
-		} else {
-			metricNames := make(map[string]struct{})
-			for idx, metric := range roleParam.Metrics {
-				metricPath := rolePath.Child("metrics").Index(idx)
-				if metric.TargetValue.AsFloat64Slow() <= 0 || math.IsInf(metric.TargetValue.AsFloat64Slow(), 0) {
-					allErrs = append(allErrs, field.Invalid(metricPath.Child("targetValue"), metric.TargetValue, "metric target value must be greater than 0 and not equal to infinity"))
-				}
-				if _, exists := metricNames[metric.Name]; exists {
-					allErrs = append(allErrs, field.Invalid(metricPath.Child("name"), metric.Name, fmt.Sprintf("duplicate metric name %s is not allowed", metric.Name)))
-				}
-				metricNames[metric.Name] = struct{}{}
-				effectiveMetricNames[metric.Name] = struct{}{}
+		}
+		metricNames := make(map[string]struct{})
+		for idx, metric := range roleParam.Metrics {
+			metricPath := rolePath.Child("metrics").Index(idx)
+			if metric.TargetValue.AsFloat64Slow() <= 0 || math.IsInf(metric.TargetValue.AsFloat64Slow(), 0) {
+				allErrs = append(allErrs, field.Invalid(metricPath.Child("targetValue"), metric.TargetValue, "metric target value must be greater than 0 and not equal to infinity"))
 			}
+			if _, exists := metricNames[metric.Name]; exists {
+				allErrs = append(allErrs, field.Invalid(metricPath.Child("name"), metric.Name, fmt.Sprintf("duplicate metric name %s is not allowed", metric.Name)))
+			}
+			metricNames[metric.Name] = struct{}{}
+			effectiveMetricNames[metric.Name] = struct{}{}
 		}
 		if !fixedRole {
+			if len(roleParam.MetricSources) == 0 && len(effectiveMetricNames) > 0 {
+				allErrs = append(allErrs, field.Invalid(rolePath.Child("metricSources"), len(roleParam.MetricSources), "metricSources must be set on every non-fixed role when metrics are configured"))
+				continue
+			}
 			for sourceKey := range roleParam.MetricSources {
 				if _, exists := effectiveMetricNames[sourceKey]; !exists {
 					allErrs = append(allErrs, field.Invalid(rolePath.Child("metricSources").Key(sourceKey), sourceKey, "metricSources key must match an effective metric name"))

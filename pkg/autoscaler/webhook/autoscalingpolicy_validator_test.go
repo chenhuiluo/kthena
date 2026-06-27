@@ -213,6 +213,11 @@ func TestValidateAutoscalingPolicy_DisaggregatedTarget(t *testing.T) {
 	allowed, msg := validator.validateAutoscalingPolicy(validPolicy)
 	assert.True(t, allowed, msg)
 
+	overridePolicy := validPolicy.DeepCopy()
+	overridePolicy.Spec.Metrics = []registryv1.AutoscalingPolicyMetric{{Name: "shared", TargetValue: resource.MustParse("1")}}
+	allowed, msg = validator.validateAutoscalingPolicy(overridePolicy)
+	assert.True(t, allowed, msg)
+
 	invalidPolicy := validPolicy.DeepCopy()
 	invalidPolicy.Spec.Metrics = []registryv1.AutoscalingPolicyMetric{{Name: "shared", TargetValue: resource.MustParse("1")}}
 	invalidPolicy.Spec.DisaggregatedTarget.Roles["prefill"] = registryv1.RoleScalingParam{
@@ -223,9 +228,26 @@ func TestValidateAutoscalingPolicy_DisaggregatedTarget(t *testing.T) {
 	}
 	allowed, msg = validator.validateAutoscalingPolicy(invalidPolicy)
 	assert.False(t, allowed)
-	assert.Contains(t, msg, "spec.metrics and per-role metrics are mutually exclusive")
+	assert.NotContains(t, msg, "spec.metrics and per-role metrics are mutually exclusive")
 	assert.Contains(t, msg, "minReplicas must be <= maxReplicas")
 	assert.Contains(t, msg, "metricSources key must match an effective metric name")
+
+	missingSourcesPolicy := validPolicy.DeepCopy()
+	missingSourcesPolicy.Spec.DisaggregatedTarget.Roles["prefill"] = registryv1.RoleScalingParam{
+		MinReplicas: 1,
+		MaxReplicas: 8,
+		Metrics:     []registryv1.AutoscalingPolicyMetric{{Name: "prefill_load", TargetValue: resource.MustParse("5")}},
+	}
+	allowed, msg = validator.validateAutoscalingPolicy(missingSourcesPolicy)
+	assert.False(t, allowed)
+	assert.Contains(t, msg, "metricSources must be set on every non-fixed role when metrics are configured")
+
+	missingInheritedSourcesPolicy := validPolicy.DeepCopy()
+	missingInheritedSourcesPolicy.Spec.Metrics = []registryv1.AutoscalingPolicyMetric{{Name: "shared", TargetValue: resource.MustParse("1")}}
+	missingInheritedSourcesPolicy.Spec.DisaggregatedTarget.Roles["prefill"] = registryv1.RoleScalingParam{MinReplicas: 1, MaxReplicas: 8}
+	allowed, msg = validator.validateAutoscalingPolicy(missingInheritedSourcesPolicy)
+	assert.False(t, allowed)
+	assert.Contains(t, msg, "metricSources must be set on every non-fixed role when metrics are configured")
 }
 
 func TestValidateAutoscalingPolicy_DisaggregatedSingleRoleAndFixedRole(t *testing.T) {

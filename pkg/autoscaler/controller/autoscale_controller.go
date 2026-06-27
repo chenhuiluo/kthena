@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -178,8 +179,8 @@ func (ac *AutoscaleController) updateTargetReplicas(ctx context.Context, target 
 		namespaceScope = defaultNamespace
 	}
 
-	if target.TargetRef.Kind != "" && target.TargetRef.Kind != workload.ModelServingKind.Kind {
-		return fmt.Errorf("target ref kind %s, name: %s not supported", targetRef.Kind, targetRef.Name)
+	if err := checkModelServingTargetRef(targetRef); err != nil {
+		return err
 	}
 
 	instance, err := ac.modelServingLister.ModelServings(namespaceScope).Get(targetRef.Name)
@@ -203,16 +204,18 @@ func (ac *AutoscaleController) getTargetReplicas(target *workload.Target, defaul
 		namespaceScope = defaultNamespace
 	}
 
-	if targetRef.Kind == workload.ModelServingKind.Kind || targetRef.Kind == "" {
-		instance, err := ac.modelServingLister.ModelServings(namespaceScope).Get(targetRef.Name)
-		if err != nil {
-			return 0, err
-		}
-		if instance.Spec.Replicas != nil {
-			return *instance.Spec.Replicas, nil
-		}
+	if err := checkModelServingTargetRef(targetRef); err != nil {
+		return 0, err
 	}
-	return 0, fmt.Errorf("target ref kind %s, name: %s not supported", targetRef.Kind, targetRef.Name)
+	instance, err := ac.modelServingLister.ModelServings(namespaceScope).Get(targetRef.Name)
+	if err != nil {
+		return 0, err
+	}
+	if instance.Spec.Replicas != nil {
+		return *instance.Spec.Replicas, nil
+	}
+	// ModelServing.spec.replicas defaults to 1; treat unset as 1 for backward compatibility.
+	return 1, nil
 }
 
 func (ac *AutoscaleController) schedule(ctx context.Context, autoscalePolicy *workload.AutoscalingPolicy) error {
@@ -320,9 +323,6 @@ func (ac *AutoscaleController) doScale(ctx context.Context, autoscalePolicy *wor
 func (ac *AutoscaleController) doDisaggregatedScale(ctx context.Context, autoscalePolicy *workload.AutoscalingPolicy) error {
 	target := autoscalePolicy.Spec.DisaggregatedTarget
 	key := formatAutoscalerMapKey(autoscalePolicy.Namespace, autoscalePolicy.Name, &target.TargetRef)
-	if ac.disaggregatedScalerMap == nil {
-		ac.disaggregatedScalerMap = make(map[string]*autoscaler.DisaggregatedAutoscaler)
-	}
 	disaggregatedScaler, ok := ac.disaggregatedScalerMap[key]
 	if !ok || disaggregatedScaler.NeedUpdate(autoscalePolicy) {
 		disaggregatedScaler = autoscaler.NewDisaggregatedAutoscaler(autoscalePolicy)
@@ -388,10 +388,27 @@ func (ac *AutoscaleController) getDisaggregatedTargetModelServing(target *worklo
 	if namespaceScope == "" {
 		namespaceScope = defaultNamespace
 	}
-	if targetRef.Kind != "" && targetRef.Kind != workload.ModelServingKind.Kind {
-		return nil, fmt.Errorf("target ref kind %s, name: %s not supported", targetRef.Kind, targetRef.Name)
+	if err := checkModelServingTargetRef(targetRef); err != nil {
+		return nil, err
 	}
 	return ac.modelServingLister.ModelServings(namespaceScope).Get(targetRef.Name)
+}
+
+func checkModelServingTargetRef(targetRef corev1.ObjectReference) error {
+	if targetRef.Kind != "" && targetRef.Kind != workload.ModelServingKind.Kind {
+		return fmt.Errorf("target ref kind %s, name: %s not supported", targetRef.Kind, targetRef.Name)
+	}
+	if targetRef.APIVersion == "" {
+		return nil
+	}
+	groupVersion, err := schema.ParseGroupVersion(targetRef.APIVersion)
+	if err != nil {
+		return fmt.Errorf("target ref apiVersion %s, kind %s, name: %s not supported: %w", targetRef.APIVersion, targetRef.Kind, targetRef.Name, err)
+	}
+	if groupVersion.Group != workload.ModelServingKind.Group {
+		return fmt.Errorf("target ref group %s, kind %s, name: %s not supported", groupVersion.Group, targetRef.Kind, targetRef.Name)
+	}
+	return nil
 }
 
 // getCurrentRoleReplicas returns the current replica count for every role named
@@ -448,6 +465,9 @@ func (ac *AutoscaleController) updateTargetRoleReplicas(ctx context.Context, tar
 		// resolved from the informer cache, so the live object could be reordered by
 		// another writer before the patch reaches the API server. If that happens,
 		// the test fails atomically and prevents changing replicas on the wrong role.
+		// Use add instead of replace because replicas is optional and may be absent;
+		// JSON Patch add works for both creating the field and updating an existing
+		// object member, while replace would fail when the field is omitted.
 		patches = append(patches,
 			jsonPatchOperation{Op: "test", Path: fmt.Sprintf("/spec/template/roles/%d/name", roleIndex), Value: roleName},
 			jsonPatchOperation{Op: "add", Path: fmt.Sprintf("/spec/template/roles/%d/replicas", roleIndex), Value: desired},

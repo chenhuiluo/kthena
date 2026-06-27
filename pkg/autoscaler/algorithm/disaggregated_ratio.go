@@ -67,9 +67,10 @@ func EnforceRoleRatio(replicas map[string]int32, bounds map[string]ReplicaBounds
 		return finalReplicas, false, "", fmt.Errorf("bounds for ratio denominator role %s not found", denominatorRole)
 	}
 
-	// A zero side participates in coupled scale-to-zero semantics outside of the
-	// ratio calculation. Avoid dividing by zero and leave both roles as-is.
-	if numerator == 0 || denominator == 0 {
+	// When both sides are zero, preserve coupled scale-to-zero and skip the ratio
+	// calculation. When exactly one side is zero, seed that side to one before
+	// ratio repair; a P/D deployment with only one live role cannot serve traffic.
+	if numerator == 0 && denominator == 0 {
 		return finalReplicas, false, "", nil
 	}
 
@@ -80,6 +81,14 @@ func EnforceRoleRatio(replicas map[string]int32, bounds map[string]ReplicaBounds
 	}
 
 	adjusted := false
+	if numerator == 0 {
+		numerator = min(max(int32(1), numeratorBounds.Min), numeratorBounds.Max)
+		adjusted = true
+	}
+	if denominator == 0 {
+		denominator = min(max(int32(1), denominatorBounds.Min), denominatorBounds.Max)
+		adjusted = true
+	}
 	ratio := float64(numerator) / float64(denominator)
 	switch {
 	case ratio < minRatio:
