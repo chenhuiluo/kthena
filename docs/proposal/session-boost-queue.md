@@ -25,19 +25,19 @@ However, without session-aware scheduling, a follow-up request from the same con
 
 The Session Boost Queue addresses this problem by promoting follow-up requests from recently completed sessions to the head of the request queue.
 
-Rather than introducing a separate queue type, session boost is implemented as a **mode of the shared request priority queue** (`RequestPriorityQueue`) that also powers [fairness scheduling](../kthena/docs/user-guide/fairness-scheduling.md). The two modes reuse the same heap, enqueue/dequeue, cancellation, backpressure, and shutdown machinery; they differ only in how request priority is computed:
+Rather than introducing a separate queue type, session boost is implemented as one of the **pluggable priority strategies** of the shared request priority queue (`RequestPriorityQueue`) that also powers [fairness scheduling](../kthena/docs/user-guide/fairness-scheduling.md). The strategies reuse the same heap, enqueue/dequeue, cancellation, backpressure, and shutdown machinery; they differ only in how request priority is computed:
 
-- **Fairness mode** (default): orders requests by per-user recent token usage.
-- **Session-boost mode** (`ENABLE_SESSION_BOOST=true`): disables per-user fairness ordering and instead promotes requests whose session completed recently.
+- **User-fairness strategy** (default): orders requests by per-user recent token usage.
+- **Session-boost strategy** (`ENABLE_SESSION_BOOST=true`): disables per-user fairness ordering and instead promotes requests whose session completed recently.
 
-Enabling session boost therefore reconfigures the same per-model priority queue into a session-aware queue; the two modes are mutually exclusive.
+Enabling session boost therefore reconfigures the same per-model priority queue into a session-aware queue; the two strategies are mutually exclusive.
 
 #### Goals
 
-1. **Simple activation**: Session boost can be enabled via `ENABLE_SESSION_BOOST=true` on top of fairness scheduling (`ENABLE_FAIRNESS_SCHEDULING=true`). Because session boost is a mode of the fairness queue, fairness scheduling is a prerequisite; if session boost is requested without it, the router logs a warning and ignores it.
+1. **Simple activation**: Session boost can be enabled via `ENABLE_SESSION_BOOST=true` on top of the priority queue (`ENABLE_PRIORITY_QUEUE=true`). Because session boost is a strategy of the priority queue, the priority queue is a prerequisite; if session boost is requested without it, the router logs a warning and ignores it.
 2. **Configurable session identification**: Users can configure which HTTP header identifies conversation sessions via `SESSION_BOOST_HEADER` (e.g., `X-Session-ID`).
-3. **Prefix cache optimization**: Prioritize follow-up requests from recently completed sessions to maximize warm cache hits.
-4. **Grace period**: After a request completes, briefly hold the dequeue slot for a potential follow-up from the same session before dispatching unrelated requests.
+3. **KV cache optimization**: Prioritize follow-up requests from recently completed sessions to maximize warm cache hits.
+4. **Grace period (advanced, off by default)**: An optional, tricky tuning knob that, after a request completes, briefly holds the dequeue slot for a potential follow-up from the same session before dispatching unrelated requests. It is **disabled by default** and should only be enabled by operators who fully understand that it deliberately delays unrelated requests in exchange for a higher same-session prefix-cache hit rate.
 5. **Backpressure-aware**: Respect backend pod capacity to avoid flooding, using two-level admission control (inflight limit + backend metrics).
 
 #### Non-Goals
@@ -51,7 +51,7 @@ Enabling session boost therefore reconfigures the same per-model priority queue 
 
 #### Architecture
 
-Session boost is a mode of the shared per-model request priority queue that sits in the request processing pipeline between the router's HTTP handler and the backend load balancer. When `ENABLE_SESSION_BOOST=true`, the same `RequestPriorityQueue` that implements fairness scheduling is constructed in session-boost mode instead of user-fairness mode.
+Session boost is a priority strategy of the shared per-model request priority queue that sits in the request processing pipeline between the router's HTTP handler and the backend load balancer. When `ENABLE_SESSION_BOOST=true`, the same `RequestPriorityQueue` that implements the default user-fairness strategy is constructed with the session-boost strategy instead.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -76,13 +76,13 @@ Session boost is a mode of the shared per-model request priority queue that sits
 │          Session Boost Queue Internals                   │
 │                                                          │
 │  ┌──────────────────┐     ┌─────────────────────────┐    │
-│  │ SessionTracker   │◀────│ MarkSessionCompleted()  │    │
-│  │ (bounded LRU)    │     │ (after response sent)   │    │
-│  │ keys: sessionID  │     └─────────────────────────┘    │
-│  │ cap: 4096 default│                                    │
+│  │ SessionTracker   │◀────│ MarkSessionRequest      │    │
+│  │ (bounded LRU)    │     │ Completed()             │    │
+│  │ keys: sessionID  │     │ (after response sent)   │    │
+│  │ cap: 4096 default│     └─────────────────────────┘    │
 │  └────────┬─────────┘                                    │
 │            │                                             │
-│            │ HasRecentCompletion(corrID)?                │
+│            │ HasRecentCompletion(sessionID)?             │
 │            ▼                                             │
 │  ┌──────────────────┐                                    │
 │  │  PushRequest()   │                                    │
@@ -122,28 +122,30 @@ User A, Session "conv-123":
 
   Turn 1: "Hello, tell me about Kubernetes"
   ┌──────────┐    ┌──────────┐    ┌──────────────┐    ┌────────────────┐
-  │ Enqueue  │──▶│  Dequeue │───▶│ Process on   │──▶│ MarkCompleted  │
-  │ (no      │    │  (normal │    │ Pod-X        │    │ ("conv-123")   │
-  │  boost)  │    │   order) │    │              │    │                │
+  │ Enqueue  │──▶│  Dequeue │───▶│ Process on   │──▶│ MarkRequest    │
+  │ (no      │    │  (normal │    │ Pod-X        │    │ Completed      │
+  │  boost)  │    │   order) │    │              │    │ ("conv-123")   │
   └──────────┘    └──────────┘    └──────────────┘    └───────┬────────┘
                                                               │
-                          SessionTracker.MarkCompleted("conv-123")  │
+                  SessionTracker.MarkRequestCompleted("conv-123")     │
                                                               │
   Turn 2: "Can you give more details on pods?"                │
   ┌──────────┐                                                │
-  │  Enqueue  │ ◀── HasRecentCompletion("conv-123") = true ───┘
-  │  (BOOST   │     (still in LRU cache)
-  │   =true)  │
+  │  Enqueue │ ◀── HasRecentCompletion("conv-123") = true ───┘
+  │  (BOOST  │     (still in LRU cache)
+  │   =true) │
   └────┬─────┘
        │
        ▼ (Promoted to heap head, ahead of all non-boosted requests)
   ┌──────────┐    ┌──────────────┐
-  │  Dequeue  │───▶│  Process on  │  ← Prefix cache HIT! TTFT reduced 50-80%
-  │  (first!) │    │  Pod-X*      │    (*if session sticky also routes here)
+  │  Dequeue │ ─▶ │  Process on  │  ← Prefix cache HIT! TTFT reduced 50-80%
+  │  (first!)│    │  Pod-X*      │    (*if session sticky also routes here)
   └──────────┘    └──────────────┘
 ```
 
 #### Grace Period Mechanism
+
+> **⚠️ Advanced, tricky feature — disabled by default.** The grace period is an advanced, scenario-specific tuning knob that is **off by default** (`SessionBoostGracePeriod = 0`). It is the single most easily-misused part of this design: enabling it deliberately **delays unrelated (non-boosted) requests** in the hope of catching a same-session follow-up. It only pays off for fast automated pipelines (RAG chains, agents) whose follow-up arrives within milliseconds; for human-driven or single-turn traffic it adds latency for no benefit. **Only enable it if you are certain you understand the trade-off described below**, and keep the window very small (tens of milliseconds at most). When in doubt, leave it disabled.
 
 The grace period is a brief wait after a request completes (Release), designed to give the same session's follow-up request a chance to arrive and be prioritized:
 
@@ -151,7 +153,7 @@ The grace period is a brief wait after a request completes (Release), designed t
 Timeline:
          ┌─ req-1 completes, Release() called
          │
-         │  ┌── Grace Period (default 50ms) ──┐
+         │  ┌─ Grace Period (default 0 = OFF) ─┐
          │  │                                  │
          ▼  ▼                                  ▼
     ─────┼──┼──────────────────────────────────┼─────
@@ -167,17 +169,65 @@ Timeline:
          │  └──────────────────────────────────┘
 ```
 
+##### How the grace wait cooperates with the inflight and backend gates
+
+The grace period is **not a third admission gate that decides whether a request may run** — that decision is still owned entirely by the two capacity gates (`inflight < MaxConcurrent` and `backendChecker() == true`). Instead, the grace wait is a *timing layer in front of those gates* that decides **which request gets to attempt admission first**, and **when** that attempt happens. The two capacity gates always run afterward, unchanged, inside `tryBackpressureDequeue`.
+
+It is important that grace is **triggered only by release events**, because a release is the one moment that frees inflight capacity. The sequence is:
+
+1. A request finishes → `Release()` runs → `inflightCount` is decremented → a signal is sent on `releaseCh`.
+2. The freed slot would normally be claimed immediately by the current heap head (which may be an unrelated, non-boosted request). The grace wait instead **holds that just-freed slot for up to `SessionBoostGracePeriod`**, betting that a same-session follow-up is about to arrive and reuse the warm prefix cache.
+3. When the wait resolves, `tryBackpressureDequeue` runs and re-checks **both** capacity gates before admitting anyone. So even if a boosted follow-up arrives during grace, it is only dispatched when `inflight < MaxConcurrent` **and** at least one backend pod reports capacity.
+
+The grace wait can resolve in three ways, and in every case the two capacity gates are the final arbiter:
+
+| Outcome                    | Trigger                                                                                       | What happens next                                                                                                                              |
+| -------------------------- | --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Skip grace (fast path)** | The heap head is *already* session-boosted when the release fires (`isHeadSessionBoosted()`). | No wait at all — go straight to the capacity gates and admit if they pass. There is nothing to wait for.                                       |
+| **Cut grace short**        | A session-boosted request arrives at the head (`notifyCh`) *during* the wait.                 | Stop the timer early and go to the capacity gates immediately. The follow-up is dispatched as soon as inflight and backend capacity allow.     |
+| **Grace expires**          | The timer fires with no boosted follow-up (`timer.C`).                                        | Stop holding the slot and fall through to the capacity gates, which now admit the ordinary heap head (subject to inflight + backend capacity). |
+
+This ordering matters because the three checks answer different questions and run in sequence:
+
+```
+Release frees a slot
+        │
+        ▼
+┌───────────────────────────┐   "Should I hold this freed slot briefly
+│ Grace timing layer        │    for a same-session follow-up?"
+│ (only on releaseCh)       │   → waits 0–GracePeriod, then proceeds
+└───────────┬───────────────┘
+            ▼
+┌───────────────────────────┐   "Is there global inflight headroom?"
+│ Gate 1: inflight <        │   → if not, hold (and drain cancelled reqs)
+│         MaxConcurrent     │
+└───────────┬───────────────┘
+            ▼
+┌───────────────────────────┐   "Does any backend pod actually have room?"
+│ Gate 2: backendChecker()  │   → if not, hold (and drain cancelled reqs)
+└───────────┬───────────────┘
+            ▼
+     Dequeue heap head
+```
+
+Two interactions are worth calling out explicitly:
+
+- **Grace never overrides backpressure.** If the grace window ends but the inflight limit is already reached or every backend pod is busy, the request is **not** admitted — `tryBackpressureDequeue` simply holds (and drains any cancelled requests from the heap) until the next release or poll tick reopens the gates. Grace only chooses *who* tries next; the capacity gates decide *whether* anyone runs.
+- **Fresh arrivals on an idle queue bypass grace.** Grace is tied to `releaseCh` (a freed slot), not to `notifyCh` (a new arrival). When a request lands on an otherwise idle queue with no pending release, it goes straight to the capacity gates with no grace delay, so enabling grace adds no admission latency to first turns. The only place a new arrival waits is *inside* an already-running grace window, where it is precisely the boosted follow-up the window exists to catch. When both a release and a new arrival are pending at once, the release is preferred so the freed slot is the one held for the grace window.
+
+The net effect is a strict precedence: **grace timing → inflight gate → backend gate**. The grace layer is purely additive and optional (`SessionBoostGracePeriod = 0` removes it entirely, taking the no-grace fast path), and it can only ever *delay* an admission to favor a session-boosted follow-up — it can never admit a request that the inflight or backend gates would otherwise reject.
+
 #### Configuration
 
-| Environment Variable          | Default        | Description                                                                                                                                                                                   |
-| ----------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ENABLE_FAIRNESS_SCHEDULING`  | `false`        | Enable the fairness queue. Required for session boost, which runs as a mode of this queue                                                                                                     |
-| `ENABLE_SESSION_BOOST`        | `false`        | Enable session-boost mode on the fairness queue (requires `ENABLE_FAIRNESS_SCHEDULING=true`)                                                                                                  |
-| `SESSION_BOOST_HEADER`        | `X-Session-ID` | HTTP header used to identify conversation sessions                                                                                                                                            |
-| `SESSION_BOOST_MAX_SESSIONS`  | `4096`         | Maximum number of recently-completed sessions kept warm for boosting. Bounds an LRU cache; the least-recently-used session is evicted when exceeded. Sized by session count, not time         |
-| `SESSION_BOOST_GRACE_PERIOD`  | `0`            | Wait time after release for same-session follow-up. Disabled by default; enable only when you understand the latency trade-off                                                                |
-| `SESSION_BOOST_POLL_INTERVAL` | `100ms`        | Backend capacity polling interval                                                                                                                                                             |
-| `FAIRNESS_MAX_CONCURRENT`     | `16`           | Reused from fairness scheduling as the global (total) inflight limit in session-boost mode. Operators size it from the estimated per-pod concurrency multiplied by the number of backend pods |
+| Environment Variable            | Default        | Description                                                                                                                                                                                                                                      |
+| ------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ENABLE_PRIORITY_QUEUE`         | `false`        | Enable the priority queue. Required for session boost, which runs as a strategy of this queue                                                                                                                                                    |
+| `ENABLE_SESSION_BOOST`          | `false`        | Enable the session-boost strategy on the priority queue (requires `ENABLE_PRIORITY_QUEUE=true`)                                                                                                                                                  |
+| `SESSION_BOOST_HEADER`          | `X-Session-ID` | HTTP header used to identify conversation sessions                                                                                                                                                                                               |
+| `SESSION_BOOST_MAX_SESSIONS`    | `4096`         | Maximum number of recently-completed sessions kept warm for boosting. Bounds an LRU cache; the least-recently-used session is evicted when exceeded. Sized by session count, not time                                                            |
+| `SESSION_BOOST_GRACE_PERIOD`    | `0`            | Wait time after release for same-session follow-up. Disabled by default; enable only when you understand the latency trade-off                                                                                                                   |
+| `SESSION_BOOST_POLL_INTERVAL`   | `100ms`        | Backend capacity polling interval                                                                                                                                                                                                                |
+| `PRIORITY_QUEUE_MAX_CONCURRENT` | `16`           | Queue-level setting shared with the user-fairness strategy; it is the global (total) inflight limit when the session-boost strategy is active. Operators size it from the estimated per-pod concurrency multiplied by the number of backend pods |
 
 ### Design Details
 
@@ -190,12 +240,12 @@ Session boost reuses the shared `RequestPriorityQueue` and its `FairnessQueueCon
 type FairnessQueueConfig struct {
     // ... fairness fields (TokenWeight, RequestNumWeight, MaxQPS, ...) ...
 
-    // MaxConcurrent is reused in session-boost mode as the global (total) inflight
+    // MaxConcurrent is the queue-level limit; in the session-boost strategy it is the global (total) inflight
     // limit (default 16 when unset). Operators size it from per-pod concurrency
     // multiplied by pod count.
     MaxConcurrent int
 
-    SessionBoostEnabled      bool          // Switch from user-fairness to session-boost mode
+    SessionBoostEnabled      bool          // Switch from user-fairness to session-boost strategy
     SessionIDHeader          string        // HTTP header for session identification
     SessionBoostMaxSessions  int           // LRU capacity: max recently-completed sessions kept warm
     SessionBoostGracePeriod  time.Duration // Wait for same-session follow-up (default: 0, disabled)
@@ -246,7 +296,7 @@ When a request with the configured session header (e.g., `X-Session-ID: conv-abc
 
 The queue uses two-level admission control:
 
-1. **Inflight limit**: At most `MaxConcurrent` requests can be in-flight across all backends simultaneously. `MaxConcurrent` is reused from fairness scheduling (`FAIRNESS_MAX_CONCURRENT`) as a global limit; operators size it from the estimated per-pod concurrency and pod count. This prevents flooding backends between metric scrapes.
+1. **Inflight limit**: At most `MaxConcurrent` requests can be in-flight across all backends simultaneously. `MaxConcurrent` is the queue-level limit shared with the user-fairness strategy (`PRIORITY_QUEUE_MAX_CONCURRENT`); operators size it from the estimated per-pod concurrency and pod count. This prevents flooding backends between metric scrapes.
 2. **Backend metrics check**: The `BackendWaitingChecker` polls backend pod metrics (e.g., vLLM's `RequestWaitingNum`) to confirm at least one pod has capacity.
 
 When a request completes (Release), the queue immediately attempts to dequeue the next request (release-driven dequeue) rather than waiting for the next polling tick, ensuring minimal latency between sequential requests.
@@ -269,11 +319,11 @@ Without session boost, Turn 2 may be queued behind 10 other requests. By the tim
 
 #### 2. Grace Period for Natural Conversation Flow
 
-Human users typically take 1-50ms between receiving a response and submitting the next message (for automated pipelines) or the follow-up may arrive within seconds (for human users). The grace period is disabled by default (`0`) to avoid adding latency to non-boosted requests. When explicitly enabled (e.g., `50ms`), it holds the dequeue slot briefly for automated multi-turn pipelines (like RAG chains or agentic workflows) that issue follow-up requests programmatically. Only enable it if you understand the trade-off.
+Human users typically take 1-50ms between receiving a response and submitting the next message (for automated pipelines) or the follow-up may arrive within seconds (for human users). The grace period is a **tricky, advanced feature that is disabled by default (`0`)** to avoid adding latency to non-boosted requests. When explicitly enabled (e.g., `50ms`), it holds the dequeue slot briefly for automated multi-turn pipelines (like RAG chains or agentic workflows) that issue follow-up requests programmatically. Because it deliberately delays unrelated requests, **only enable it if you are sure you understand the trade-off**: it helps only when follow-ups arrive within milliseconds, and for human-driven or single-turn traffic it adds latency for no gain. Keep the window very small (tens of milliseconds), and when in doubt leave it off.
 
 #### 3. No User ID Requirement for Priority
 
-Session boost derives priority from the configured session header (default: `X-Session-ID`) rather than the user identity. Even though it runs as a mode of the fairness queue, the session-boost ordering does not depend on a user ID, so prefix cache optimization works for unauthenticated requests (which are simply enqueued without a boost until their session completes once).
+Session boost derives priority from the configured session header (default: `X-Session-ID`) rather than the user identity. Even though it runs as a strategy of the priority queue, the session-boost ordering does not depend on a user ID, so prefix cache optimization works for unauthenticated requests (which are simply enqueued without a boost until their session completes once).
 
 #### 4. Complementary with Session Sticky
 

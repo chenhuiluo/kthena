@@ -69,7 +69,11 @@ func getEnvBool(key string, fallback bool) bool {
 	return fallback
 }
 
-var EnableFairnessScheduling = getEnvBool("ENABLE_FAIRNESS_SCHEDULING", false)
+// EnablePriorityQueue is the master switch for the router's per-model request
+// priority queue. The priority queue admits requests according to a pluggable
+// priority strategy; user fairness is the default strategy and session boost is
+// an alternative strategy selected via EnableSessionBoost.
+var EnablePriorityQueue = getEnvBool("ENABLE_PRIORITY_QUEUE", false)
 var EnableSessionBoost = getEnvBool("ENABLE_SESSION_BOOST", false)
 
 type Router struct {
@@ -84,10 +88,10 @@ type Router struct {
 	// KV Connector management
 	connectorFactory *connectors.Factory
 
-	// Fairness scheduling configuration
-	fairnessTimeout  time.Duration
-	tokenWeight      float64 // Weight for token-based priority (default 1.0)
-	requestNumWeight float64 // Weight for request-count-based priority (default 0.0)
+	// Priority queue configuration
+	priorityQueueTimeout time.Duration
+	tokenWeight          float64 // Weight for token-based priority in the fairness strategy (default 1.0)
+	requestNumWeight     float64 // Weight for request-count-based priority in the fairness strategy (default 0.0)
 }
 
 // ActiveRequestCount returns the number of requests currently being handled by the router.
@@ -96,10 +100,10 @@ func (r *Router) ActiveRequestCount() int64 {
 }
 
 func NewRouter(store datastore.Store, routerConfigPath string) *Router {
-	// Session boost is a mode of the fairness queue and requires fairness
-	// scheduling to be enabled. Warn if it is requested on its own.
-	if EnableSessionBoost && !EnableFairnessScheduling {
-		klog.Warningf("ENABLE_SESSION_BOOST=true requires ENABLE_FAIRNESS_SCHEDULING=true; session boost will be ignored")
+	// Session boost is an alternative priority-queue strategy and requires the
+	// priority queue to be enabled. Warn if it is requested on its own.
+	if EnableSessionBoost && !EnablePriorityQueue {
+		klog.Warningf("ENABLE_SESSION_BOOST=true requires ENABLE_PRIORITY_QUEUE=true; session boost will be ignored")
 	}
 
 	// Create a unified rate limiter for all models
@@ -167,30 +171,30 @@ func NewRouter(store datastore.Store, routerConfigPath string) *Router {
 	}
 
 	return &Router{
-		store:            store,
-		scheduler:        scheduler.NewScheduler(store, routerConfig),
-		authenticator:    auth.NewJWTAuthenticator(routerConfig),
-		loadRateLimiter:  loadRateLimiter,
-		accessLogger:     accessLogger,
-		metrics:          metricsInstance,
-		tokenizer:        tokenizerInstance,
-		connectorFactory: connectors.NewDefaultFactory(),
-		fairnessTimeout:  parseFairnessTimeout(),
-		tokenWeight:      parseEnvFloat("FAIRNESS_PRIORITY_TOKEN_WEIGHT", 1.0),
-		requestNumWeight: parseEnvFloat("FAIRNESS_PRIORITY_REQUEST_NUM_WEIGHT", 0.0),
+		store:                store,
+		scheduler:            scheduler.NewScheduler(store, routerConfig),
+		authenticator:        auth.NewJWTAuthenticator(routerConfig),
+		loadRateLimiter:      loadRateLimiter,
+		accessLogger:         accessLogger,
+		metrics:              metricsInstance,
+		tokenizer:            tokenizerInstance,
+		connectorFactory:     connectors.NewDefaultFactory(),
+		priorityQueueTimeout: parsePriorityQueueTimeout(),
+		tokenWeight:          parseEnvFloat("FAIRNESS_PRIORITY_TOKEN_WEIGHT", 1.0),
+		requestNumWeight:     parseEnvFloat("FAIRNESS_PRIORITY_REQUEST_NUM_WEIGHT", 0.0),
 	}
 }
 
-const defaultFairnessTimeout = 60 * time.Second
+const defaultPriorityQueueTimeout = 60 * time.Second
 
-func parseFairnessTimeout() time.Duration {
-	if s, ok := os.LookupEnv("FAIRNESS_QUEUE_TIMEOUT"); ok {
+func parsePriorityQueueTimeout() time.Duration {
+	if s, ok := os.LookupEnv("PRIORITY_QUEUE_TIMEOUT"); ok {
 		if d, err := time.ParseDuration(s); err == nil && d > 0 {
 			return d
 		}
-		klog.Warningf("Invalid FAIRNESS_QUEUE_TIMEOUT %q, using default %v", s, defaultFairnessTimeout)
+		klog.Warningf("Invalid PRIORITY_QUEUE_TIMEOUT %q, using default %v", s, defaultPriorityQueueTimeout)
 	}
-	return defaultFairnessTimeout
+	return defaultPriorityQueueTimeout
 }
 
 func parseEnvFloat(key string, fallback float64) float64 {
@@ -324,16 +328,17 @@ func (r *Router) HandlerFunc() gin.HandlerFunc {
 		// Store metrics recorder in context for use in other functions
 		c.Set("metricsRecorder", metricsRecorder)
 
-		// step 3.1: direct load balancing when fairness scheduling is disabled.
-		// Session boost is a mode of the fairness queue and has no effect unless
-		// fairness scheduling is enabled.
-		if !EnableFairnessScheduling {
+		// step 3.1: direct load balancing when the priority queue is disabled.
+		// Session boost is a priority-queue strategy and has no effect unless the
+		// priority queue is enabled.
+		if !EnablePriorityQueue {
 			r.doLoadbalance(c, modelRequest)
 			return
 		}
 
-		// step 3.2: fairness queue scheduling. When session boost is enabled, the
-		// queue orders requests by session boost instead of per-user fairness.
+		// step 3.2: priority queue scheduling. The queue orders requests by the
+		// active priority strategy: per-user fairness by default, or session
+		// boost when it is enabled.
 		if err := r.handleFairnessScheduling(c, modelRequest, requestID, modelName); err != nil {
 			accesslog.SetError(c, "scheduling", err.Error())
 			c.Set("finishReason", "scheduling")
@@ -1076,7 +1081,7 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 		requestID, userId, modelName)
 
 	// Create request-scoped context that unifies client disconnect and server timeout
-	reqCtx, cancel := context.WithTimeout(c.Request.Context(), r.fairnessTimeout)
+	reqCtx, cancel := context.WithTimeout(c.Request.Context(), r.priorityQueueTimeout)
 	defer cancel()
 
 	var pri float64
@@ -1117,10 +1122,10 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 			requestID, userId, modelName, queueReq.SessionBoost, time.Since(queueReq.RequestTime))
 		r.doLoadbalance(c, modelRequest)
 
-		// After successful proxy, mark the session as completed so follow-up
+		// After successful proxy, mark the session request as completed so follow-up
 		// requests from the same session get priority boost for prefix cache.
 		if sessionID != "" {
-			r.store.MarkSessionCompleted(modelName, sessionID)
+			r.store.MarkSessionRequestCompleted(modelName, sessionID)
 		}
 		return nil
 	case <-reqCtx.Done():
@@ -1129,7 +1134,7 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 		}
 		if errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
 			klog.Errorf("[FairnessScheduling] request timed out in queue: reqID=%s sessionID=%s user=%s model=%s timeout=%v",
-				requestID, sessionID, userId, modelName, r.fairnessTimeout)
+				requestID, sessionID, userId, modelName, r.priorityQueueTimeout)
 			c.AbortWithStatusJSON(http.StatusGatewayTimeout, "Request processing timed out")
 			return fmt.Errorf("request processing timed out in fairness queue")
 		}

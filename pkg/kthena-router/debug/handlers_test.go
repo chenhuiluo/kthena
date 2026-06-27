@@ -181,7 +181,7 @@ func (m *MockStore) GetSessionIDHeader() string {
 	return args.String(0)
 }
 
-func (m *MockStore) MarkSessionCompleted(modelName, sessionID string) {
+func (m *MockStore) MarkSessionRequestCompleted(modelName, sessionID string) {
 	m.Called(modelName, sessionID)
 }
 

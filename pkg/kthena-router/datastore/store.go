@@ -239,9 +239,9 @@ type Store interface {
 	// Enqueue adds a request to the fair queue
 	Enqueue(*Request) error
 
-	// MarkSessionCompleted records that a request with the given session ID
+	// MarkSessionRequestCompleted records that a request with the given session ID
 	// has completed, enabling priority boosting for follow-up requests in the same session.
-	MarkSessionCompleted(modelName, sessionID string)
+	MarkSessionRequestCompleted(modelName, sessionID string)
 
 	// GetSessionIDHeader returns the configured HTTP header name used to identify
 	// conversation sessions. Returns empty string if session boost is not enabled.
@@ -416,39 +416,42 @@ func (s *store) getPodRuntimeInspector() PodRuntimeInspector {
 	return s.podRuntimeInspector
 }
 
-// createFairnessQueueConfig reads fairness queue configuration from environment variables.
+// createFairnessQueueConfig reads the request priority queue configuration from
+// environment variables. This includes queue-level settings (PRIORITY_QUEUE_*),
+// the default user-fairness strategy weights (FAIRNESS_*), and the optional
+// session-boost strategy (SESSION_BOOST_*).
 func createFairnessQueueConfig() FairnessQueueConfig {
 	cfg := DefaultFairnessQueueConfig()
 
-	if v := os.Getenv("FAIRNESS_MAX_CONCURRENT"); v != "" {
+	if v := os.Getenv("PRIORITY_QUEUE_MAX_CONCURRENT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			cfg.MaxConcurrent = n
 		} else {
-			klog.Warningf("Invalid FAIRNESS_MAX_CONCURRENT: %q, using default %d", v, cfg.MaxConcurrent)
+			klog.Warningf("Invalid PRIORITY_QUEUE_MAX_CONCURRENT: %q, using default %d", v, cfg.MaxConcurrent)
 		}
 	}
 
-	if v := os.Getenv("FAIRNESS_MAX_QPS"); v != "" {
+	if v := os.Getenv("PRIORITY_QUEUE_MAX_QPS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.MaxQPS = n
 		} else {
-			klog.Warningf("Invalid FAIRNESS_MAX_QPS: %q, using default %d", v, cfg.MaxQPS)
+			klog.Warningf("Invalid PRIORITY_QUEUE_MAX_QPS: %q, using default %d", v, cfg.MaxQPS)
 		}
 	}
 
-	if v := os.Getenv("FAIRNESS_PRIORITY_REFRESH_RETRIES"); v != "" {
+	if v := os.Getenv("PRIORITY_QUEUE_REFRESH_RETRIES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			cfg.MaxPriorityRefreshRetries = n
 		} else {
-			klog.Warningf("Invalid FAIRNESS_PRIORITY_REFRESH_RETRIES: %q, using default %d", v, cfg.MaxPriorityRefreshRetries)
+			klog.Warningf("Invalid PRIORITY_QUEUE_REFRESH_RETRIES: %q, using default %d", v, cfg.MaxPriorityRefreshRetries)
 		}
 	}
 
-	if v := os.Getenv("FAIRNESS_REBUILD_THRESHOLD"); v != "" {
+	if v := os.Getenv("PRIORITY_QUEUE_REBUILD_THRESHOLD"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.RebuildThreshold = n
 		} else {
-			klog.Warningf("Invalid FAIRNESS_REBUILD_THRESHOLD: %q, using default %d", v, cfg.RebuildThreshold)
+			klog.Warningf("Invalid PRIORITY_QUEUE_REBUILD_THRESHOLD: %q, using default %d", v, cfg.RebuildThreshold)
 		}
 	}
 
@@ -473,14 +476,15 @@ func createFairnessQueueConfig() FairnessQueueConfig {
 	return cfg
 }
 
-// applySessionBoostConfigFromEnv enables session-boost mode on the fairness queue
+// applySessionBoostConfigFromEnv enables session-boost mode on the priority queue
 // config when ENABLE_SESSION_BOOST=true and reads the session-boost specific
-// options from the environment. When session boost is enabled, the fairness queue
-// switches from per-user fair queuing to session-aware boosting.
+// options from the environment. Session boost is one of the priority queue's
+// pluggable priority strategies; when it is enabled, the queue switches from the
+// default per-user fairness strategy to session-aware boosting.
 //
-// Session boost requires fairness scheduling to be enabled
-// (ENABLE_FAIRNESS_SCHEDULING=true); otherwise it is ignored, since session boost
-// is a mode of the fairness queue rather than a standalone queue.
+// Session boost requires the priority queue to be enabled
+// (ENABLE_PRIORITY_QUEUE=true); otherwise it is ignored, since session boost is a
+// priority-queue strategy rather than a standalone queue.
 func applySessionBoostConfigFromEnv(cfg *FairnessQueueConfig) {
 	v := os.Getenv("ENABLE_SESSION_BOOST")
 	if v == "" {
@@ -491,8 +495,8 @@ func applySessionBoostConfigFromEnv(cfg *FairnessQueueConfig) {
 		return
 	}
 
-	if !isFairnessSchedulingEnabled() {
-		klog.Warningf("ENABLE_SESSION_BOOST=true requires ENABLE_FAIRNESS_SCHEDULING=true; session boost will be ignored")
+	if !isPriorityQueueEnabled() {
+		klog.Warningf("ENABLE_SESSION_BOOST=true requires ENABLE_PRIORITY_QUEUE=true; session boost will be ignored")
 		return
 	}
 
@@ -527,10 +531,10 @@ func applySessionBoostConfigFromEnv(cfg *FairnessQueueConfig) {
 	}
 }
 
-// isFairnessSchedulingEnabled reports whether fairness scheduling is enabled via
-// the ENABLE_FAIRNESS_SCHEDULING environment variable.
-func isFairnessSchedulingEnabled() bool {
-	if v := os.Getenv("ENABLE_FAIRNESS_SCHEDULING"); v != "" {
+// isPriorityQueueEnabled reports whether the request priority queue is enabled via
+// the ENABLE_PRIORITY_QUEUE environment variable.
+func isPriorityQueueEnabled() bool {
+	if v := os.Getenv("ENABLE_PRIORITY_QUEUE"); v != "" {
 		if enabled, err := strconv.ParseBool(v); err == nil {
 			return enabled
 		}
@@ -645,7 +649,7 @@ func (s *store) Enqueue(req *Request) error {
 		var newQueue *RequestPriorityQueue
 		if s.fairnessQueueConfig.SessionBoostEnabled {
 			// Session-boost mode: gate dequeue on backend capacity. The total
-			// inflight limit is FAIRNESS_MAX_CONCURRENT, sized by the operator.
+			// inflight limit is PRIORITY_QUEUE_MAX_CONCURRENT, sized by the operator.
 			checker := s.makeBackendWaitingChecker(modelName)
 			newQueue = NewRequestPriorityQueueWithConfig(nil, s.fairnessQueueConfig, s.tokenTracker, checker)
 		} else {
@@ -706,7 +710,7 @@ func (s *store) makeBackendWaitingChecker(modelName string) BackendWaitingChecke
 	}
 }
 
-func (s *store) MarkSessionCompleted(modelName, sessionID string) {
+func (s *store) MarkSessionRequestCompleted(modelName, sessionID string) {
 	if sessionID == "" {
 		return
 	}
@@ -714,7 +718,7 @@ func (s *store) MarkSessionCompleted(modelName, sessionID string) {
 	// is running in session-boost mode; otherwise it is a no-op.
 	if val, ok := s.requestWaitingQueue.Load(modelName); ok {
 		if queue, _ := val.(*RequestPriorityQueue); queue != nil {
-			queue.MarkSessionCompleted(sessionID)
+			queue.MarkSessionRequestCompleted(sessionID)
 		}
 	}
 }

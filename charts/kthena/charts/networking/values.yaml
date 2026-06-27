@@ -39,28 +39,36 @@ kthenaRouter:
   # -- Drain timeout for kthena-router graceful shutdown.
   # -- This should be less than terminationGracePeriodSeconds.
   drainTimeout: 5m
-  # fairness configuration for request scheduling
-  fairness:
-    # enabled controls whether fairness scheduling is active
+  # priorityQueue configures the router's per-model request priority queue.
+  # The queue admits requests according to a pluggable priority strategy. User
+  # fairness is the DEFAULT strategy; session boost is an alternative strategy.
+  # The two strategies are mutually exclusive.
+  priorityQueue:
+    # enabled controls whether the priority queue is active. When enabled with no
+    # other strategy selected, the queue uses the default user-fairness strategy.
     enabled: false
-    # windowSize is the sliding window duration for token usage tracking
-    # Valid formats: 1m, 5m, 10m, 30m, 1h (default: 1h)
-    windowSize: "1h"
-    # inputTokenWeight is the weight multiplier for input tokens in priority calculation (default: 1.0)
-    inputTokenWeight: 1.0
-    # outputTokenWeight is the weight multiplier for output tokens in priority calculation (default: 2.0)
-    outputTokenWeight: 2.0
-    # maxConcurrent is the global total inflight request limit admitted to backends.
-    # It is reused by session-boost mode; size it as the estimated per-pod concurrency
-    # (e.g. vLLM's --max-num-seqs) multiplied by the number of backend pods.
-    # 0 or unset uses the router default (16).
+    # maxConcurrent is the queue-level global total inflight request limit admitted
+    # to backends. It is shared by all strategies. In session-boost mode, size it as
+    # the estimated per-pod concurrency (e.g. vLLM's --max-num-seqs) multiplied by
+    # the number of backend pods. 0 or unset uses the router default (16).
     maxConcurrent: 0
-    # sessionBoost is a mode of the fairness queue (it requires fairness.enabled=true).
-    # When enabled, the fairness queue switches from per-user fair queuing to
-    # session-aware boosting to maximize prefix cache hits for multi-turn
-    # conversations. The two modes are mutually exclusive.
+    # fairness holds settings for the default user-fairness priority strategy, which
+    # orders requests by each user's recent token usage (lower usage = higher priority).
+    fairness:
+      # windowSize is the sliding window duration for token usage tracking
+      # Valid formats: 1m, 5m, 10m, 30m, 1h (default: 1h)
+      windowSize: "1h"
+      # inputTokenWeight is the weight multiplier for input tokens in priority calculation (default: 1.0)
+      inputTokenWeight: 1.0
+      # outputTokenWeight is the weight multiplier for output tokens in priority calculation (default: 2.0)
+      outputTokenWeight: 2.0
+    # sessionBoost selects the session-boost priority strategy (it requires
+    # priorityQueue.enabled=true). When enabled, the priority queue switches from
+    # the default user-fairness strategy to session-aware boosting to maximize
+    # prefix cache hits for multi-turn conversations. The two strategies are
+    # mutually exclusive.
     sessionBoost:
-      # enabled controls whether session-boost mode is active on the fairness queue
+      # enabled controls whether the session-boost strategy is active on the priority queue
       enabled: false
       # header is the HTTP header used to identify conversation sessions
       header: "X-Session-ID"

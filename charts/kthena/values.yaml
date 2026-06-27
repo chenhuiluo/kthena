@@ -68,24 +68,28 @@ networking:
         keyFile: /etc/tls/tls.key
         # -- Secret name for storing webhook certificates.
         secretName: kthena-router-webhook-certs
-    fairness:
-      # -- Enable fairness scheduling.
+    # priorityQueue configures the per-model request priority queue. User fairness
+    # is the default priority strategy; session boost is an alternative strategy.
+    priorityQueue:
+      # -- Enable the request priority queue (default strategy: user fairness).
       enabled: false
-      # -- Sliding window duration for token usage tracking.
-      windowSize: "1h"
-      # -- Weight multiplier for input tokens.
-      inputTokenWeight: 1.0
-      # -- Weight multiplier for output tokens.
-      outputTokenWeight: 2.0
-      # -- Global total inflight request limit admitted to backends.<br/>
-      # Reused by session-boost mode; size it as estimated per-pod concurrency x pod count.<br/>
+      # -- Queue-level global total inflight request limit admitted to backends.<br/>
+      # Shared by all strategies; size it as estimated per-pod concurrency x pod count.<br/>
       # `0` or unset uses the router default (16).
       maxConcurrent: 0
-      # sessionBoost is a mode of the fairness queue (requires `fairness.enabled=true`).
+      # fairness holds settings for the default user-fairness priority strategy.
+      fairness:
+        # -- User-fairness strategy: sliding window duration for token usage tracking.
+        windowSize: "1h"
+        # -- User-fairness strategy: weight multiplier for input tokens.
+        inputTokenWeight: 1.0
+        # -- User-fairness strategy: weight multiplier for output tokens.
+        outputTokenWeight: 2.0
+      # sessionBoost selects the session-boost strategy (requires `priorityQueue.enabled=true`).
       sessionBoost:
-        # -- Enable session-boost mode on the fairness queue.<br/>
-        # Switches the queue from per-user fairness to session-aware boosting
-        # (the two modes are mutually exclusive).
+        # -- Switch the priority queue to the session-boost strategy.<br/>
+        # Replaces the default per-user fairness strategy with session-aware boosting
+        # (the two strategies are mutually exclusive).
         enabled: false
         # -- HTTP header used to identify conversation sessions.
         header: "X-Session-ID"

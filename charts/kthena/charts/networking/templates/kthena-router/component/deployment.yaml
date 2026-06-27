@@ -77,22 +77,23 @@ spec:
                   name: redis-secret
                   key: password
                   optional: true
-            # Fairness scheduling configuration
-            - name: ENABLE_FAIRNESS_SCHEDULING
-              value: {{ .Values.kthenaRouter.fairness.enabled | quote }}
-            {{- if .Values.kthenaRouter.fairness.enabled }}
+            # Priority queue configuration
+            - name: ENABLE_PRIORITY_QUEUE
+              value: {{ .Values.kthenaRouter.priorityQueue.enabled | quote }}
+            {{- if .Values.kthenaRouter.priorityQueue.enabled }}
+            # User-fairness strategy settings (default priority strategy)
             - name: FAIRNESS_WINDOW_SIZE
-              value: {{ .Values.kthenaRouter.fairness.windowSize | quote }}
+              value: {{ .Values.kthenaRouter.priorityQueue.fairness.windowSize | quote }}
             - name: FAIRNESS_INPUT_TOKEN_WEIGHT
-              value: {{ .Values.kthenaRouter.fairness.inputTokenWeight | quote }}
+              value: {{ .Values.kthenaRouter.priorityQueue.fairness.inputTokenWeight | quote }}
             - name: FAIRNESS_OUTPUT_TOKEN_WEIGHT
-              value: {{ .Values.kthenaRouter.fairness.outputTokenWeight | quote }}
-            {{- if .Values.kthenaRouter.fairness.maxConcurrent }}
-            - name: FAIRNESS_MAX_CONCURRENT
-              value: {{ .Values.kthenaRouter.fairness.maxConcurrent | quote }}
+              value: {{ .Values.kthenaRouter.priorityQueue.fairness.outputTokenWeight | quote }}
+            {{- if .Values.kthenaRouter.priorityQueue.maxConcurrent }}
+            - name: PRIORITY_QUEUE_MAX_CONCURRENT
+              value: {{ .Values.kthenaRouter.priorityQueue.maxConcurrent | quote }}
             {{- end }}
-            # Session boost is a mode of the fairness queue
-            {{- with .Values.kthenaRouter.fairness.sessionBoost }}
+            # Session boost is an alternative priority-queue strategy
+            {{- with .Values.kthenaRouter.priorityQueue.sessionBoost }}
             {{- if .enabled }}
             - name: ENABLE_SESSION_BOOST
               value: "true"

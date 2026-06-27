@@ -40,7 +40,7 @@ func TestSessionBoostQueue_BasicPriorityOrdering(t *testing.T) {
 	defer q.Close()
 
 	// Simulate a completed session
-	q.MarkSessionCompleted("conv-123")
+	q.MarkSessionRequestCompleted("conv-123")
 
 	now := time.Now()
 
@@ -127,9 +127,9 @@ func TestSessionBoostQueue_BoostEvictedByLRU(t *testing.T) {
 
 	// conv-123 completes first; two newer sessions then complete and push it out
 	// of the LRU cache.
-	q.MarkSessionCompleted("conv-123")
-	q.MarkSessionCompleted("conv-456")
-	q.MarkSessionCompleted("conv-789")
+	q.MarkSessionRequestCompleted("conv-123")
+	q.MarkSessionRequestCompleted("conv-456")
+	q.MarkSessionRequestCompleted("conv-789")
 
 	now := time.Now()
 	req := &Request{
@@ -156,16 +156,16 @@ func TestSessionBoostQueue_BoostEvictedByLRU(t *testing.T) {
 func TestSessionTracker_LRU(t *testing.T) {
 	st := NewSessionTracker(2)
 
-	st.MarkCompleted("a")
-	st.MarkCompleted("b")
+	st.MarkRequestCompleted("a")
+	st.MarkRequestCompleted("b")
 	if !st.HasRecentCompletion("a") || !st.HasRecentCompletion("b") {
 		t.Fatal("both a and b should be tracked")
 	}
 
 	// Re-complete "a" so it becomes most-recently-used; "b" is now the LRU entry.
-	st.MarkCompleted("a")
+	st.MarkRequestCompleted("a")
 	// Completing "c" exceeds capacity and should evict "b" (the LRU), not "a".
-	st.MarkCompleted("c")
+	st.MarkRequestCompleted("c")
 
 	if st.HasRecentCompletion("b") {
 		t.Error("b should have been evicted as the least-recently-used session")
@@ -186,8 +186,8 @@ func TestSessionBoostQueue_MultipleSessions(t *testing.T) {
 	q := newSessionBoostQueue(cfg)
 	defer q.Close()
 
-	q.MarkSessionCompleted("conv-A")
-	q.MarkSessionCompleted("conv-B")
+	q.MarkSessionRequestCompleted("conv-A")
+	q.MarkSessionRequestCompleted("conv-B")
 
 	now := time.Now()
 	requests := []*Request{
@@ -373,7 +373,7 @@ func TestSessionBoostQueue_GracePeriod_BoostedArrives(t *testing.T) {
 	}
 
 	// Mark session completed and push a non-boosted request
-	q.MarkSessionCompleted("session-1")
+	q.MarkSessionRequestCompleted("session-1")
 	nonBoosted := &Request{
 		UserID:      "user-B",
 		ModelName:   "model-1",
@@ -476,7 +476,7 @@ func TestSessionBoostQueue_DirectMode(t *testing.T) {
 	q := newSessionBoostQueue(cfg)
 	defer q.Close()
 
-	q.MarkSessionCompleted("session-1")
+	q.MarkSessionRequestCompleted("session-1")
 
 	now := time.Now()
 	normalReq := &Request{
@@ -566,7 +566,7 @@ func TestSessionBoostQueue_EmptySessionID(t *testing.T) {
 	q := newSessionBoostQueue(cfg)
 	defer q.Close()
 
-	q.MarkSessionCompleted("conv-123")
+	q.MarkSessionRequestCompleted("conv-123")
 
 	now := time.Now()
 	req := &Request{

@@ -1,10 +1,12 @@
 # Session Boost Queue
 
-Kthena Router session boost queue optimizes multi-turn conversation performance by prioritizing follow-up requests from the same conversation session. This maximizes **prefix cache hit rate** on LLM inference backends (e.g., vLLM), significantly reducing Time-to-First-Token (TTFT) for multi-turn conversations.
+Kthena Router session boost is an alternative **priority strategy** for the router's per-model **priority queue**. It optimizes multi-turn conversation performance by prioritizing follow-up requests from the same conversation session. This maximizes **prefix cache hit rate** on LLM inference backends (e.g., vLLM), significantly reducing Time-to-First-Token (TTFT) for multi-turn conversations.
 
-This guide explains what session boost does, when to use it, how to enable it, and how to verify it is working.
+This guide explains what session boost does, when to use it, how to enable it, and how to verify it is working. It assumes familiarity with the priority queue described in [Fairness Scheduling](./fairness-scheduling), whose default user-fairness strategy session boost replaces when enabled.
 
 ## Overview
+
+The router schedules requests through a per-model priority queue. The queue is strategy-agnostic and supports two mutually exclusive priority strategies: the default **user fairness** strategy and the **session boost** strategy described here. They share the same queue, admission control, and backpressure machinery, and differ only in how request priority is computed.
 
 Modern LLM inference engines like vLLM maintain a **prefix cache** (KV cache) that stores previously computed key-value attention states. In multi-turn conversations, each follow-up message shares a large prefix with the previous turn. If the follow-up request is processed shortly after the prior turn completes, the prefix cache is still warm, and the engine can skip recomputing attention for the shared prefix—substantially reducing TTFT.
 
@@ -43,7 +45,7 @@ Session boost is designed for these scenarios:
 - **Multi-turn chat applications**: ChatGPT-like interfaces where users have back-and-forth conversations with an LLM. Each turn builds on the previous conversation context.
 - **Agentic workflows and RAG chains**: Automated pipelines that issue multiple sequential requests in the same session, where each request depends on the previous response.
 - **Low-latency prefix cache optimization**: Workloads where minimizing TTFT is critical and the same session's requests benefit from being processed back-to-back on warm KV cache.
-- **Prefix cache optimization instead of per-user fairness**: When you want the shared fairness queue to prioritize warm KV cache reuse rather than equitable per-user resource sharing.
+- **Prefix cache optimization instead of per-user fairness**: When you want the shared priority queue to prioritize warm KV cache reuse rather than equitable per-user resource sharing.
 
 Session boost is **not** needed when:
 
@@ -53,7 +55,7 @@ Session boost is **not** needed when:
 ## Prerequisites
 
 - A Kubernetes cluster with Kthena installed.
-- **Fairness scheduling enabled** (`ENABLE_FAIRNESS_SCHEDULING=true`). Session boost is a mode of the fairness queue, so it only takes effect when fairness scheduling is enabled. If `ENABLE_SESSION_BOOST=true` is set without fairness scheduling, the router logs a warning and ignores session boost.
+- **Priority queue enabled** (`ENABLE_PRIORITY_QUEUE=true`). Session boost is an alternative strategy of the priority queue, so it only takes effect when the priority queue is enabled. If `ENABLE_SESSION_BOOST=true` is set without the priority queue, the router logs a warning and ignores session boost.
 - A deployed `ModelRoute` and backend `ModelServer` (e.g., vLLM) that supports prefix caching.
 - Clients that include a consistent session identifier header across related requests in a conversation.
 
@@ -61,20 +63,20 @@ Session boost is **not** needed when:
 
 ### Helm Values
 
-The simplest way to enable session boost is through Helm values. Because session boost is a **mode of the fairness queue**, its settings live under `fairness.sessionBoost`:
+The simplest way to enable session boost is through Helm values. Because session boost is an alternative **priority strategy** of the priority queue, its settings live under `priorityQueue.sessionBoost`:
 
 ```yaml
 networking:
   kthenaRouter:
-    fairness:
-      enabled: true              # Required: session boost is a mode of the fairness queue
+    priorityQueue:
+      enabled: true              # Required: session boost is a priority-queue strategy
+      # maxConcurrent: 32        # Queue-level global total inflight limit in session-boost mode.
+      #                          # Size it yourself: estimated per-pod concurrency x pod count.
       sessionBoost:
         enabled: true
         header: "X-Session-ID"
         maxSessions: 4096        # LRU cache of recently-completed sessions kept warm
         # pollInterval: "100ms"
-      # maxConcurrent: 32        # Global total inflight limit in session-boost mode.
-      #                          # Size it yourself: estimated per-pod concurrency x pod count.
 ```
 
 Apply with Helm:
@@ -92,8 +94,8 @@ You can also configure session boost directly via environment variables on the `
 
 ```yaml
 env:
-- name: ENABLE_FAIRNESS_SCHEDULING
-  value: "true"              # Required: session boost runs as a mode of the fairness queue
+- name: ENABLE_PRIORITY_QUEUE
+  value: "true"              # Required: session boost runs as a priority-queue strategy
 - name: ENABLE_SESSION_BOOST
   value: "true"
 - name: SESSION_BOOST_HEADER
@@ -102,21 +104,21 @@ env:
   value: "4096"
 - name: SESSION_BOOST_POLL_INTERVAL
   value: "100ms"
-# - name: FAIRNESS_MAX_CONCURRENT
-#   value: "32"               # Global total inflight limit in session-boost mode.
+# - name: PRIORITY_QUEUE_MAX_CONCURRENT
+#   value: "32"               # Queue-level gueue-level global total inflight limit in session-boost mode.
 #                             # Size it yourself: estimated per-pod concurrency x pod count.
 ```
 
 ## Configuration Reference
 
-| Environment Variable          | Purpose                                                                           | Default      | Notes                                                                                                                                                                                                                                       |
-| ----------------------------- | --------------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ENABLE_FAIRNESS_SCHEDULING`  | Enable the fairness queue (required for session boost)                            | `false`      | Session boost is a mode of this queue; it is ignored unless this is `true`                                                                                                                                                                  |
-| `ENABLE_SESSION_BOOST`        | Enable session-boost mode on the fairness queue                                   | `false`      | Requires `ENABLE_FAIRNESS_SCHEDULING=true`                                                                                                                                                                                                  |
-| `SESSION_BOOST_HEADER`        | HTTP header used to identify conversation sessions                                | *(required)* | Must match what your clients send                                                                                                                                                                                                           |
-| `SESSION_BOOST_MAX_SESSIONS`  | Max number of recently-completed sessions kept "warm" for boosting (LRU-bounded)  | `4096`       | When the cache is full, the least-recently-used session is evicted automatically. Size it by the number of concurrent conversations you want to keep boosted—no time-based tuning required                                                  |
-| `SESSION_BOOST_POLL_INTERVAL` | Interval at which the queue polls backend pod metrics to check available capacity | `100ms`      | Lower values react faster to capacity changes but increase metrics polling load                                                                                                                                                             |
-| `FAIRNESS_MAX_CONCURRENT`     | Total inflight requests admitted to backends (session-boost mode)                 | `16`         | Reused from fairness scheduling. It is a **global** limit, not per-pod. In session-boost mode you must size it yourself based on the estimated per-pod concurrency (e.g., vLLM's `--max-num-seqs`) multiplied by the number of backend pods |
+| Environment Variable            | Purpose                                                                           | Default      | Notes                                                                                                                                                                                                                                                                                   |
+| ------------------------------- | --------------------------------------------------------------------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ENABLE_PRIORITY_QUEUE`         | Enable the priority queue (required for session boost)                            | `false`      | Session boost is a strategy of this queue; it is ignored unless this is `true`                                                                                                                                                                                                          |
+| `ENABLE_SESSION_BOOST`          | Switch the priority queue to the session-boost strategy                           | `false`      | Requires `ENABLE_PRIORITY_QUEUE=true`                                                                                                                                                                                                                                                   |
+| `SESSION_BOOST_HEADER`          | HTTP header used to identify conversation sessions                                | *(required)* | Must match what your clients send                                                                                                                                                                                                                                                       |
+| `SESSION_BOOST_MAX_SESSIONS`    | Max number of recently-completed sessions kept "warm" for boosting (LRU-bounded)  | `4096`       | When the cache is full, the least-recently-used session is evicted automatically. Size it by the number of concurrent conversations you want to keep boosted—no time-based tuning required                                                                                              |
+| `SESSION_BOOST_POLL_INTERVAL`   | Interval at which the queue polls backend pod metrics to check available capacity | `100ms`      | Lower values react faster to capacity changes but increase metrics polling load                                                                                                                                                                                                         |
+| `PRIORITY_QUEUE_MAX_CONCURRENT` | Total inflight requests admitted to backends (session-boost strategy)             | `16`         | Queue-level setting shared with the fairness strategy the fairness strategy. It is a **global** limit, not per-pod. In session-boost mode you must size it yourself based on the estimated per-pod concurrency (e.g., vLLM's `--max-num-seqs`) multiplied by the number of backend pods |
 
 > `SESSION_BOOST_GRACE_PERIOD` is intentionally omitted from the table above. It is an advanced, scenario-specific knob that is disabled by default; see [Advanced: Grace Period](#advanced-grace-period-use-with-caution).
 
@@ -178,24 +180,24 @@ The session boost queue uses a simple two-level priority:
 
 The queue uses two-level admission control to avoid flooding backends:
 
-1. **Inflight limit**: at most `FAIRNESS_MAX_CONCURRENT` requests can be in-flight across all backends simultaneously. This is a global limit; size it from your estimated per-pod concurrency and the number of backend pods.
+1. **Inflight limit**: at most `PRIORITY_QUEUE_MAX_CONCURRENT` requests can be in-flight across all backends simultaneously. This is a global limit; size it from your estimated per-pod concurrency and the number of backend pods.
 2. **Backend metrics check**: the queue polls backend pod metrics to confirm at least one pod has available capacity before dispatching.
 
 When a request completes, the queue immediately attempts to dequeue the next request (release-driven dequeue) rather than waiting for the next polling tick.
 
-## Session Boost vs Fairness Scheduling
+## Session Boost vs User Fairness
 
-Session boost and fairness scheduling share the same underlying per-model request priority queue but configure it for different goals. Enabling session boost switches that queue from per-user fairness ordering to session-aware boosting:
+Session boost and user fairness are the two priority strategies of the same per-model request priority queue; they configure that shared queue for different goals. Selecting session boost switches the queue from the default per-user fairness ordering to session-aware boosting:
 
-| Aspect           | Session Boost                      | Fairness Scheduling               |
-| ---------------- | ---------------------------------- | --------------------------------- |
-| Goal             | Maximize prefix cache hits         | Equitable resource allocation     |
-| Activation       | `ENABLE_SESSION_BOOST=true`        | `ENABLE_FAIRNESS_SCHEDULING=true` |
-| Requires user ID | No                                 | Yes                               |
-| Priority logic   | Boosted > non-boosted, FIFO within | Lower recent usage wins           |
-| Best for         | Multi-turn latency optimization    | Multi-tenant contention           |
+| Aspect           | Session Boost                      | User Fairness                             |
+| ---------------- | ---------------------------------- | ----------------------------------------- |
+| Goal             | Maximize prefix cache hits         | Equitable resource allocation             |
+| Activation       | `ENABLE_SESSION_BOOST=true`        | default when `ENABLE_PRIORITY_QUEUE=true` |
+| Requires user ID | No                                 | Yes                                       |
+| Priority logic   | Boosted > non-boosted, FIFO within | Lower recent usage wins                   |
+| Best for         | Multi-turn latency optimization    | Multi-tenant contention                   |
 
-Because both modes are driven by the same queue, they are **mutually exclusive**—when session boost is enabled, per-user fairness ordering is turned off for that queue. Enable one or the other based on your primary scheduling concern.
+Because both strategies are driven by the same queue, they are **mutually exclusive**—when session boost is enabled, per-user fairness ordering is turned off for that queue. Enable one or the other based on your primary scheduling concern.
 
 ## Choosing Good Settings
 
@@ -204,7 +206,7 @@ Start with the defaults unless you have a specific performance issue.
 Recommended tuning:
 
 - **Many concurrent conversations**: increase `SESSION_BOOST_MAX_SESSIONS` so that active sessions are not evicted from the LRU cache before their follow-up arrives. The default (`4096`) suits most deployments; raise it if you serve a larger number of simultaneous conversations.
-- **High-throughput backends**: the default total inflight limit (`FAIRNESS_MAX_CONCURRENT=16`) is conservative. Size it yourself as roughly the per-pod concurrency (e.g., vLLM's `--max-num-seqs`) times the number of backend pods. Reduce for conservative admission control; increase for backends that handle high parallelism.
+- **High-throughput backends**: the default total inflight limit (`PRIORITY_QUEUE_MAX_CONCURRENT=16`) is conservative. Size it yourself as roughly the per-pod concurrency (e.g., vLLM's `--max-num-seqs`) times the number of backend pods. Reduce for conservative admission control; increase for backends that handle high parallelism.
 - **Latency-sensitive workloads**: reduce `SESSION_BOOST_POLL_INTERVAL` to `50ms` for faster reaction to backend capacity changes.
 
 ## Verify Session Boost
@@ -246,7 +248,7 @@ To observe the effect, generate concurrent load with multiple simultaneous multi
 ### Requests are not being boosted
 
 Verify that:
-1. Both `ENABLE_FAIRNESS_SCHEDULING` and `ENABLE_SESSION_BOOST` are set to `true` in the router environment. Session boost is ignored (with a warning) if fairness scheduling is disabled.
+1. Both `ENABLE_PRIORITY_QUEUE` and `ENABLE_SESSION_BOOST` are set to `true` in the router environment. Session boost is ignored (with a warning) if the priority queue is disabled.
 2. The client sends the configured header (set via `SESSION_BOOST_HEADER`) with a consistent value across turns.
 3. The session is still tracked—that is, it has not been evicted from the LRU cache by `SESSION_BOOST_MAX_SESSIONS` newer sessions completing in the meantime.
 

@@ -73,10 +73,10 @@ func NewSessionTracker(capacity int) *SessionTracker {
 	}
 }
 
-// MarkCompleted records that a request from the given session has completed,
+// MarkRequestCompleted records that a request from the given session has completed,
 // promoting it to the most-recently-used position. When the cache exceeds its
 // capacity, the least-recently-used session is evicted.
-func (st *SessionTracker) MarkCompleted(sessionID string) {
+func (st *SessionTracker) MarkRequestCompleted(sessionID string) {
 	if sessionID == "" {
 		return
 	}
@@ -119,12 +119,12 @@ func (st *SessionTracker) ActiveSessions() int {
 	return st.ll.Len()
 }
 
-// MarkSessionCompleted records that a request from the given session has completed,
+// MarkSessionRequestCompleted records that a request from the given session has completed,
 // enabling priority boosting for follow-up requests in the same session. No-op when
 // the queue is not in session-boost mode.
-func (pq *RequestPriorityQueue) MarkSessionCompleted(sessionID string) {
+func (pq *RequestPriorityQueue) MarkSessionRequestCompleted(sessionID string) {
 	if pq.sessionTracker != nil {
-		pq.sessionTracker.MarkCompleted(sessionID)
+		pq.sessionTracker.MarkRequestCompleted(sessionID)
 	}
 }
 

@@ -9,6 +9,8 @@
 
 ## 1. Current Architecture
 
+> **Note:** The request queue described here is a general per-model **priority queue**. User fairness is its **default priority strategy**; an alternative **session-boost** strategy (see [Session Boost Queue](./session-boost-queue.md)) reuses the same queue. Queue-level configuration uses the `PRIORITY_QUEUE_*` environment variables, while user-fairness scoring uses the `FAIRNESS_*` variables.
+
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │                         Request Flow (Fairness ON)                     │
@@ -57,13 +59,13 @@
 
 ### Current Components
 
-| Component | Location | Responsibility |
-|-----------|----------|----------------|
-| `handleFairnessScheduling` | `router.go:965` | Entry point; extracts userId, gets priority, enqueues, blocks |
-| `RequestPriorityQueue` | `fairness_queue.go` | Min-heap ordered by token usage; per-model goroutine dequeues at fixed QPS |
-| `InMemorySlidingWindowTokenTracker` | `token_tracker.go` | Sliding-window weighted token accumulator per (user, model) |
-| `EnableFairnessScheduling` | `router.go:68` | Global env-var kill switch (`ENABLE_FAIRNESS_SCHEDULING`) |
-| Metrics | `metrics.go` | `kthena_router_fairness_queue_size`, `kthena_router_fairness_queue_duration_seconds` |
+| Component                           | Location            | Responsibility                                                                       |
+| ----------------------------------- | ------------------- | ------------------------------------------------------------------------------------ |
+| `handleFairnessScheduling`          | `router.go:965`     | Entry point; extracts userId, gets priority, enqueues, blocks                        |
+| `RequestPriorityQueue`              | `fairness_queue.go` | Min-heap ordered by token usage; per-model goroutine dequeues at fixed QPS           |
+| `InMemorySlidingWindowTokenTracker` | `token_tracker.go`  | Sliding-window weighted token accumulator per (user, model)                          |
+| `EnablePriorityQueue`               | `router.go`         | Global env-var kill switch (`ENABLE_PRIORITY_QUEUE`)                                 |
+| Metrics                             | `metrics.go`        | `kthena_router_fairness_queue_size`, `kthena_router_fairness_queue_duration_seconds` |
 
 ---
 
@@ -286,7 +288,7 @@ type Request struct {
 
 **Three-point cancellation:**
 
-1. **At enqueue:** Create `reqCtx, cancel := context.WithTimeout(c.Request.Context(), r.fairnessTimeout)` and store `reqCtx.Done()` in the `Request`.
+1. **At enqueue:** Create `reqCtx, cancel := context.WithTimeout(c.Request.Context(), r.priorityQueueTimeout)` and store `reqCtx.Done()` in the `Request`.
 2. **At dequeue (in `popWhenAvailable`):** After popping, check whether `req.CancelCh` is closed. If cancelled, skip (decrement metrics, continue to next).
 3. **At wait site (in `handleFairnessScheduling`):** Wait on the same request context used by the queue:
 
@@ -348,7 +350,7 @@ func (pq *RequestPriorityQueue) Close(err error) {
 **Design:**
 
 ```go
-// Environment variable: FAIRNESS_QUEUE_TIMEOUT (default: "60s")
+// Environment variable: PRIORITY_QUEUE_TIMEOUT (default: "60s")
 type FairnessConfig struct {
     QueueTimeout time.Duration
 }
@@ -419,31 +421,31 @@ The scheduler should define whether requests age while waiting. Without an aging
 
 ### Phase 1: Safety & Correctness (Recommended First)
 
-| Item | Gap | Effort | Risk |
-|------|-----|--------|------|
-| Unified cancellation + timeout support (4.3) | Gap 3 | Small | Low |
-| Queue lifecycle management (4.4) | Gap 4 | Small | Low |
-| Configurable timeout (4.5) | Gap 7 | Trivial | None |
+| Item                                         | Gap   | Effort  | Risk |
+| -------------------------------------------- | ----- | ------- | ---- |
+| Unified cancellation + timeout support (4.3) | Gap 3 | Small   | Low  |
+| Queue lifecycle management (4.4)             | Gap 4 | Small   | Low  |
+| Configurable timeout (4.5)                   | Gap 7 | Trivial | None |
 
 These are bug-fixes / resource-leak fixes with no behavioral change to existing users.
 
 ### Phase 2: Core Fairness Improvement
 
-| Item | Gap | Effort | Risk |
-|------|-----|--------|------|
-| Backpressure-aware dequeue (4.1) | Gap 1 | Medium | Medium — needs load testing |
-| Bounded priority refresh (4.2) | Gap 2 | Medium | Medium |
-| Rollout metrics + starvation policy (4.7) | Cross-cutting | Small | Low |
+| Item                                      | Gap           | Effort | Risk                        |
+| ----------------------------------------- | ------------- | ------ | --------------------------- |
+| Backpressure-aware dequeue (4.1)          | Gap 1         | Medium | Medium — needs load testing |
+| Bounded priority refresh (4.2)            | Gap 2         | Medium | Medium                      |
+| Rollout metrics + starvation policy (4.7) | Cross-cutting | Small  | Low                         |
 
 These improve the quality of fairness scheduling. The backpressure change should be gated behind a configuration flag initially.
 
 ### Phase 3: Advanced (Future)
 
-| Item | Gap | Effort | Risk |
-|------|-----|--------|------|
-| Composite priority (4.6) | Gap 8 | Small | Low |
-| Cross-model fairness with normalized per-model cost | Gap 5 | Medium | Medium |
-| Distributed token tracker (Gap 6) | Gap 6 | Large | Medium — needs Redis dependency |
+| Item                                                | Gap   | Effort | Risk                            |
+| --------------------------------------------------- | ----- | ------ | ------------------------------- |
+| Composite priority (4.6)                            | Gap 8 | Small  | Low                             |
+| Cross-model fairness with normalized per-model cost | Gap 5 | Medium | Medium                          |
+| Distributed token tracker (Gap 6)                   | Gap 6 | Large  | Medium — needs Redis dependency |
 
 ---
 

@@ -21,22 +21,22 @@ A Helm chart for deploying Kthena
 | networking.kthenaRouter.debugPort | int | `15000` | Debug server port for Kthena Router (localhost only). |
 | networking.kthenaRouter.drainTimeout | string | `"5m"` | This should be less than terminationGracePeriodSeconds. |
 | networking.kthenaRouter.enabled | bool | `true` | Enable Kthena Router. |
-| networking.kthenaRouter.fairness.enabled | bool | `false` | Enable fairness scheduling. |
-| networking.kthenaRouter.fairness.inputTokenWeight | float | `1` | Weight multiplier for input tokens. |
-| networking.kthenaRouter.fairness.maxConcurrent | int | `0` | Global total inflight request limit admitted to backends.<br/> Reused by session-boost mode; size it as estimated per-pod concurrency x pod count.<br/> `0` or unset uses the router default (16). |
-| networking.kthenaRouter.fairness.outputTokenWeight | float | `2` | Weight multiplier for output tokens. |
-| networking.kthenaRouter.fairness.sessionBoost.enabled | bool | `false` | Enable session-boost mode on the fairness queue.<br/> Switches the queue from per-user fairness to session-aware boosting (the two modes are mutually exclusive). |
-| networking.kthenaRouter.fairness.sessionBoost.gracePeriod | string | `"0s"` | Wait time after a request completes for a same-session follow-up.<br/> Disabled by default (`0s`). |
-| networking.kthenaRouter.fairness.sessionBoost.header | string | `"X-Session-ID"` | HTTP header used to identify conversation sessions. |
-| networking.kthenaRouter.fairness.sessionBoost.maxSessions | int | `4096` | Maximum number of recently-completed sessions kept warm for boosting.<br/> Bounds an LRU cache; the least-recently-used session is evicted automatically.<br/> Size it by the number of concurrent conversations to keep boosted. |
-| networking.kthenaRouter.fairness.sessionBoost.pollInterval | string | `"100ms"` | Interval at which the queue polls backend pod metrics for capacity. |
-| networking.kthenaRouter.fairness.windowSize | string | `"1h"` | Sliding window duration for token usage tracking. |
 | networking.kthenaRouter.gatewayAPI.enabled | bool | `false` | Enable Gateway API related features. |
 | networking.kthenaRouter.gatewayAPI.inferenceExtension | bool | `false` | Enable Gateway API Inference Extension features.<br/> Requires `gatewayAPI.enabled` to be true. |
 | networking.kthenaRouter.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy for Kthena Router. |
 | networking.kthenaRouter.image.repository | string | `"ghcr.io/volcano-sh/kthena-router"` | Image repository for Kthena Router. |
 | networking.kthenaRouter.image.tag | string | `"latest"` | Image tag for Kthena Router. |
 | networking.kthenaRouter.port | int | `8080` | Container port for Kthena Router. |
+| networking.kthenaRouter.priorityQueue.enabled | bool | `false` | Enable the request priority queue (default strategy: user fairness). |
+| networking.kthenaRouter.priorityQueue.fairness.inputTokenWeight | float | `1` | User-fairness strategy: weight multiplier for input tokens. |
+| networking.kthenaRouter.priorityQueue.fairness.outputTokenWeight | float | `2` | User-fairness strategy: weight multiplier for output tokens. |
+| networking.kthenaRouter.priorityQueue.fairness.windowSize | string | `"1h"` | User-fairness strategy: sliding window duration for token usage tracking. |
+| networking.kthenaRouter.priorityQueue.maxConcurrent | int | `0` | Queue-level global total inflight request limit admitted to backends.<br/> Shared by all strategies; size it as estimated per-pod concurrency x pod count.<br/> `0` or unset uses the router default (16). |
+| networking.kthenaRouter.priorityQueue.sessionBoost.enabled | bool | `false` | Switch the priority queue to the session-boost strategy.<br/> Replaces the default per-user fairness strategy with session-aware boosting (the two strategies are mutually exclusive). |
+| networking.kthenaRouter.priorityQueue.sessionBoost.gracePeriod | string | `"0s"` | Wait time after a request completes for a same-session follow-up.<br/> Disabled by default (`0s`). |
+| networking.kthenaRouter.priorityQueue.sessionBoost.header | string | `"X-Session-ID"` | HTTP header used to identify conversation sessions. |
+| networking.kthenaRouter.priorityQueue.sessionBoost.maxSessions | int | `4096` | Maximum number of recently-completed sessions kept warm for boosting.<br/> Bounds an LRU cache; the least-recently-used session is evicted automatically.<br/> Size it by the number of concurrent conversations to keep boosted. |
+| networking.kthenaRouter.priorityQueue.sessionBoost.pollInterval | string | `"100ms"` | Interval at which the queue polls backend pod metrics for capacity. |
 | networking.kthenaRouter.terminationGracePeriodSeconds | int | `330` | The router will drain all in-flight requests before forcefully closing connections. |
 | networking.kthenaRouter.tls.dnsName | string | `"your-domain.com"` | DNS name to use for the certificate. |
 | networking.kthenaRouter.tls.enabled | bool | `false` | Enable TLS for Kthena Router server. |
