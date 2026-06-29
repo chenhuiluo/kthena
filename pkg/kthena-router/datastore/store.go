@@ -2006,7 +2006,7 @@ func (s *store) AddOrUpdateHTTPRoute(httpRoute *gatewayv1.HTTPRoute) error {
 
 	// Update gateway routes mapping
 	for _, parentRef := range httpRoute.Spec.ParentRefs {
-		if parentRef.Kind != nil && *parentRef.Kind == "Gateway" {
+		if isGatewayParentRef(parentRef) {
 			gatewayName := string(parentRef.Name)
 			gatewayNamespace := httpRoute.Namespace
 			if parentRef.Namespace != nil {
@@ -2025,6 +2025,13 @@ func (s *store) AddOrUpdateHTTPRoute(httpRoute *gatewayv1.HTTPRoute) error {
 
 	klog.V(4).Infof("Added or updated HTTPRoute: %s", key)
 	return nil
+}
+
+func isGatewayParentRef(parentRef gatewayv1.ParentReference) bool {
+	if parentRef.Group != nil && string(*parentRef.Group) != gatewayv1.GroupName {
+		return false
+	}
+	return parentRef.Kind == nil || *parentRef.Kind == "Gateway"
 }
 
 func (s *store) DeleteHTTPRoute(key string) error {
