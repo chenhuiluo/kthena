@@ -1,5 +1,5 @@
 ---
-title: Session Boost Queue for Multi-Turn Conversation Prefix Cache Optimization
+title: Session Boost Strategy for Multi-Turn Conversation Prefix Cache Optimization
 authors:
 - "@YaoZengzeng"
 reviewers:
@@ -11,11 +11,11 @@ creation-date: 2026-06-03
 
 ---
 
-## Session Boost Queue for Multi-Turn Conversation Prefix Cache Optimization
+## Session Boost Strategy for Multi-Turn Conversation Prefix Cache Optimization
 
 ### Summary
 
-This proposal introduces a **Session Boost Queue** that provides session-aware priority boosting for multi-turn conversations. It allows follow-up requests in the same conversation session to be prioritized for processing, maximizing **prefix cache hit rate** on LLM inference backends (e.g., vLLM) and significantly reducing Time-to-First-Token (TTFT) for multi-turn conversations.
+This proposal introduces a **session-boost priority strategy** for the shared request priority queue (`RequestPriorityQueue`). It is not a separate queue: it is a pluggable priority strategy on the existing priority queue that provides session-aware priority boosting for multi-turn conversations. It allows follow-up requests in the same conversation session to be prioritized for processing, maximizing **prefix cache hit rate** on LLM inference backends (e.g., vLLM) and significantly reducing Time-to-First-Token (TTFT) for multi-turn conversations.
 
 ### Motivation
 
