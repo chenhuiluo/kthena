@@ -158,15 +158,15 @@ Timeline:
          ▼  ▼                                  ▼
     ─────┼──┼──────────────────────────────────┼─────
          │  │                                  │
-         │  │  Case A: Boosted request arrives │
-         │  │  during grace → dequeue now      │
-         │  │                                  │
-         │  │  Case B: No boost arrives →      │
-         │  │  dequeue normal head after grace │
-         │  │                                  │
-         │  │  Case C: Head already boosted →  │
+         │  │  Case A: Head already boosted →  │
          │  │  skip grace, dequeue immediately │
-         │  └──────────────────────────────────┘
+         │  │                                  │
+         │  │  Case B: Otherwise hold the slot │
+         │  │  for the full grace period, then │
+         │  │  dequeue the head (boosted ranks │
+         │  │  first, so a follow-up that      │
+         │  │  arrived wins automatically)     │
+         │  └────────────────────────────────┐
 ```
 
 ##### How the grace wait cooperates with the inflight and backend gates
@@ -177,15 +177,14 @@ It is important that grace is **triggered only by release events**, because a re
 
 1. A request finishes → `Release()` runs → `inflightCount` is decremented → a signal is sent on `releaseCh`.
 2. The freed slot would normally be claimed immediately by the current heap head (which may be an unrelated, non-boosted request). The grace wait instead **holds that just-freed slot for up to `SessionBoostGracePeriod`**, betting that a same-session follow-up is about to arrive and reuse the warm prefix cache.
-3. When the wait resolves, `tryBackpressureDequeue` runs and re-checks **both** capacity gates before admitting anyone. So even if a boosted follow-up arrives during grace, it is only dispatched when `inflight < MaxConcurrent` **and** at least one backend pod reports capacity.
+3. When the wait resolves, `tryBackpressureDequeue` runs and re-checks **both** capacity gates before admitting anyone. A boosted follow-up that arrived during grace is admitted first because boosted requests outrank others in the heap, and only when `inflight < MaxConcurrent` **and** at least one backend pod reports capacity.
 
 The grace wait can resolve in three ways, and in every case the two capacity gates are the final arbiter:
 
-| Outcome                    | Trigger                                                                                       | What happens next                                                                                                                              |
-| -------------------------- | --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Skip grace (fast path)** | The heap head is *already* session-boosted when the release fires (`isHeadSessionBoosted()`). | No wait at all — go straight to the capacity gates and admit if they pass. There is nothing to wait for.                                       |
-| **Cut grace short**        | A session-boosted request arrives at the head (`notifyCh`) *during* the wait.                 | Stop the timer early and go to the capacity gates immediately. The follow-up is dispatched as soon as inflight and backend capacity allow.     |
-| **Grace expires**          | The timer fires with no boosted follow-up (`timer.C`).                                        | Stop holding the slot and fall through to the capacity gates, which now admit the ordinary heap head (subject to inflight + backend capacity). |
+| Outcome                    | Trigger                                                                                       | What happens next                                                                                                                                                                                                                                       |
+| -------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Skip grace (fast path)** | The heap head is *already* session-boosted when the release fires (`isHeadSessionBoosted()`). | No wait at all — go straight to the capacity gates and admit if they pass. There is nothing to wait for.                                                                                                                                                |
+| **Grace expires**          | The timer fires (`timer.C`).                                                                  | Stop holding the slot and fall through to the capacity gates, which admit the heap head. If a same-session follow-up arrived during the wait it is now boosted and sits at the head, so it wins automatically (subject to inflight + backend capacity). |
 
 This ordering matters because the three checks answer different questions and run in sequence:
 
@@ -212,7 +211,7 @@ Release frees a slot
 
 Two interactions are worth calling out explicitly:
 
-- **Grace never overrides backpressure.** If the grace window ends but the inflight limit is already reached or every backend pod is busy, the request is **not** admitted — `tryBackpressureDequeue` simply holds (and drains any cancelled requests from the heap) until the next release or poll tick reopens the gates. Grace only chooses *who* tries next; the capacity gates decide *whether* anyone runs.
+- **Grace never overrides backpressure.** If the grace window ends but the inflight limit is already reached or every backend pod is busy, the request is **not** admitted — `tryBackpressureDequeue` simply holds (and drains any cancelled requests from the heap) until the next release, new arrival, or metrics-refresh signal reopens the gates. Grace only chooses *who* tries next; the capacity gates decide *whether* anyone runs.
 - **Fresh arrivals on an idle queue bypass grace.** Grace is tied to `releaseCh` (a freed slot), not to `notifyCh` (a new arrival). When a request lands on an otherwise idle queue with no pending release, it goes straight to the capacity gates with no grace delay, so enabling grace adds no admission latency to first turns. The only place a new arrival waits is *inside* an already-running grace window, where it is precisely the boosted follow-up the window exists to catch. When both a release and a new arrival are pending at once, the release is preferred so the freed slot is the one held for the grace window.
 
 The net effect is a strict precedence: **grace timing → inflight gate → backend gate**. The grace layer is purely additive and optional (`SessionBoostGracePeriod = 0` removes it entirely, taking the no-grace fast path), and it can only ever *delay* an admission to favor a session-boosted follow-up — it can never admit a request that the inflight or backend gates would otherwise reject.
@@ -225,7 +224,6 @@ The net effect is a strict precedence: **grace timing → inflight gate → back
 | `SESSION_BOOST_HEADER`           | `X-Session-ID` | HTTP header used to identify conversation sessions                                                                                                                                    |
 | `SESSION_BOOST_MAX_SESSIONS`     | `4096`         | Maximum number of recently-completed sessions kept warm for boosting. Bounds an LRU cache; the least-recently-used session is evicted when exceeded. Sized by session count, not time |
 | `SESSION_BOOST_GRACE_PERIOD`     | `0`            | Wait time after release for same-session follow-up. Disabled by default; enable only when you understand the latency trade-off                                                        |
-| `SESSION_BOOST_POLL_INTERVAL`    | `100ms`        | Backend capacity polling interval                                                                                                                                                     |
 | `SESSION_BOOST_INFLIGHT_PER_POD` | `16`           | Inflight requests admitted per backend pod; total inflight = perPod x backend pod count. Size it from the estimated per-pod concurrency (e.g. vLLM's --max-num-seqs)                  |
 
 ### Design Details
@@ -248,7 +246,6 @@ type FairnessQueueConfig struct {
     SessionIDHeader          string        // HTTP header for session identification
     SessionBoostMaxSessions  int           // LRU capacity: max recently-completed sessions kept warm
     SessionBoostGracePeriod  time.Duration // Wait for same-session follow-up (default: 0, disabled)
-    BackpressurePollInterval time.Duration // Backend polling frequency
 }
 
 // RequestPriorityQueue (shared) — session-boost state
@@ -263,6 +260,7 @@ type RequestPriorityQueue struct {
     backendChecker BackendWaitingChecker // Backend capacity gate
     inflightCount  atomic.Int64          // Current inflight requests
     releaseCh      chan struct{}         // Release-driven dequeue signal
+    metricsRefreshCh chan struct{}       // Store signals it after each metrics scrape
 }
 
 // Session-boost ordering (RequestPriorityQueue.Less when sessionBoost == true):
@@ -296,9 +294,9 @@ When a request with the configured session header (e.g., `X-Session-ID: conv-abc
 The queue uses two-level admission control:
 
 1. **Inflight limit**: At most `InflightPerPod` requests can be in-flight per backend pod; the total limit scales with pod count (`SESSION_BOOST_INFLIGHT_PER_POD`). This prevents flooding backends between metric scrapes.
-2. **Backend metrics check**: The `BackendWaitingChecker` polls backend pod metrics (e.g., vLLM's `RequestWaitingNum`) to confirm at least one pod has capacity.
+2. **Backend metrics check**: The `BackendWaitingChecker` reads the backend pod metrics already scraped by the store (e.g., vLLM's `RequestWaitingNum`) to confirm at least one pod has capacity. It does not scrape backends itself.
 
-When a request completes (Release), the queue immediately attempts to dequeue the next request (release-driven dequeue) rather than waiting for the next polling tick, ensuring minimal latency between sequential requests.
+When a request completes (Release), the queue immediately attempts to dequeue the next request (release-driven dequeue), ensuring minimal latency between sequential requests. The loop is fully event-driven — there is no independent polling timer. Because the capacity check reads cached metrics that change only on the store's scrape cycle, the store signals each session-boost queue right after it refreshes pod metrics (`METRICS_SCRAPE_INTERVAL`), waking any queue that is holding requests so it can re-check exactly when fresh data is available.
 
 ### Multi-Turn Conversation Advantages
 

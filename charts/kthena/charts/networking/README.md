@@ -64,7 +64,6 @@ kthenaRouter:
 | `kthenaRouter.sessionBoost.maxSessions`    | int     | `4096`           | Max recently-completed sessions kept warm (LRU-evicted)            |
 | `kthenaRouter.sessionBoost.inflightPerPod` | int     | `16`             | Inflight requests per backend pod; total = perPod x pod count      |
 | `kthenaRouter.sessionBoost.gracePeriod`    | string  | `"0s"`           | Wait time for a same-session follow-up (disabled by default)       |
-| `kthenaRouter.sessionBoost.pollInterval`   | string  | `"100ms"`        | Interval for polling backend pod metrics                           |
 
 #### Session Boost Configuration
 

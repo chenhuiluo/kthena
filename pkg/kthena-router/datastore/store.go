@@ -525,14 +525,6 @@ func applySessionBoostConfigFromEnv(cfg *FairnessQueueConfig) {
 			klog.Warningf("Invalid SESSION_BOOST_GRACE_PERIOD: %q, using default %v", v, cfg.SessionBoostGracePeriod)
 		}
 	}
-
-	if v := os.Getenv("SESSION_BOOST_POLL_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			cfg.BackpressurePollInterval = d
-		} else {
-			klog.Warningf("Invalid SESSION_BOOST_POLL_INTERVAL: %q, using default %v", v, cfg.BackpressurePollInterval)
-		}
-	}
 }
 
 // isFairnessSchedulingEnabled reports whether user-fairness scheduling is enabled
@@ -575,6 +567,16 @@ func (s *store) Run(ctx context.Context) {
 				return true
 			})
 			s.initialSynced.Store(true)
+			// Backend pod metrics just refreshed; wake any session-boost queue so it
+			// can re-check capacity for requests it is holding. The capacity check
+			// reads these cached metrics, so this is the moment fresh data is
+			// available. The notify is a no-op for non-session-boost queues.
+			s.requestWaitingQueue.Range(func(_, value any) bool {
+				if q, ok := value.(*RequestPriorityQueue); ok {
+					q.NotifyBackendMetricsRefreshed()
+				}
+				return true
+			})
 			select {
 			case <-ctx.Done():
 				return

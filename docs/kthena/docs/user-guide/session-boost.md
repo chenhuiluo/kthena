@@ -73,7 +73,6 @@ networking:
       header: "X-Session-ID"
       maxSessions: 4096          # LRU cache of recently-completed sessions kept warm
       inflightPerPod: 16         # total inflight = inflightPerPod x backend pod count
-      # pollInterval: "100ms"
 ```
 
 Apply with Helm:
@@ -97,21 +96,18 @@ env:
   value: "X-Session-ID"
 - name: SESSION_BOOST_MAX_SESSIONS
   value: "4096"
-- name: SESSION_BOOST_POLL_INTERVAL
-  value: "100ms"
 - name: SESSION_BOOST_INFLIGHT_PER_POD
   value: "16"                 # total inflight = perPod x backend pod count
 ```
 
 ## Configuration Reference
 
-| Environment Variable             | Purpose                                                                           | Default        | Notes                                                                                                                                                                                      |
-| -------------------------------- | --------------------------------------------------------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `ENABLE_SESSION_BOOST`           | Enable the session-boost scheduling strategy                                      | `false`        | Mutually exclusive with `ENABLE_FAIRNESS_SCHEDULING`                                                                                                                                       |
-| `SESSION_BOOST_HEADER`           | HTTP header used to identify conversation sessions                                | `X-Session-ID` | Must match what your clients send                                                                                                                                                          |
-| `SESSION_BOOST_MAX_SESSIONS`     | Max number of recently-completed sessions kept "warm" for boosting (LRU-bounded)  | `4096`         | When the cache is full, the least-recently-used session is evicted automatically. Size it by the number of concurrent conversations you want to keep boosted—no time-based tuning required |
-| `SESSION_BOOST_POLL_INTERVAL`    | Interval at which the queue polls backend pod metrics to check available capacity | `100ms`        | Lower values react faster to capacity changes but increase metrics polling load                                                                                                            |
-| `SESSION_BOOST_INFLIGHT_PER_POD` | Inflight requests admitted per backend pod                                        | `16`           | The total inflight limit is this value multiplied by the number of backend pods. Size it from the per-pod concurrency (e.g., vLLM's `--max-num-seqs`)                                      |
+| Environment Variable             | Purpose                                                                          | Default        | Notes                                                                                                                                                                                      |
+| -------------------------------- | -------------------------------------------------------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ENABLE_SESSION_BOOST`           | Enable the session-boost scheduling strategy                                     | `false`        | Mutually exclusive with `ENABLE_FAIRNESS_SCHEDULING`                                                                                                                                       |
+| `SESSION_BOOST_HEADER`           | HTTP header used to identify conversation sessions                               | `X-Session-ID` | Must match what your clients send                                                                                                                                                          |
+| `SESSION_BOOST_MAX_SESSIONS`     | Max number of recently-completed sessions kept "warm" for boosting (LRU-bounded) | `4096`         | When the cache is full, the least-recently-used session is evicted automatically. Size it by the number of concurrent conversations you want to keep boosted—no time-based tuning required |
+| `SESSION_BOOST_INFLIGHT_PER_POD` | Inflight requests admitted per backend pod                                       | `16`           | The total inflight limit is this value multiplied by the number of backend pods. Size it from the per-pod concurrency (e.g., vLLM's `--max-num-seqs`)                                      |
 
 > `SESSION_BOOST_GRACE_PERIOD` is intentionally omitted from the table above. It is an advanced, scenario-specific knob that is disabled by default; see [Advanced: Grace Period](#advanced-grace-period-use-with-caution).
 
@@ -174,9 +170,9 @@ The session boost queue uses a simple two-level priority:
 The queue uses two-level admission control to avoid flooding backends:
 
 1. **Inflight limit**: at most `SESSION_BOOST_INFLIGHT_PER_POD` requests can be in-flight per backend pod; the total limit is that value times the number of backend pods serving the model.
-2. **Backend metrics check**: the queue polls backend pod metrics to confirm at least one pod has available capacity before dispatching.
+2. **Backend metrics check**: the queue checks backend pod metrics to confirm at least one pod has available capacity before dispatching. These metrics are refreshed by the router's periodic metrics scrape (`METRICS_SCRAPE_INTERVAL`, default `1s`). The backpressure loop is fully event-driven: it re-checks capacity on request completion, on new arrivals, and whenever the scrape refreshes the cached metrics — there is no independent polling timer, since the cached metrics only change on the scrape cycle.
 
-When a request completes, the queue immediately attempts to dequeue the next request (release-driven dequeue) rather than waiting for the next polling tick.
+When a request completes, the queue immediately attempts to dequeue the next request (release-driven dequeue) rather than waiting for the next metrics refresh.
 
 ## Session Boost vs User Fairness
 
@@ -200,7 +196,7 @@ Recommended tuning:
 
 - **Many concurrent conversations**: increase `SESSION_BOOST_MAX_SESSIONS` so that active sessions are not evicted from the LRU cache before their follow-up arrives. The default (`4096`) suits most deployments; raise it if you serve a larger number of simultaneous conversations.
 - **High-throughput backends**: the default per-pod inflight limit (`SESSION_BOOST_INFLIGHT_PER_POD=16`) is conservative. Size it from the per-pod concurrency (e.g., vLLM's `--max-num-seqs`); the total limit scales with the number of backend pods. Reduce for conservative admission control; increase for backends that handle high parallelism.
-- **Latency-sensitive workloads**: reduce `SESSION_BOOST_POLL_INTERVAL` to `50ms` for faster reaction to backend capacity changes.
+- **Faster reaction to capacity changes**: when all backends are momentarily busy, the queue re-checks capacity each time the metrics scrape refreshes the cached pod metrics. Lower `METRICS_SCRAPE_INTERVAL` (default `1s`) if you need the queue to notice freed capacity sooner, keeping in mind it also increases metrics scraping load.
 
 ## Verify Session Boost
 
@@ -263,7 +259,7 @@ The grace period is an **advanced, scenario-specific** tuning knob. It is **disa
 
 By default, when a request completes the queue immediately dequeues the next request. The grace period (`SESSION_BOOST_GRACE_PERIOD`) instead makes the queue **briefly hold the freed dequeue slot** after a completion, waiting for a follow-up from the *same* session to arrive so it can ride the still-warm prefix cache:
 
-- If a boosted (same-session) request arrives during the grace window, it is dequeued immediately.
+- If a boosted (same-session) request arrives during the grace window, it is admitted first when the window ends, because boosted requests outrank others in the queue.
 - If no boosted request arrives before the window expires, the next non-boosted request proceeds as normal.
 - If the head of the queue is already a boosted request, the grace period is skipped entirely.
 

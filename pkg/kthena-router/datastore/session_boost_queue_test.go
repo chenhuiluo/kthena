@@ -241,7 +241,6 @@ func TestSessionBoostQueue_BackpressureDrainsCancelledWhenBusy(t *testing.T) {
 
 	cfg := sessionBoostConfig()
 	cfg.SessionBoostGracePeriod = 0
-	cfg.BackpressurePollInterval = 10 * time.Millisecond
 	cfg.InflightPerPod = 4
 	q := newSessionBoostQueue(cfg, checker)
 	defer q.Close()
@@ -288,7 +287,6 @@ func TestSessionBoostQueue_BackpressureMode(t *testing.T) {
 
 	cfg := sessionBoostConfig()
 	cfg.SessionBoostGracePeriod = 0
-	cfg.BackpressurePollInterval = 10 * time.Millisecond
 	cfg.InflightPerPod = 2 // total inflight limit (no pod counter, perPod = total)
 	q := newSessionBoostQueue(cfg, checker)
 	defer q.Close()
@@ -345,7 +343,6 @@ func TestSessionBoostQueue_GracePeriod_BoostedArrives(t *testing.T) {
 
 	cfg := sessionBoostConfig()
 	cfg.SessionBoostGracePeriod = 200 * time.Millisecond
-	cfg.BackpressurePollInterval = 50 * time.Millisecond
 	cfg.InflightPerPod = 1
 	q := newSessionBoostQueue(cfg, checker)
 	defer q.Close()
@@ -417,7 +414,6 @@ func TestSessionBoostQueue_GracePeriod_NoBoostArrives(t *testing.T) {
 
 	cfg := sessionBoostConfig()
 	cfg.SessionBoostGracePeriod = 100 * time.Millisecond
-	cfg.BackpressurePollInterval = 50 * time.Millisecond
 	cfg.InflightPerPod = 1
 	q := newSessionBoostQueue(cfg, checker)
 	defer q.Close()

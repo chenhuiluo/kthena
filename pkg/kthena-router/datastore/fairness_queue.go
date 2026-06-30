@@ -79,10 +79,6 @@ type FairnessQueueConfig struct {
 	// 0 disables the grace period.
 	SessionBoostGracePeriod time.Duration
 
-	// BackpressurePollInterval controls how often the backpressure checker polls
-	// backend pod waiting-queue status in session-boost mode.
-	BackpressurePollInterval time.Duration
-
 	// InflightPerPod is the maximum number of inflight requests allowed per backend
 	// pod in session-boost mode. The total inflight limit is InflightPerPod times
 	// the number of backend pods serving the model. When <= 0, a default of
@@ -117,7 +113,6 @@ func DefaultFairnessQueueConfig() FairnessQueueConfig {
 		SessionIDHeader:           defaultSessionBoostHeader,
 		SessionBoostMaxSessions:   defaultSessionBoostMaxSessions,
 		SessionBoostGracePeriod:   0,
-		BackpressurePollInterval:  100 * time.Millisecond,
 		InflightPerPod:            defaultSessionBoostInflightPerPod,
 	}
 }
@@ -183,6 +178,12 @@ type RequestPriorityQueue struct {
 	podCounter     PodCounter            // Optional; counts backend pods for inflight scaling
 	inflightCount  atomic.Int64          // In-flight requests in session-boost mode
 	releaseCh      chan struct{}         // Signals a permit release in session-boost mode
+	// metricsRefreshCh wakes the backpressure dequeue loop after the store refreshes
+	// backend pod metrics. The capacity check reads cached pod metrics, which only
+	// change on the store's scrape cycle; a release/arrival can therefore observe a
+	// stale "busy" value. This signal lets the loop re-check exactly when fresh
+	// metrics are available, replacing a blind timer. nil unless session boost is on.
+	metricsRefreshCh chan struct{}
 }
 
 var _ heap.Interface = &RequestPriorityQueue{}
@@ -218,6 +219,7 @@ func NewRequestPriorityQueueWithConfig(metricsInstance *metrics.Metrics, cfg Fai
 		}
 		pq.sessionTracker = NewSessionTracker(maxSessions)
 		pq.releaseCh = make(chan struct{}, 1)
+		pq.metricsRefreshCh = make(chan struct{}, 1)
 		pq.backendChecker = checker
 	} else if cfg.MaxConcurrent > 0 {
 		pq.sem = make(chan struct{}, cfg.MaxConcurrent)
@@ -283,7 +285,7 @@ func (pq *RequestPriorityQueue) PushRequest(r *Request) error {
 	// Update queue size metrics
 	pq.metricIncSize(r.ModelName, r.UserID)
 
-	if pq.sessionBoost && r.SessionBoost {
+	if r.SessionBoost {
 		klog.V(4).Infof("[SessionBoost] session boost: sessionID=%s promoted, queueLen=%d",
 			r.SessionID, len(pq.heap))
 	}

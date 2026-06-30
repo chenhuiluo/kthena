@@ -18,11 +18,11 @@ package datastore
 
 import (
 	"container/heap"
-	"container/list"
 	"context"
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"k8s.io/klog/v2"
 )
 
@@ -56,12 +56,10 @@ type PodCounter func() int
 // keeping a few extra entries is harmless because boosting only matters when the
 // queue is contended.
 type SessionTracker struct {
-	mu       sync.Mutex
-	capacity int
-	// ll holds session IDs ordered by recency: front = most recently completed,
-	// back = least recently used (next to be evicted).
-	ll    *list.List
-	items map[string]*list.Element // sessionID -> element in ll
+	// cache maps a session ID to a presence marker, ordered by recency. The
+	// underlying hashicorp/golang-lru cache is safe for concurrent use and evicts
+	// the least-recently-used session once capacity is exceeded.
+	cache *lru.Cache[string, struct{}]
 }
 
 // NewSessionTracker creates a new session tracker that remembers up to capacity
@@ -71,11 +69,14 @@ func NewSessionTracker(capacity int) *SessionTracker {
 	if capacity <= 0 {
 		capacity = defaultSessionBoostMaxSessions
 	}
-	return &SessionTracker{
-		capacity: capacity,
-		ll:       list.New(),
-		items:    make(map[string]*list.Element),
+	cache, err := lru.NewWithEvict(capacity, func(sessionID string, _ struct{}) {
+		klog.V(4).Infof("[SessionTracker] evicted LRU session %q", sessionID)
+	})
+	if err != nil {
+		// capacity is guaranteed positive above, so this is unreachable in practice.
+		klog.Errorf("[SessionTracker] failed to create LRU cache (capacity=%d): %v", capacity, err)
 	}
+	return &SessionTracker{cache: cache}
 }
 
 // MarkRequestCompleted records that a request from the given session has completed,
@@ -85,23 +86,7 @@ func (st *SessionTracker) MarkRequestCompleted(sessionID string) {
 	if sessionID == "" {
 		return
 	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if el, ok := st.items[sessionID]; ok {
-		st.ll.MoveToFront(el)
-		return
-	}
-	el := st.ll.PushFront(sessionID)
-	st.items[sessionID] = el
-	if st.ll.Len() > st.capacity {
-		oldest := st.ll.Back()
-		if oldest != nil {
-			st.ll.Remove(oldest)
-			delete(st.items, oldest.Value.(string))
-			klog.V(4).Infof("[SessionTracker] evicted LRU session %q, tracked=%d/%d",
-				oldest.Value.(string), st.ll.Len(), st.capacity)
-		}
-	}
+	st.cache.Add(sessionID, struct{}{})
 }
 
 // HasRecentCompletion reports whether the given session ID is currently tracked
@@ -111,17 +96,12 @@ func (st *SessionTracker) HasRecentCompletion(sessionID string) bool {
 	if sessionID == "" {
 		return false
 	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	_, exists := st.items[sessionID]
-	return exists
+	return st.cache.Contains(sessionID)
 }
 
 // ActiveSessions returns the number of sessions currently tracked.
 func (st *SessionTracker) ActiveSessions() int {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.ll.Len()
+	return st.cache.Len()
 }
 
 // MarkSessionRequestCompleted records that a request from the given session has completed,
@@ -157,6 +137,12 @@ func (pq *RequestPriorityQueue) runSessionBoostMode(ctx context.Context) {
 // unblocks the waiting caller by closing its NotifyChan.
 func (pq *RequestPriorityQueue) admitSessionBoost(req *Request) {
 	pq.inflightCount.Add(1)
+	// req.Release returns the inflight permit this admission consumed. The request
+	// handler invokes it (via defer) once the backend response is fully proxied or
+	// the request fails/times out. It decrements the inflight count, signals
+	// releaseCh so the dequeue loop can immediately admit the next waiting request,
+	// and updates the inflight metric. sync.Once makes it idempotent so capacity is
+	// never released twice on overlapping exit paths.
 	releaseOnce := sync.Once{}
 	req.Release = func() {
 		releaseOnce.Do(func() {
@@ -169,6 +155,11 @@ func (pq *RequestPriorityQueue) admitSessionBoost(req *Request) {
 		})
 	}
 	pq.metricIncInflight(req.ModelName)
+	// Closing NotifyChan is the admission signal: the caller blocked in Enqueue is
+	// waiting on this channel and proceeds to the backend only once it is closed.
+	// We notify here because admission (a free inflight slot plus backend capacity)
+	// is exactly the condition that lets this request run; there is no separate
+	// readiness state to wait on.
 	if req.NotifyChan != nil {
 		close(req.NotifyChan)
 	}
@@ -191,85 +182,85 @@ func (pq *RequestPriorityQueue) runDirectMode(ctx context.Context) {
 	}
 }
 
+// NotifyBackendMetricsRefreshed wakes the backpressure dequeue loop after the
+// store refreshes backend pod metrics. The capacity check reads cached metrics
+// that only change on the store's scrape cycle, so this signal lets a held queue
+// re-check exactly when fresh capacity data is available. It is a non-blocking,
+// coalescing send and a no-op for queues not in session-boost mode.
+func (pq *RequestPriorityQueue) NotifyBackendMetricsRefreshed() {
+	if pq.metricsRefreshCh == nil {
+		return
+	}
+	select {
+	case pq.metricsRefreshCh <- struct{}{}:
+	default: // A refresh signal is already pending.
+	}
+}
+
 // runBackpressureMode dequeues requests only when backend pods have capacity.
 // Uses two-level admission control:
 //  1. Inflight limit: at most InflightPerPod requests in flight per backend pod.
 //  2. Backend metrics check: at least one pod reports capacity available.
 //
-// Session Grace Period: When SessionBoostGracePeriod > 0, a release event triggers
-// a short wait before dequeuing to give the same session time to submit a follow-up
-// request that can leverage prefix cache.
-func (pq *RequestPriorityQueue) runBackpressureMode(ctx context.Context) {
-	pollInterval := pq.config.BackpressurePollInterval
-	if pollInterval <= 0 {
-		pollInterval = 100 * time.Millisecond
-	}
-	klog.V(4).Infof("[SessionBoost] starting backpressure dequeue loop, poll_interval=%v, gracePeriod=%v",
-		pollInterval, pq.config.SessionBoostGracePeriod)
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
-
-	if pq.config.SessionBoostGracePeriod > 0 {
-		pq.runBackpressureWithGrace(ctx, ticker)
-	} else {
-		pq.runBackpressureNoGrace(ctx, ticker)
-	}
-}
-
-// runBackpressureNoGrace is the fast path when grace period is disabled (default).
-// Listens on notifyCh for immediate dequeue of freshly enqueued requests.
-func (pq *RequestPriorityQueue) runBackpressureNoGrace(ctx context.Context, ticker *time.Ticker) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-pq.stopCh:
-			return
-		case <-pq.releaseCh:
-			pq.tryBackpressureDequeue(ctx)
-		case <-pq.notifyCh:
-			pq.tryBackpressureDequeue(ctx)
-		case <-ticker.C:
-			pq.tryBackpressureDequeue(ctx)
-		}
-	}
-}
-
-// runBackpressureWithGrace handles the case where grace period is configured.
-// The grace wait applies to release events (releaseCh): after a request completes,
-// we briefly hold the freed capacity to give the same session a chance to submit a
-// follow-up that can reuse the warm prefix cache. New arrivals (notifyCh) are
-// admitted immediately when capacity exists, so enabling grace does not add
-// admission latency to first turns on an idle queue.
+// The loop is fully event-driven: it reacts to releases, new arrivals, and the
+// store's metrics-refresh signal. There is no independent timer because the
+// capacity check only reads cached pod metrics, which change solely on the
+// store's scrape cycle.
 //
-// When both a fresh arrival and a release are pending, the release must win so the
-// just-freed slot is held for the grace period; Go's select picks randomly between
-// ready cases, so the notifyCh branch drains any pending release and routes it
-// through the grace path to keep that ordering deterministic. The ticker remains a
-// backstop.
-func (pq *RequestPriorityQueue) runBackpressureWithGrace(ctx context.Context, ticker *time.Ticker) {
+// Session Grace Period: when SessionBoostGracePeriod > 0, a release briefly holds
+// the freed slot (via waitGraceAndDequeue) so a same-session follow-up has time to
+// arrive and reuse the warm prefix cache. Fresh arrivals are still admitted
+// immediately, so enabling grace adds no latency to first turns on an idle queue.
+// When a release and an arrival are pending at once, the release wins so the
+// just-freed slot is the one held for the grace window.
+func (pq *RequestPriorityQueue) runBackpressureMode(ctx context.Context) {
+	grace := pq.config.SessionBoostGracePeriod > 0
+	klog.V(4).Infof("[SessionBoost] starting backpressure dequeue loop, gracePeriod=%v", pq.config.SessionBoostGracePeriod)
 	for {
 		select {
+		// Lifecycle: the queue's owning context was cancelled — stop dispatching.
 		case <-ctx.Done():
 			return
+		// Lifecycle: the queue was closed via Close() — stop dispatching.
 		case <-pq.stopCh:
 			return
+		// A request finished and freed an inflight slot. With grace enabled, hold
+		// the freed slot briefly for a same-session follow-up; otherwise try to
+		// admit the next request right away.
 		case <-pq.releaseCh:
-			pq.waitGraceAndDequeue(ctx)
-		case <-pq.notifyCh:
-			// A fresh request arrived. If a release is also pending, prefer the
-			// grace path so the freed slot is held briefly for a same-session
-			// follow-up; otherwise admit immediately so an idle queue need not wait
-			// for the next ticker tick.
-			select {
-			case <-pq.releaseCh:
+			if grace {
 				pq.waitGraceAndDequeue(ctx)
-			default:
+			} else {
 				pq.tryBackpressureDequeue(ctx)
 			}
-		case <-ticker.C:
+		// A fresh request was enqueued. With grace enabled, if a release is also
+		// pending, route through the grace path so the freed slot is held for a
+		// same-session follow-up; otherwise admit immediately so an idle queue need
+		// not wait for the next signal.
+		case <-pq.notifyCh:
+			if grace && pq.drainPendingRelease() {
+				pq.waitGraceAndDequeue(ctx)
+			} else {
+				pq.tryBackpressureDequeue(ctx)
+			}
+		// Backend pod metrics were just refreshed by the store. Re-check capacity in
+		// case requests are being held because all backends previously read busy.
+		case <-pq.metricsRefreshCh:
 			pq.tryBackpressureDequeue(ctx)
 		}
+	}
+}
+
+// drainPendingRelease non-blockingly consumes one pending release signal, reporting
+// whether one was present. It lets the arrival branch prefer the grace path when a
+// release is also waiting, keeping that ordering deterministic despite select's
+// random choice between simultaneously-ready cases.
+func (pq *RequestPriorityQueue) drainPendingRelease() bool {
+	select {
+	case <-pq.releaseCh:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -283,36 +274,28 @@ func (pq *RequestPriorityQueue) isHeadSessionBoosted() bool {
 	return pq.heap[0].SessionBoost
 }
 
-// waitGraceAndDequeue waits up to SessionBoostGracePeriod for a session-boosted
-// request to arrive at the head of the queue.
+// waitGraceAndDequeue holds a just-freed slot for up to SessionBoostGracePeriod
+// before dispatching, giving a same-session follow-up time to arrive. It does not
+// need to watch for the follow-up itself: boosted requests outrank others in the
+// heap, so once the timer fires tryBackpressureDequeue admits the boosted request
+// first if one showed up. The wait stays responsive to shutdown via ctx/stopCh.
 func (pq *RequestPriorityQueue) waitGraceAndDequeue(ctx context.Context) {
-	// Fast path: head is already session-boosted.
+	// Fast path: a boosted follow-up is already at the head, so there is nothing
+	// to wait for.
 	if pq.isHeadSessionBoosted() {
 		klog.V(4).Info("[SessionBoost] grace: head already boosted, skipping wait")
 		pq.tryBackpressureDequeue(ctx)
 		return
 	}
 
-	klog.V(4).Infof("[SessionBoost] grace: starting grace period %v", pq.config.SessionBoostGracePeriod)
+	klog.V(4).Infof("[SessionBoost] grace: holding freed slot for %v", pq.config.SessionBoostGracePeriod)
 	timer := time.NewTimer(pq.config.SessionBoostGracePeriod)
 	defer timer.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-pq.stopCh:
-			return
-		case <-pq.notifyCh:
-			if pq.isHeadSessionBoosted() {
-				klog.V(4).Info("[SessionBoost] grace period: session-boosted request arrived, dequeuing immediately")
-				pq.tryBackpressureDequeue(ctx)
-				return
-			}
-		case <-timer.C:
-			pq.tryBackpressureDequeue(ctx)
-			return
-		}
+	select {
+	case <-ctx.Done():
+	case <-pq.stopCh:
+	case <-timer.C:
+		pq.tryBackpressureDequeue(ctx)
 	}
 }
 

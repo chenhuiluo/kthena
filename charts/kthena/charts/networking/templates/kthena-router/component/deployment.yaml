@@ -106,8 +106,6 @@ spec:
             {{- end }}
             - name: SESSION_BOOST_GRACE_PERIOD
               value: {{ .gracePeriod | quote }}
-            - name: SESSION_BOOST_POLL_INTERVAL
-              value: {{ .pollInterval | quote }}
             {{- end }}
             {{- end }}
             # Access log configuration

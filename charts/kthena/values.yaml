@@ -100,8 +100,6 @@ networking:
       # -- Wait time after a request completes for a same-session follow-up.<br/>
       # Disabled by default (`0s`).
       gracePeriod: "0s"
-      # -- Interval at which the queue polls backend pod metrics for capacity.
-      pollInterval: "100ms"
     gatewayAPI:
       # -- Enable Gateway API related features.
       enabled: false

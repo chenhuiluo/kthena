@@ -70,9 +70,6 @@ kthenaRouter:
     # follow-up to arrive. Disabled by default (0s); enable only if you understand
     # the latency trade-off for non-boosted requests.
     gracePeriod: "0s"
-    # pollInterval is the interval at which the queue polls backend pod metrics
-    # to check available capacity (default: 100ms)
-    pollInterval: "100ms"
   # accessLog configuration for request logging
   accessLog:
     # enabled controls whether access logging is active
