@@ -4,18 +4,12 @@ metadata:
   name: self-healing-test-model
 spec:
   name: self-healing-test-model
-  autoscalingPolicy:
-    metrics:
-    - metricName: concurrency
-      targetValue: "10"
   backend:
     name: backend1
     type: vLLM
     modelURI: hf://Qwen/Qwen2.5-0.5B-Instruct
     cacheURI: hostpath:///tmp/cache
-    minReplicas: 1
-    # maxReplicas is set to 1 since this fixture only tests ASP generation and self-healing, not autoscaling
-    maxReplicas: 1
+    replicas: 1
     workers:
     - type: server
       image: ghcr.io/huntersman/vllm-cpu-env:latest

@@ -269,21 +269,6 @@ func TestModelBoosterSelfHealing(t *testing.T) {
 
 	expectedChildName := mbutils.GetBackendResourceName(model.Name, model.Spec.Backend.Name)
 
-	policyToDelete, err := kthenaClient.WorkloadV1alpha1().AutoscalingPolicies(testNamespace).Get(ctx, expectedChildName, metav1.GetOptions{})
-	require.NoError(t, err, "Expected AutoscalingPolicy to be generated with deterministic name")
-
-	err = kthenaClient.WorkloadV1alpha1().AutoscalingPolicies(testNamespace).Delete(ctx, policyToDelete.Name, metav1.DeleteOptions{})
-	require.NoError(t, err, "Failed to delete AutoscalingPolicy")
-
-	require.Eventually(t, func() bool {
-		recreated, err := kthenaClient.WorkloadV1alpha1().AutoscalingPolicies(testNamespace).Get(ctx, policyToDelete.Name, metav1.GetOptions{})
-		if err != nil {
-			return false
-		}
-		return recreated.UID != policyToDelete.UID
-	}, 1*time.Minute, 2*time.Second, "Controller failed to self-heal deleted AutoscalingPolicy")
-
-	t.Log("AutoscalingPolicy was successfully self-healed. Testing ModelServing...")
 	servingToDelete, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, expectedChildName, metav1.GetOptions{})
 	require.NoError(t, err, "Expected ModelServing to be generated with deterministic name")
 
@@ -330,12 +315,6 @@ func TestModelBoosterSelfHealing(t *testing.T) {
 		return recreated.UID != routeToDelete.UID
 	}, 1*time.Minute, 2*time.Second, "Controller failed to self-heal deleted ModelRoute")
 
-	t.Log("ModelRoute was successfully self-healed. Verifying AutoscalingPolicyBinding...")
-
-	binding, err := kthenaClient.WorkloadV1alpha1().AutoscalingPolicyBindings(testNamespace).Get(ctx, expectedChildName, metav1.GetOptions{})
-	require.NoError(t, err, "Expected AutoscalingPolicyBinding to be generated")
-	assertOwnedByModelBooster(t, binding.OwnerReferences, createdModel)
-
 	t.Log("All child resources self-healed successfully. Test complete.")
 }
 
@@ -350,7 +329,7 @@ func createInvalidModel() *workload.ModelBooster {
 	model := utils.LoadYAMLFromFile[workload.ModelBooster](filepath.Join(testDataDir, "ModelBooster-vllm.yaml"))
 	model.Name = "invalid-model"
 	model.Spec.Name = "invalid-model"
-	model.Spec.Backend.MinReplicas = 5 // invalid: greater than maxReplicas
+	model.Spec.Backend.Replicas = 1000001 // invalid: exceeds maximum allowed replicas
 	return model
 }
 

@@ -9,8 +9,7 @@ spec:
     type: vLLM
     modelURI: hf://Qwen/Qwen2.5-0.5B-Instruct
     cacheURI: hostpath:///tmp/cache
-    minReplicas: 1
-    maxReplicas: 1
+    replicas: 1
     workers:
     - type: server
       image: ghcr.io/huntersman/vllm-cpu-env:latest
