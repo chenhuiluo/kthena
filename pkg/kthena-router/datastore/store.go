@@ -1282,6 +1282,31 @@ func (s *store) DeleteModelRoute(namespacedName string) error {
 	return nil
 }
 
+// MatchModelServer 是路由匹配的核心函数 — 根据请求中的 model 名找到应该由哪个 ModelServer 处理
+//
+// 返回值:
+//   - types.NamespacedName: 匹配到的 ModelServer 的命名空间/名称
+//   - bool: 是否为 LoRA 请求 (LoRA 请求走 loraRoutes 索引, 基础模型走 routes 索引)
+//   - *ModelRoute: 匹配到的 ModelRoute CR (用于后续回调触发限流配置更新)
+//   - error: 未匹配时返回错误
+//
+// 匹配流程 (5级优先级逐层收窄):
+//
+//   1. 基础模型匹配: routes[model] → 基础模型名精确匹配
+//      例: model="gpt-4" → 直接命中
+//
+//   2. LoRA 适配器匹配: loraRoutes[model] → LoRA 名精确匹配
+//      例: model="法律助手" → 命中 LoRA 路由, isLora=true
+//
+//   3. Gateway 作用域过滤: 只保留属于此 Gateway 的 ModelRoute
+//      (通过 parentRefs 匹配, 无 parentRefs 的 ModelRoute 视为全局路由)
+//
+//   4. 规则匹配: selectRule() → 按 Body/Header/Query 条件进一步筛选
+//      例: Header["X-Tenant"]="legal" → 只匹配含此条件的规则
+//
+//   5. 加权随机: selectDestination() → 多个目标 ModelServer 按权重分配
+//      例: targetA weight=70, targetB weight=30 → 70%流量到A, 30%到B
+//
 func (s *store) MatchModelServer(model string, req *http.Request, gatewayKey string) (types.NamespacedName, bool, *aiv1alpha1.ModelRoute, error) {
 	s.routeMutex.RLock()
 	defer s.routeMutex.RUnlock()
@@ -1387,6 +1412,9 @@ func (s *store) matchesSpecificGateway(mr *aiv1alpha1.ModelRoute, gatewayKey str
 	return false
 }
 
+// selectRule 从 ModelRoute 的多条规则中选出匹配当前请求的那条
+// 匹配条件: Body 中的 model 字段 + HTTP Header 值 + Query 参数值
+// 三种匹配模式: Exact(精确), Prefix(前缀), Regex(正则)
 func (s *store) selectRule(modelName string, req *http.Request, rules []*aiv1alpha1.Rule) (*aiv1alpha1.Rule, error) {
 	for _, rule := range rules {
 		if rule.ModelMatch == nil {
@@ -1430,6 +1458,9 @@ func (s *store) selectRule(modelName string, req *http.Request, rules []*aiv1alp
 	return nil, fmt.Errorf("failed to find a matching rule")
 }
 
+// matchString 字符串匹配工具函数, 支持三种模式:
+//   Exact: 精确相等  |  Prefix: 前缀匹配  |  Regex: 正则匹配
+//   无指定匹配条件时默认返回 true (视为通配)
 func matchString(sm *aiv1alpha1.StringMatch, value string) bool {
 	switch {
 	case sm.Exact != nil:
@@ -1444,6 +1475,8 @@ func matchString(sm *aiv1alpha1.StringMatch, value string) bool {
 	}
 }
 
+// selectDestination 从多个目标 ModelServer 中按权重随机选一个
+// 权重越大 → 被选中概率越高; 所有目标权重一致 → 等概率轮询
 func (s *store) selectDestination(targets []*aiv1alpha1.TargetModel) (*aiv1alpha1.TargetModel, error) {
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("no target models specified in rule")

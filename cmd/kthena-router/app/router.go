@@ -41,6 +41,46 @@ const (
 	routerConfigFile = "/etc/config/routerConfiguration.yaml"
 )
 
+// =============================================================================
+// kthena-router 核心组装 & HTTP Server 生命周期管理
+// =============================================================================
+//
+// 【本文件职责】
+//   1. NewRouter(): 组装路由处理核心 — DataStore + Scheduler + 限流器 + 分词器 + 回调
+//   2. NewServer(): 创建 HTTP Server 结构体 (封装 Router + 配置)
+//   3. Server.Run(): 启动入口 — 初始化 K8s Client → 启动 Controller → 启动 HTTP 监听
+//   4. NewListenerManager(): Gateway API 模式下的多端口监听器管理
+//
+// 【NewRouter() 组装流程】
+//   DataStore (路由表+Pod列表)
+//     ↓ 注册回调: ModelRoute 变化 → 更新 RateLimiter
+//     ↓ 注册回调: Pod 变化 → 更新 Tokenizer
+//   Scheduler (调度管线)
+//     ↓ 从 ConfigMap 加载插件配置 / 使用硬编码默认值
+//   RateLimiter (令牌桶限流)
+//     ↓ AddOrUpdateLimiter(modelName, rateLimitSpec)
+//   Tokenizer (Token 估算)
+//     ↓ NewSimpleEstimateTokenizer() — len(prompt)/4 兜底
+//   → 返回 *router.Router
+//
+// 【Server.Run() 启动流程】
+//   1. 创建 K8s Client (in-cluster config)
+//   2. 创建 DataStore
+//   3. 初始化 5 个 Controller:
+//      - ModelRouteController (必须) — watch ModelRoute CRD, 同步到 DataStore
+//      - ModelServerController (必须) — watch ModelServer CRD, 同步到 DataStore
+//      - GatewayController       (可选, --enable-gateway-api)
+//      - HTTPRouteController     (可选, --enable-gateway-api)
+//      - InferencePoolController  (可选, --enable-gateway-api-inference-extension)
+//   4. 创建 Router (NewRouter)
+//   5. 启动所有 Informer, 等待缓存同步
+//   6. 启动 HTTP 监听 (Default 或 Gateway 模式)
+//   7. 启动优雅关机 goroutine: 等待 ctx.Done() → srv.Shutdown(drainTimeout) → force close
+//
+// =============================================================================
+
+// NewRouter 组装路由器的所有组件并返回 *router.Router
+// 这是最核心的组装函数,把 DataStore/Scheduler/RateLimiter/Tokenizer 连接起来
 func NewRouter(store datastore.Store) *router.Router {
 	return router.NewRouter(store, routerConfigFile)
 }

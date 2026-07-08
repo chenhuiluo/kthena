@@ -54,12 +54,16 @@ import (
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 )
 
+// Gin 上下文键定义
 const (
+	// GatewayKey: 存储网关标识，由 Gateway 监听器设置，用于 HTTPRoute 匹配
+	// PromptKey: 存储已解析的 ChatMessage 对象，避免重复解析
 	// Context keys for gin context
 	GatewayKey = "gatewayKey"
 	PromptKey  = "promptKey" // store parsed ChatMessage, which will be reused
 )
 
+// getEnvBool 从环境变量读取布尔值，支持默认值回退
 func getEnvBool(key string, fallback bool) bool {
 	if value, ok := os.LookupEnv(key); ok {
 		if boolValue, err := strconv.ParseBool(value); err == nil {
@@ -69,6 +73,7 @@ func getEnvBool(key string, fallback bool) bool {
 	return fallback
 }
 
+// EnableFairnessScheduling 启用每模型用户公平排队调度，按用户近期 Token 用量排序
 // EnableFairnessScheduling enables the router's per-model user-fairness queue,
 // which orders requests by each user's recent token usage. EnableSessionBoost
 // enables session-aware boosting to maximize prefix cache reuse. The two are
@@ -76,22 +81,26 @@ func getEnvBool(key string, fallback bool) bool {
 var EnableFairnessScheduling = getEnvBool("ENABLE_FAIRNESS_SCHEDULING", false)
 var EnableSessionBoost = getEnvBool("ENABLE_SESSION_BOOST", false)
 
+// Router 是 kthena-router 的请求处理核心结构体
+// 持有调度器/限流器/分词器等组件,是 HTTP 请求到 Pod 代理的中枢
 type Router struct {
-	scheduler       scheduler.Scheduler
-	authenticator   *auth.JWTAuthenticator
-	store           datastore.Store
-	loadRateLimiter *ratelimit.TokenRateLimiter
-	accessLogger    accesslog.AccessLogger
-	metrics         *metrics.Metrics
-	tokenizer       tokenizer.Tokenizer
+	scheduler       scheduler.Scheduler    // 调度器，执行 Filter -> Score -> TopN 管线
+	authenticator   *auth.JWTAuthenticator // JWT 认证器
+	store           datastore.Store        // 数据存储，持有所有 Pod/ModelServer/ModelRoute/限流状态/指标
+	loadRateLimiter *ratelimit.TokenRateLimiter // 令牌桶限流器（支持单机或全局 Redis 模式）
+	accessLogger    accesslog.AccessLogger // 访问日志记录器
+	metrics         *metrics.Metrics       // 请求指标收集器
+	tokenizer       tokenizer.Tokenizer    // Token 数量估算器
 
+	// KV 连接器工厂，用于 PD 分离场景
 	// KV Connector management
 	connectorFactory *connectors.Factory
 
+	// 优先队列配置
 	// Priority queue configuration
-	queueTimeout     time.Duration
-	tokenWeight      float64 // Weight for token-based priority in the fairness strategy (default 1.0)
-	requestNumWeight float64 // Weight for request-count-based priority in the fairness strategy (default 0.0)
+	queueTimeout     time.Duration // 队列等待超时时间
+	tokenWeight      float64 // 公平调度策略中 Token 用量的权重（默认 1.0） in the fairness strategy (default 1.0)
+	requestNumWeight float64 // 公平调度策略中请求计数权重（默认 0.0） in the fairness strategy (default 0.0)
 }
 
 // ActiveRequestCount returns the number of requests currently being handled by the router.
@@ -99,22 +108,29 @@ func (r *Router) ActiveRequestCount() int64 {
 	return r.metrics.ActiveRequestsCount()
 }
 
+// NewRouter 创建新的 Router 实例，初始化限流器、指标收集器、Token估算器、调度器等核心组件
 func NewRouter(store datastore.Store, routerConfigPath string) *Router {
+	// 公平调度和 SessionBoost 互斥，不能同时启用
 	// User fairness and session boost are mutually exclusive scheduling strategies.
 	// Enabling both is a configuration error.
 	if EnableFairnessScheduling && EnableSessionBoost {
 		klog.Fatalf("ENABLE_FAIRNESS_SCHEDULING and ENABLE_SESSION_BOOST are mutually exclusive; enable only one")
 	}
 
+	// 创建统一的令牌桶限流器，覆盖所有模型
 	// Create a unified rate limiter for all models
 	loadRateLimiter := ratelimit.NewTokenRateLimiter()
 
+	// 使用全局单例 Prometheus 指标收集器
 	// Use global metrics instance
 	metricsInstance := metrics.DefaultMetrics
 
+	// 初始化 Token 估算器 — 默认实现用 len(prompt)/4 兜底
 	// Initialize tokenizer
 	tokenizerInstance := tokenizer.NewSimpleEstimateTokenizer()
 
+	// 注册 ModelRoute 变更回调，动态更新限流器配置
+	// 当 ModelRoute CRD 增删改时, DataStore 会触发此回调
 	store.RegisterCallback("ModelRoute", func(data datastore.EventData) {
 		switch data.EventType {
 		case datastore.EventAdd, datastore.EventUpdate:
@@ -123,29 +139,35 @@ func NewRouter(store datastore.Store, routerConfigPath string) *Router {
 			}
 			klog.Infof("add or update rate limit for model %s", data.ModelName)
 
+			// 将限流规则配置到统一限流器
 			// Configure the unified rate limiter for this model
 			if err := loadRateLimiter.AddOrUpdateLimiter(data.ModelName, data.ModelRoute.Spec.RateLimit); err != nil {
 				klog.Errorf("failed to configure rate limiter for model %s: %v", data.ModelName, err)
 			}
 
+				// 删除: 清除该模型的令牌桶
 		case datastore.EventDelete:
 			klog.Infof("delete rate limit for model %s", data.ModelName)
 			loadRateLimiter.DeleteLimiter(data.ModelName)
 		}
 	})
 
+	// 解析调度器配置文件（ConfigMap 挂载到 /etc/config/）
+	// 包含: 启用的 Filter/Score 插件列表、各插件的权重和参数
 	routerConfig, err := conf.ParseRouterConfig(routerConfigPath)
 	if err != nil {
 		klog.Fatalf("failed to parse router config: %v", err)
 	}
 
+	// 配置访问日志记录器，通过环境变量控制开关/格式/输出目标
 	// Initialize access logger with configuration from environment variables
 	accessLogConfig := &accesslog.AccessLoggerConfig{
-		Enabled: true,
+			Enabled: true,  // 默认启用
 		Format:  accesslog.FormatText,
 		Output:  "stdout",
 	}
 
+	// 读取 ACCESS_LOG_ENABLED 环境变量（true/false）
 	// Read access log configuration from environment variables
 	if enabled := os.Getenv("ACCESS_LOG_ENABLED"); enabled != "" {
 		if enabledBool, err := strconv.ParseBool(enabled); err == nil {
@@ -153,6 +175,7 @@ func NewRouter(store datastore.Store, routerConfigPath string) *Router {
 		}
 	}
 
+	// 读取 ACCESS_LOG_FORMAT 环境变量（text/json）
 	if format := os.Getenv("ACCESS_LOG_FORMAT"); format != "" {
 		if format == "json" {
 			accessLogConfig.Format = accesslog.FormatJSON
@@ -161,6 +184,7 @@ func NewRouter(store datastore.Store, routerConfigPath string) *Router {
 		}
 	}
 
+	// 读取 ACCESS_LOG_OUTPUT 环境变量（stdout/文件路径）
 	if output := os.Getenv("ACCESS_LOG_OUTPUT"); output != "" {
 		accessLogConfig.Output = output
 	}
@@ -170,6 +194,7 @@ func NewRouter(store datastore.Store, routerConfigPath string) *Router {
 		klog.Fatalf("failed to create access logger: %v", err)
 	}
 
+	// 构建 Router 实例，填充所有核心组件字段
 	return &Router{
 		store:            store,
 		scheduler:        scheduler.NewScheduler(store, routerConfig),
@@ -185,8 +210,11 @@ func NewRouter(store datastore.Store, routerConfigPath string) *Router {
 	}
 }
 
+// 默认公平调度队列超时时间（60秒）
 const defaultQueueTimeout = 60 * time.Second
 
+// parseQueueTimeout 从 FAIRNESS_QUEUE_TIMEOUT 环境变量解析队列超时时间
+// 支持 Go duration 格式（如 "30s"、"2m"），默认 60 秒
 func parseQueueTimeout() time.Duration {
 	if s, ok := os.LookupEnv("FAIRNESS_QUEUE_TIMEOUT"); ok {
 		if d, err := time.ParseDuration(s); err == nil && d > 0 {
@@ -197,6 +225,8 @@ func parseQueueTimeout() time.Duration {
 	return defaultQueueTimeout
 }
 
+// parseEnvFloat 从环境变量读取浮点数，支持 NaN/Inf/负数校验
+// 用于读取公平调度权重参数（FAIRNESS_PRIORITY_TOKEN_WEIGHT 等）
 func parseEnvFloat(key string, fallback float64) float64 {
 	if s, ok := os.LookupEnv(key); ok {
 		if v, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 {
@@ -207,6 +237,9 @@ func parseEnvFloat(key string, fallback float64) float64 {
 	return fallback
 }
 
+// calculateRequestPriority 计算请求在公平调度队列中的优先级
+// 优先级 = tokenWeight × 用户Token用量 + requestNumWeight × 用户请求次数
+// 值越低 → 优先级越高 → 越先出队 (最近使用少的用户优先服务)
 func (r *Router) calculateRequestPriority(userID, modelName string) float64 {
 	priority, err := datastore.CalculateFairnessPriority(r.store, userID, modelName, r.tokenWeight, r.requestNumWeight)
 	if err != nil {
@@ -216,45 +249,52 @@ func (r *Router) calculateRequestPriority(userID, modelName string) float64 {
 	return priority
 }
 
+// ModelRequest 是模型推理请求的通用映射类型
 type ModelRequest map[string]interface{}
 
+// HandlerFunc 是 kthena-router 的核心入口 — 所有 /v1/ 请求都经过这里
+// 主流程: 限流检查 → Token估算 → 分支(直接调度 / 公平排队)
 func (r *Router) HandlerFunc() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// ── 1. 活跃请求计数 ──────────────────────────────────────
+		// 用于优雅关机: drain 时等待此计数归零再关闭连接
 		r.metrics.IncActiveRequests()
 		defer r.metrics.DecActiveRequests()
 
-		// Handle /v1/models endpoint (OpenAI-compatible model listing)
+		// ── 2. OpenAI 兼容的模型列表端点 ──────────────────────────
+		// GET /v1/models → 返回 DataStore 中所有注册的模型名
+		// 很多 OpenAI 客户端库初始化时会调用此端点验证连接
 		if c.Request.Method == http.MethodGet &&
 			(c.Request.URL.Path == "/v1/models" || c.Request.URL.Path == "/models") {
 			r.ListModels(c)
 			return
 		}
 
-		// Step 1: Parse and validate request
+		// ── 3. 解析请求体 ──────────────────────────────────────────
+		// 从 JSON body 提取 model 字段 + 完整请求 map
 		modelRequest, err := ParseModelRequest(c)
 		if err != nil {
 			accesslog.SetError(c, "request_parsing", err.Error())
 			return
 		}
 
-		// step 2: Detection of rate limit
+		// ── 4. 提取模型名 + 初始化指标追踪 ───────────────────────
 		modelName := modelRequest["model"].(string)
 
-		// Set model name in access log
+		// 访问日志: 记录本次请求的模型名
 		accesslog.SetModelName(c, modelName)
-
-		// Store model name in context for metrics middleware
+		// Gin context: 存储模型名供指标中间件读取
 		c.Set("model", modelName)
 
-		// Create metrics recorder for this request
+		// 创建本次请求的指标记录器, 跟踪延迟/Token用量/限流状态
 		path := c.Request.URL.Path
 		metricsRecorder := metrics.NewRequestMetricsRecorder(r.metrics, modelName, path)
 
-		// Increment downstream request count at request start
+		// 增加下游活跃请求数 (router 视角的"已接受未完成"请求数)
 		r.metrics.IncActiveDownstreamRequests(modelName)
 		defer func() {
-			// Decrement downstream request count when request completes
 			r.metrics.DecActiveDownstreamRequests(modelName)
+			// 请求完成时: 记录最终状态码和结束原因
 			if metricsRecorder != nil {
 				statusCode := strconv.Itoa(c.Writer.Status())
 				reason := "successful_request"
@@ -265,6 +305,8 @@ func (r *Router) HandlerFunc() gin.HandlerFunc {
 			}
 		}()
 
+		// ── 5. 解析 Prompt 文本 ──────────────────────────────────
+		// 从请求体的 messages 字段提取用户输入文本
 		prompt, err := utils.ParsePrompt(modelRequest)
 		if err != nil {
 			accesslog.SetError(c, "prompt_parsing", "prompt not found")
@@ -272,27 +314,28 @@ func (r *Router) HandlerFunc() gin.HandlerFunc {
 			c.Set("finishReason", "prompt_parsing")
 			return
 		}
-		// Store parsed prompt to avoid re-parsing in doLoadbalance.
+		// 缓存到 Gin context, 后续 doLoadbalance() 直接取用, 避免重复解析
 		c.Set(PromptKey, prompt)
 		promptStr := utils.GetPromptString(prompt)
 
-		// Calculate input tokens for metrics using tokenizer
+		// ── 6. 估算输入 Token 数 ─────────────────────────────────
+		// SimpleEstimateTokenizer: 基于 len(prompt)/4 的粗略估计
 		inputTokens, err := r.tokenizer.CalculateTokenNum(promptStr)
 		if err != nil {
 			klog.Errorf("failed to calculate token number: %v", err)
 			inputTokens = len(promptStr) / 4 // fallback estimation
 		}
 
-		// Calculate and set input tokens for access log
+		// 访问日志: 记录输入 Token 数 (输出 Token 在响应完成时补充)
 		accesslog.SetTokenCounts(c, inputTokens, 0)
-
-		// Mark end of request processing phase
+		// 标记请求处理阶段结束 (区分"排队等待"和"实际处理"时间)
 		accesslog.MarkRequestProcessingEnd(c)
-
-		// Record input tokens immediately
+		// 立即记录输入 Token 到 Prometheus 指标
 		metricsRecorder.RecordInputTokens(inputTokens)
 
-		// Apply rate limiting using the unified rate limiter
+		// ── 7. 令牌桶限流 ─────────────────────────────────────────
+		// 三维度检查: input tokens/s, output tokens/s, requests/s
+		// 超限返回 429 Too Many Requests
 		if err := r.loadRateLimiter.RateLimit(modelName, promptStr); err != nil {
 			var errorMsg string
 			var errorType string
@@ -312,31 +355,29 @@ func (r *Router) HandlerFunc() gin.HandlerFunc {
 				tokenType = metrics.LimitTypeRequests
 			}
 			accesslog.SetError(c, errorType, errorMsg)
-
-			// Record rate limit exceeded
 			metricsRecorder.RecordRateLimitExceeded(tokenType)
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, errorMsg)
 			c.Set("finishReason", "rate_limit")
 			return
 		}
 
+		// ── 8. 生成 Request ID ────────────────────────────────────
+		// 如果客户端未提供 x-request-id, 则自动生成一个 UUID
 		requestID := uuid.New().String()
 		if c.Request.Header.Get("x-request-id") == "" {
 			c.Request.Header.Set("x-request-id", requestID)
 		}
-
-		// Store metrics recorder in context for use in other functions
+		// Gin context: 存储指标记录器供 proxyModelEndpoint/proxy 等函数使用
 		c.Set("metricsRecorder", metricsRecorder)
 
-		// step 3.1: direct load balancing when neither fairness scheduling nor
-		// session boost is enabled.
+		// ── 9. 分支: 直接调度 vs 排队调度 ────────────────────────
+		// 9a. 无 Fairness/SessionBoost → 最快路径: 限流通过后立即调度
 		if !EnableFairnessScheduling && !EnableSessionBoost {
 			_ = r.doLoadbalance(c, modelRequest)
 			return
 		}
-
-		// step 3.2: queue scheduling. The queue orders requests by the active
-		// strategy: per-user fairness or session boost (mutually exclusive).
+		// 9b. 有 Fairness/SessionBoost → 先入优先队列排队, 出队后调度
+		// 超时/客户端断连 → 请求被取消
 		if err := r.handleFairnessScheduling(c, modelRequest, requestID, modelName); err != nil {
 			accesslog.SetError(c, "scheduling", err.Error())
 			c.Set("finishReason", "scheduling")
@@ -345,17 +386,23 @@ func (r *Router) HandlerFunc() gin.HandlerFunc {
 	}
 }
 
+// doLoadbalance 是负载均衡的核心函数 — 从路由匹配到调度决策到代理转发
+// 主流程: 模型匹配 → 取Pod列表 → 构建调度上下文 → 调度打分 → 代理转发
+//   同构/PD聚合: scheduler 返回 BestPods → proxyModelEndpoint() → proxy()
+//   PD 分离:     scheduler 返回 DecodePods+PrefillPods → proxyToPDDisaggregated()
 func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error {
 	modelName := modelRequest["model"].(string)
 
-	// Check if this is an InferencePool request from HTTPRoute
-	var pods []*datastore.PodInfo
-	var port int32
-	var modelServerName types.NamespacedName
-	var modelRoute *v1alpha1.ModelRoute
-	var modelServer *v1alpha1.ModelServer
+	// ── 1. 声明本函数的输出变量 ──────────────────────────────
+	var pods []*datastore.PodInfo     // 候选 Pod 列表
+	var port int32                     // ModelServer 的工作端口
+	var modelServerName types.NamespacedName // ModelServer CR 的命名空间/名称
+	var modelRoute *v1alpha1.ModelRoute     // 匹配到的 ModelRoute CR
+	var modelServer *v1alpha1.ModelServer   // ModelServer CR 对象
 
-	// Get gateway key from context if available (set by Gateway listener)
+	// ── 2. 获取 Gateway 标识 (Gateway API 模式) ──────────────
+	// 由 ListenerManager 的中间件注入, 值为 "namespace/name"
+	// 用于 Gateway 作用域过滤: 只有属于此 Gateway 的 ModelRoute 才参与匹配
 	var gatewayKey string
 	if key, exists := c.Get(GatewayKey); exists {
 		if k, ok := key.(string); ok {
@@ -366,19 +413,25 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		accesslog.SetGatewayAPIInfo(c, gatewayKey, "", "")
 	}
 
+	// ── 3. 路由匹配: model 名 → ModelServer ──────────────────
+	// MatchModelServer 内部逻辑:
+	//   a. 精确匹配 routes[model] → ModelServer (基础模型路由)
+	//   b. LoRA 适配器匹配 loraRoutes[model] (LoRA 路由)
+	//   c. Gateway 作用域过滤 (parentRefs 匹配)
+	//   d. 规则匹配 selectRule() (按 Body/Header/Query 条件)
+	//   e. 加权随机 selectDestination() (多目标按权重分配)
 	var isLora bool
 	var err error
-	// Try to match ModelRoute first
 	modelServerName, isLora, modelRoute, err = r.store.MatchModelServer(modelName, c.Request, gatewayKey)
 	if err != nil {
+		// 匹配失败不立即返回, 先记日志, 后面还有 HTTPRoute 兜底
 		accesslog.SetError(c, "model_server_matching", fmt.Sprintf("can't find corresponding model server: %v", err))
 	}
 
+	// ── 4. 根据匹配结果走不同分支取 Pod 和端口 ─────────────
 	if err == nil && strings.HasPrefix(c.Request.URL.Path, "/v1/") {
-		// Regular ModelServer request
-		// step 3: Find pods and model server details
-		klog.V(4).Infof("modelServer is %v, is_lora: %v", modelServerName, isLora)
-
+		// ── 4a. ModelServer 路径: /v1/ 请求且 ModelRoute 匹配成功 ──
+		// 获取该 ModelServer 下所有 Ready 的 Pod + ModelServer CR
 		pods, modelServer, err = r.getPodsAndServer(modelServerName)
 		if err != nil || len(pods) == 0 {
 			klog.Errorf("failed to get pods and model server: %v, %v", modelServerName, err)
@@ -387,16 +440,20 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 			return fmt.Errorf("can't find model server: %v", modelServerName)
 		}
 
+		// 如果不是 LoRA 请求,将 model 字段替换为 ModelServer CR 中的基础模型名
+		// 原因: 推理引擎 (vLLM/SGLang) 只认识自己加载的模型名,不认识路由别名
 		model := modelServer.Spec.Model
 		if model != nil && !isLora {
 			modelRequest["model"] = *model
 		}
 
+		// 记录推理引擎的工作端口 (Pod IP + 此端口 = 引擎实际监听地址)
 		port = modelServer.Spec.WorkloadPort.Port
 	} else if matched, inferencePoolName := r.handleHTTPRoute(c, gatewayKey); matched {
-		// If ModelRoute is not matched, try to match HTTPRoute
+		// ── 4b. HTTPRoute 路径: ModelRoute 未匹配,但 HTTPRoute 匹配 ──
+		// 这是 Gateway API Inference Extension 的路径
+		// 通过 InferencePool 获取 Pod 列表和端口
 
-		// Get InferencePool from store
 		inferencePoolKey := fmt.Sprintf("%s/%s", inferencePoolName.Namespace, inferencePoolName.Name)
 		inferencePool := r.store.GetInferencePool(inferencePoolKey)
 		if inferencePool == nil {
@@ -406,7 +463,7 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 			return fmt.Errorf("can't find inference pool: %v", inferencePoolName)
 		}
 
-		// Get pods from InferencePool
+		// 从 InferencePool 获取关联的 Pod 列表
 		pods, err = r.store.GetPodsByInferencePool(inferencePoolName)
 		if err != nil || len(pods) == 0 {
 			klog.Errorf("failed to get pods for inference pool: %v, %v", inferencePoolName, err)
@@ -415,24 +472,25 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 			return fmt.Errorf("can't find pods for inference pool: %v", inferencePoolName)
 		}
 
-		// Get target port from InferencePool
+		// 从 InferencePool.Spec.TargetPorts 获取目标端口
 		if len(inferencePool.Spec.TargetPorts) == 0 {
 			klog.Errorf("inference pool %v has no target ports", inferencePoolName)
 			accesslog.SetError(c, "port_discovery", fmt.Sprintf("inference pool %v has no target ports", inferencePoolName))
 			c.AbortWithStatusJSON(http.StatusBadRequest, fmt.Sprintf("inference pool %v has no target ports", inferencePoolName))
 			return fmt.Errorf("inference pool %v has no target ports", inferencePoolName)
 		}
-		// Use the first target port
 		port = int32(inferencePool.Spec.TargetPorts[0].Number)
 
 		klog.V(4).Infof("InferencePool is %v, pods count: %d, port: %d", inferencePoolName, len(pods), port)
 	} else {
+		// ── 4c. 两条路都没匹配 → 404 ──
 		accesslog.SetError(c, "route_not_found", "route not found")
 		c.AbortWithStatusJSON(http.StatusNotFound, "route not found")
 		return fmt.Errorf("route not found")
 	}
 
-	// Common scheduling logic for both ModelServer and InferencePool
+	// ── 5. 构建 framework.Context — 调度管线在插件间传递的上下文 ──
+	// 从 Gin context 取出 HandlerFunc 中缓存的 prompt
 	var prompt *common.ChatMessage
 	if cached, exists := c.Get(PromptKey); exists {
 		var ok bool
@@ -447,7 +505,7 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		return fmt.Errorf("prompt not found")
 	}
 
-	// Get metrics recorder from gin context
+	// 从 Gin context 取出 HandlerFunc 中创建的指标记录器
 	var metricsRecorder *metrics.RequestMetricsRecorder
 	if recorder, exists := c.Get("metricsRecorder"); exists {
 		if rec, ok := recorder.(*metrics.RequestMetricsRecorder); ok {
@@ -455,18 +513,22 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		}
 	}
 
-	// Get PDGroup if available (only for ModelServer)
+	// 提取 PDGroup (仅 ModelServer 请求才有)
+	// PDGroup 是 ModelServer.Spec.WorkloadSelector.PDGroup 字段
+	// 如果存在, 说明是 PD 分离部署, scheduler 会分别调度 decode/prefill Pod
 	var pdGroup *v1alpha1.PDGroup
 	if modelServer != nil && modelServer.Spec.WorkloadSelector != nil {
 		pdGroup = modelServer.Spec.WorkloadSelector.PDGroup
 	}
 
+	// 提取 session ID (用于 Session Boost: 相同 session 优先到同一 Pod)
 	sessionHeader := r.store.GetSessionIDHeader()
 	var sessionID string
 	if sessionHeader != "" {
 		sessionID = c.Request.Header.Get(sessionHeader)
 	}
 
+	// 组装调度上下文 — Schedule() 会填充 BestPods 或 DecodePods+PrefillPods
 	ctx := &framework.Context{
 		Model:           modelName,
 		Prompt:          prompt,
@@ -476,6 +538,9 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		MetricsRecorder: metricsRecorder,
 	}
 
+	// ── 6. 执行调度: Filter → Score → TopN ──────────────────
+	// 同构: 填充 ctx.BestPods (Top5 Pod)
+	// PD分离: 填充 ctx.DecodePods (Top5) + ctx.PrefillPods (每个 Decode 配 1 个 Prefill)
 	err = r.scheduler.Schedule(ctx, pods)
 	if err != nil {
 		accesslog.SetError(c, "scheduling", fmt.Sprintf("can't schedule to target pod: %v", err))
@@ -483,12 +548,13 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		return fmt.Errorf("can't schedule to target pod: %v", err)
 	}
 
-	// Set complete request routing information in access log
+	// ── 7. 记录访问日志的路由信息 ─────────────────────────────
+	// ModelRoute → ModelServer → 选中 Pod, 完整链路
 	modelServerFullName := fmt.Sprintf("%s/%s", modelServerName.Namespace, modelServerName.Name)
 	modelRouteName := ""
 	if modelRoute != nil {
 		modelRouteName = fmt.Sprintf("%s/%s", modelRoute.Namespace, modelRoute.Name)
-		// Set the model route name in context for upstream connections
+		// 供上游连接中间件使用
 		c.Set("modelRouteName", modelRouteName)
 	}
 
@@ -496,10 +562,11 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		selectedPod := ctx.BestPods[0].GetPodNamespacedName().Name
 		accesslog.SetRequestRouting(c, modelRouteName, modelServerFullName, selectedPod)
 	} else {
-		// Set routing info even if no pod is selected (for error cases)
+		// PD 分离场景 — 此时还没有选定 decode Pod
 		accesslog.SetRequestRouting(c, modelRouteName, modelServerFullName, "")
 	}
 
+	// ── 8. 代理请求到选中的 Pod ──────────────────────────────
 	req := c.Request
 	if err := r.proxyModelEndpoint(c, req, ctx, modelRequest, port); err != nil {
 		klog.Errorf("request failed reqID: %s: %v", c.Request.Header.Get("x-request-id"), err)
@@ -510,6 +577,9 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 	return nil
 }
 
+// ParseModelRequest 从 Gin context 解析 HTTP 请求体为 ModelRequest (map[string]interface{})
+// 步骤: 读取 body → JSON 反序列化 → 校验 model 字段非空
+// 如果解析失败, 直接写回 400/500 错误响应并终止请求
 func ParseModelRequest(c *gin.Context) (ModelRequest, error) {
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -532,6 +602,9 @@ func ParseModelRequest(c *gin.Context) (ModelRequest, error) {
 	return modelRequest, nil
 }
 
+// getPodsAndServer 根据 ModelServer 的 NamespacedName 从 DataStore 获取:
+//   1. 该 ModelServer 下所有 Ready 的 Pod 列表 (PodInfo 含 IP/端口/指标/在途计数等)
+//   2. ModelServer CR 对象 (含模型名/端口/PDGroup 等配置)
 func (r *Router) getPodsAndServer(modelServerName types.NamespacedName) ([]*datastore.PodInfo, *v1alpha1.ModelServer, error) {
 	pods, err := r.store.GetPodsByModelServer(modelServerName)
 	if err != nil || len(pods) == 0 {
@@ -544,9 +617,11 @@ func (r *Router) getPodsAndServer(modelServerName types.NamespacedName) ([]*data
 	return pods, modelServer, nil
 }
 
-// handleHTTPRoute handles HTTPRoute matching for non-/v1/ paths
-// Returns true if HTTPRoute was matched and request is being handled, false otherwise
-// Also returns the InferencePool NamespacedName if found
+// handleHTTPRoute 处理非 /v1/ 路径的 HTTPRoute 匹配，返回是否匹配及 InferencePool 名称
+// handleHTTPRoute 处理 Gateway API 的 HTTPRoute 匹配 (非 /v1/ 路径的请求)
+// 返回值:
+//   - matched: true = HTTPRoute 匹配成功, 请求应路由到 InferencePool
+//   - inferencePoolName: 匹配到的 InferencePool 的 NamespacedName
 func (r *Router) handleHTTPRoute(c *gin.Context, gatewayKey string) (bool, types.NamespacedName) {
 	matchResult, matched := r.findHTTPRouteMatch(c, gatewayKey)
 	if !matched {
@@ -583,7 +658,12 @@ func (r *Router) handleHTTPRoute(c *gin.Context, gatewayKey string) (bool, types
 	return true, inferencePoolName
 }
 
-// applyURLRewrite applies HTTPURLRewriteFilter to the request
+// applyURLRewrite 应用 Gateway API 的 HTTPURLRewriteFilter 规则
+// applyURLRewrite 应用 HTTPURLRewriteFilter 到请求
+// 支持 Gateway API 规范中的两种路径重写:
+//   - ReplaceFullPath: 替换完整路径 (如 /api/v2/chat → /v1/chat)
+//   - ReplacePrefixMatch: 只替换匹配的前缀部分
+// 还支持 Hostname 重写 (替换 HTTP Host 头)
 func (r *Router) applyURLRewrite(c *gin.Context, urlRewrite *gatewayv1.HTTPURLRewriteFilter) {
 	// Apply hostname rewrite
 	if urlRewrite.Hostname != nil {
@@ -633,6 +713,13 @@ func (r *Router) applyURLRewrite(c *gin.Context, urlRewrite *gatewayv1.HTTPURLRe
 	}
 }
 
+// proxy 遍历 BestPods (Top5) 逐个尝试代理，失败自动换下一个 Pod 重试
+//
+// 关键实现:
+//   - body 只能读一次: RoundTrip 会消耗 req.Body，因此先缓存 bodyBytes，每次重试前重建 Body
+//   - 在途请求计数 (on-flight): 代理前 Incr，完成后 Decr，供 least-request 插件实时打分
+//   - 成功后调用 RunPostHooks (如 prefix-cache 插件写缓存)
+//   - 如果响应已部分写入 (c.Writer.Written())，不能重试，直接返回错误
 func (r *Router) proxy(
 	c *gin.Context,
 	req *http.Request,
@@ -700,6 +787,14 @@ func (r *Router) proxy(
 	return fmt.Errorf("request to all pods failed")
 }
 
+// proxyModelEndpoint 请求代理的入口函数,根据调度结果选择代理路径:
+//   - ctx.BestPods 非空 (同构/PD聚合) → proxy() — 单阶段代理
+//   - ctx.BestPods 为空 (PD分离) → proxyToPDDisaggregated() — 两阶段代理
+//
+// 该函数还负责:
+//   - 构建 decode 请求 (connectors.BuildDecodeRequest: 修正 model 字段, 将路由别名替换为基础模型名)
+//   - 解析流式/非流式响应中的 Token Usage (用于限流计数和公平调度指标)
+//   - 更新用户的 Token 使用量 (UpdateTokenCount: 影响下次公平调度的优先级)
 func (r *Router) proxyModelEndpoint(
 	c *gin.Context,
 	req *http.Request,
@@ -765,6 +860,8 @@ func (r *Router) proxyModelEndpoint(
 	return r.proxyToPDDisaggregated(c, req, ctx, kvConnector, modelRequest, port)
 }
 
+// GetModelServer 根据模型名查找对应的 ModelServer CR 对象
+// 对外暴露的工具方法, 用于 debug 端点或内部组件查询
 func (r *Router) GetModelServer(modelName string, req *http.Request) (*v1alpha1.ModelServer, error) {
 	modelServerName, isLora, _, err := r.store.MatchModelServer(modelName, req, "")
 	if err != nil {
@@ -781,6 +878,7 @@ func (r *Router) GetModelServer(modelName string, req *http.Request) (*v1alpha1.
 	return modelServer, nil
 }
 
+// modelObject 是 OpenAI API 兼容的模型信息对象
 type modelObject struct {
 	ID      string `json:"id"`
 	Object  string `json:"object"`
@@ -788,41 +886,55 @@ type modelObject struct {
 	OwnedBy string `json:"owned_by"`
 }
 
+// modelsResponse 是 OpenAI API 兼容的模型列表响应
 type modelsResponse struct {
 	Object string        `json:"object"`
 	Data   []modelObject `json:"data"`
 }
 
-// ListModels implements the OpenAI-compatible GET /v1/models endpoint.
-// It returns all model names registered via ModelRoutes.
+// ListModels 实现 OpenAI 兼容的 GET /v1/models 接口，返回所有通过 ModelRoute 注册的模型名称
+// ListModels 实现 OpenAI 兼容的 GET /v1/models 端点
+// 返回 DataStore 中通过 ModelRoute 注册的所有模型名
+// 很多 OpenAI 客户端库初始化时会调用此端点验证连接
 func (r *Router) ListModels(c *gin.Context) {
 	modelNames := r.store.GetModelNames()
 
 	data := make([]modelObject, 0, len(modelNames))
 	for _, name := range modelNames {
 		data = append(data, modelObject{
-			ID:      name,
-			Object:  "model",
-			Created: 0,
-			OwnedBy: "kthena",
+			ID:      name,      // 模型名 (来自 ModelRoute.Spec.ModelName)
+			Object:  "model",   // OpenAI 规范固定值
+			Created: 0,         // kthena 未跟踪创建时间
+			OwnedBy: "kthena",  // 归属方标识
 		})
 	}
 
 	c.JSON(http.StatusOK, modelsResponse{
-		Object: "list",
+		Object: "list", // OpenAI 规范固定值
 		Data:   data,
 	})
 }
 
+// Auth 返回 JWT 认证中间件 — 仅对 /v1/ 路径生效
 func (r *Router) Auth() gin.HandlerFunc {
 	return r.authenticator.Authenticate()
 }
 
+// AccessLog 返回访问日志中间件 — 仅对 /v1/ 路径生效
 func (r *Router) AccessLog() gin.HandlerFunc {
 	return accesslog.AccessLogMiddleware(r.accessLogger)
 }
 
-// proxyRequest proxies the request to the model server pods, returns response to downstream.
+// proxyRequest 底层 HTTP 代理函数,将请求转发到目标 Pod 并回传响应
+//
+// 流式响应处理:
+//   逐行读取 SSE 事件 (data: ...), 尝试从最后一个 chunk 解析 usage 中的 CompletionTokens
+//   如果 > 0, 触发 onUsage 回调记录输出 Token (用于限流计数)
+//   使用 Gin 的 Stream 方法逐行转发, 不缓冲整个响应
+//
+// 非流式响应处理:
+//   使用 TeeReader 同时写入客户端和内部 buffer
+//   响应完成后从 buffer 解析完整 JSON 提取 Usage
 func proxyRequest(
 	c *gin.Context,
 	req *http.Request,
@@ -905,6 +1017,8 @@ func proxyRequest(
 	return nil
 }
 
+// doRequest 使用 HTTP Transport 发送请求到目标 Pod
+// 步骤: 1. 将 URL Host 替换为 podIP:Port  2. RoundTrip 发送请求  3. 非 2xx 视为错误
 func doRequest(
 	req *http.Request,
 	podIP string,
@@ -926,7 +1040,8 @@ func doRequest(
 	return resp, nil
 }
 
-// isStreaming checks if the given model request has streaming enabled
+// isStreaming 检查请求是否启用 SSE 流式输出
+// OpenAI 格式: {"stream": true} → 引擎逐 Token 推送 chunk, 前端实时渲染
 func isStreaming(modelRequest ModelRequest) bool {
 	if v, ok := modelRequest["stream"]; ok {
 		if stream, isBool := v.(bool); isBool && stream {
@@ -936,7 +1051,16 @@ func isStreaming(modelRequest ModelRequest) bool {
 	return false
 }
 
-// getKVConnector gets the appropriate KV connector for a model server
+// getKVConnector 获取 ModelServer 对应的 KV 连接器 (仅 PD 分离场景使用)
+//
+// KV 连接器负责协调 prefill 和 decode 两阶段:
+//   1. 将 prompt 发送给 prefill Pod, 生成 KV Cache
+//   2. 将 KV Cache 传输给 decode Pod, 逐 Token 生成输出
+//
+// 类型选择优先级:
+//   1. 显式指定: ModelServer.Spec.KVConnector.Type (最高优先)
+//   2. 引擎推断: InferenceEngine == SGLang → ZMQ bootstrap 协议
+//   3. 默认回退: HTTP (通用 NIXL/MoonCake 传输层)
 func (r *Router) getKVConnector(modelServerName types.NamespacedName) (connectors.KVConnector, error) {
 	modelServer := r.store.GetModelServer(modelServerName)
 	if modelServer == nil {
@@ -960,7 +1084,25 @@ func (r *Router) getKVConnector(modelServerName types.NamespacedName) (connector
 	return connector, nil
 }
 
-// proxyToPDDisaggregated handles PD disaggregated routing using KV connectors
+// proxyToPDDisaggregated PD 分离场景的请求代理 — 两阶段协调
+//
+// PD 分离原理:
+//   prefill Pod: 只处理输入 Token, 生成 KV Cache (计算密集)
+//   decode Pod:  只读取 KV Cache 逐 Token 生成输出 (访存密集)
+//   两者独立扩缩容, 互不干扰
+//
+// 重试策略:
+//   maxRetry = min(len(decodePods), len(prefillPods))
+//   每次换一对全新的 (prefill, decode) Pod
+//
+// 在途请求计数 (OnFlightHooks):
+//   connector.Proxy() 内部在 prefill/decode 阶段开始/结束时调用这些回调
+//   精确更新该 Pod 的在途计数, 确保 least-request 插件看到实时负载
+//
+// 三种 Connector 模式:
+//   NIXL/HTTP: 顺序 prefill(写 KV Cache 到共享内存) → decode(读 KV Cache)
+//   SGLang:    并发 prefill + decode (ZMQ bootstrap 协议要求同时在线)
+//   MoonCake:  类似 NIXL, 使用 MoonCake 传输层
 func (r *Router) proxyToPDDisaggregated(
 	c *gin.Context,
 	req *http.Request,
@@ -1054,7 +1196,21 @@ func (r *Router) proxyToPDDisaggregated(
 	return fmt.Errorf("all prefill/decode attempts failed")
 }
 
-// handleFairnessScheduling handles the fairness scheduling flow for requests.
+// handleFairnessScheduling 公平调度/会话提升的排队流程
+//
+// 背景: 当多个用户/租户同时发请求, 如果只看 Pod 负载 (least-request),
+// 高频用户会持续占据所有 GPU 资源, 低频用户被饿死
+//
+// 解决方式: 请求先进优先队列排队, 按策略排序后逐个出队执行
+//   - Fairness: 按用户最近 Token 用量排序, 用得少 → 优先级高 → 先出队
+//   - SessionBoost: 按 session 亲和排序, 同 session → 优先级高 → 先出队
+//
+// 出队后执行 doLoadbalance(), 成功则 MarkSessionRequestCompleted()
+// 让同 session 的后续请求获得 SessionBoost 优先级提升
+//
+// 两种退出方式:
+//   a. NotifyChan 收到信号 → 请求被选中, 执行调度
+//   b. reqCtx.Done() → 超时 (504) 或客户端断连 (503)
 func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequest, requestID string, modelName string) error {
 	// Extract session ID from HTTP header for multi-turn conversation tracking.
 	sessionHeader := r.store.GetSessionIDHeader()

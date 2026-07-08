@@ -37,6 +37,34 @@ import (
 
 const validatingWebhookConfigurationName = "kthena-router-validating-webhook"
 
+// =============================================================================
+// kthena-router 进程入口
+// =============================================================================
+//
+// 【启动流程】
+//   main() 解析 CLI 参数 →
+//     1. 可选: 启动 webhook server (go runWebhook) 用于校验 ModelRoute CRD
+//     2. 启动核心 HTTP server: app.NewServer(...).Run(ctx)
+//        → app/router.go: NewServer() 创建 Server 结构体
+//        → Server.Run(ctx):
+//            a. 创建 DataStore (pkg/kthena-router/datastore) — 所有路由表/后端/Pod 的内存存储
+//            b. 创建 5 个 K8s Controller (pkg/kthena-router/controller) — watch CRD 变化并同步到 DataStore
+//            c. 创建 Scheduler (pkg/kthena-router/scheduler) — Filter→Score→TopN 调度管线
+//            d. 创建 Gin HTTP Server (pkg/kthena-router/router) — 注册中间件和路由
+//            e. 启动 informer 同步, 等待缓存就绪
+//            f. 启动 HTTP 监听 + 优雅关机 goroutine
+//
+// 【两种运行模式】
+//   - Default Server (--enable-gateway-api=false): 监听单端口, 处理 /v1/ 推理请求
+//   - Gateway API Server (--enable-gateway-api=true): 根据 Gateway CRD 的 Listener 配置,
+//     动态创建多端口/多主机监听器
+//
+// 【关键 CLI 参数】
+//   --router-port          监听端口 (默认 8080)
+//   --enable-webhook       启用 ModelRoute 校验 webhook (默认 true)
+//   --enable-gateway-api   启用 Gateway API 模式 (默认 false)
+//   --debug-port           调试端口, 暴露 /debug/cache 等端点 (默认 0=禁用)
+// =============================================================================
 func main() {
 	var (
 		routerPort                         string

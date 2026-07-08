@@ -25,7 +25,26 @@ import (
 	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
 )
 
-// Context stores information which maybe useful in Filter or Score plugins.
+// =============================================================================
+// 调度框架接口定义 — 所有插件必须实现这些接口
+// =============================================================================
+//
+// 【三种插件类型】
+//   FilterPlugin:   过滤不合格的 Pod (硬条件, 返回 true/false)
+//   ScorePlugin:    对通过过滤的 Pod 打分 (软偏好, 返回 [0,100] 分)
+//   PostScheduleHook: 调度完成后执行后处理 (如写缓存)
+//
+// 【Context】
+//   在插件之间传递的上下文, 携带:
+//     Model, Prompt, SessionID — 请求信息
+//     BestPods — 同构场景调度结果 (TopN)
+//     DecodePods, PrefillPods — PD 分离场景调度结果
+//     PDGroup — PD 分组信息
+//     MetricsRecorder — 指标记录器
+//
+// =============================================================================
+
+// Context 存储在 Filter/Score 插件之间传递的信息
 type Context struct {
 	Model  string
 	Prompt *common.ChatMessage
@@ -50,6 +69,7 @@ type Context struct {
 	MetricsRecorder *metrics.RequestMetricsRecorder
 }
 
+// ScorePlugin 对通过过滤的 Pod 打分, 分数范围 [0, 100], 100=最优
 type ScorePlugin interface {
 	Name() string
 	// Score is a method that is used to rank pods that have passed the filter plugins.
@@ -57,6 +77,7 @@ type ScorePlugin interface {
 	Score(ctx *Context, pods []*datastore.PodInfo) map[*datastore.PodInfo]int
 }
 
+// FilterPlugin 过滤不合格的 Pod, 返回 true=保留, false=剔除
 type FilterPlugin interface {
 	Name() string
 	// Filter is a method that is used to filter valid pods that can be sent request to.
