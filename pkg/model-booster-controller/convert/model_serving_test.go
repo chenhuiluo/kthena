@@ -357,6 +357,38 @@ func TestCreateModelServingResources(t *testing.T) {
 	}
 }
 
+func TestBuildModelServingVLLMPreStopHandlesUnavailableMetrics(t *testing.T) {
+	model := loadYaml[workload.ModelBooster](t, "testdata/input/model.yaml")
+	serving, err := BuildModelServing(model)
+	require.NoError(t, err)
+	require.NotEmpty(t, serving.Spec.Template.Roles)
+
+	var engine *corev1.Container
+	for roleIndex := range serving.Spec.Template.Roles {
+		for containerIndex := range serving.Spec.Template.Roles[roleIndex].EntryTemplate.Spec.Containers {
+			container := &serving.Spec.Template.Roles[roleIndex].EntryTemplate.Spec.Containers[containerIndex]
+			if container.Name == "engine" {
+				engine = container
+				break
+			}
+		}
+		if engine != nil {
+			break
+		}
+	}
+	require.NotNil(t, engine)
+	require.NotNil(t, engine.Lifecycle)
+	require.NotNil(t, engine.Lifecycle.PreStop)
+	require.NotNil(t, engine.Lifecycle.PreStop.Exec)
+	require.Len(t, engine.Lifecycle.PreStop.Exec.Command, 3)
+
+	script := engine.Lifecycle.PreStop.Exec.Command[2]
+	assert.Contains(t, script, "curl -s --max-time 2 http://localhost:8000/metrics")
+	assert.Contains(t, script, `if [ -z "$RUNNING" ]; then`)
+	assert.Contains(t, script, "Metrics endpoint unavailable, exiting preStop")
+	assert.NotContains(t, script, "$ERR")
+}
+
 func TestBuildModelServingSkipEngineDependencyInstall(t *testing.T) {
 	tests := []struct {
 		name              string
