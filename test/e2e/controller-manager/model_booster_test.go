@@ -24,6 +24,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	clientset "github.com/volcano-sh/kthena/client-go/clientset/versioned"
 	workload "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	mbutils "github.com/volcano-sh/kthena/pkg/model-booster-controller/utils"
 	"github.com/volcano-sh/kthena/test/e2e/utils"
@@ -40,7 +41,8 @@ const (
 
 // TestModelCR creates a ModelBooster CR from YAML, waits for it to become active,
 // tests chat functionality, verifies generated child resources and ownership,
-// updates the CR, and verifies cascading deletion.
+// validates self-healing of deleted child resources, updates the CR,
+// and verifies cascading deletion.
 func TestModelCR(t *testing.T) {
 	ctx, kthenaClient, _ := setupControllerManagerE2ETest(t)
 
@@ -97,6 +99,9 @@ func TestModelCR(t *testing.T) {
 	// Record revision label for comparison
 	msRevisionBefore := ms.Labels[mbutils.RevisionLabelKey]
 	require.NotEmpty(t, msRevisionBefore, "ModelServing revision label should be set")
+
+	t.Log("Testing self-healing of child resources")
+	assertModelBoosterChildrenSelfHeal(t, ctx, kthenaClient, model)
 
 	t.Log("Testing update of ModelBooster")
 	require.Eventually(t, func() bool {
@@ -233,42 +238,12 @@ func TestModelCRDisaggregated(t *testing.T) {
 	}, 2*time.Minute, 2*time.Second, "Disaggregated ModelServer should be garbage-collected")
 }
 
-// TestModelBoosterSelfHealing validates that the controller instantly self-heals deleted child resources.
-func TestModelBoosterSelfHealing(t *testing.T) {
-	ctx, kthenaClient, _ := setupControllerManagerE2ETest(t)
-
-	// Load the ModelBooster CR with autoscaling policy from YAML fixture
-	model := utils.LoadYAMLFromFile[workload.ModelBooster](filepath.Join(testDataDir, "ModelBooster-autoscaling.yaml"))
-	model.Namespace = testNamespace
-
-	waitForWebhookReady(t, ctx, kthenaClient, model.Namespace)
-
-	createdModel, err := kthenaClient.WorkloadV1alpha1().ModelBoosters(testNamespace).Create(ctx, model, metav1.CreateOptions{})
-	require.NoError(t, err, "Failed to create Model CR")
-	assert.NotNil(t, createdModel)
-
-	t.Cleanup(func() {
-		if err := kthenaClient.WorkloadV1alpha1().ModelBoosters(testNamespace).Delete(context.Background(), model.Name, metav1.DeleteOptions{}); err != nil {
-			t.Logf("cleanup: failed to delete ModelBooster %s: %v", model.Name, err)
-		}
-	})
-
-	t.Logf("Created Model CR: %s/%s", createdModel.Namespace, createdModel.Name)
-
-	// Wait for the Model to be Active
-	require.Eventually(t, func() bool {
-		m, err := kthenaClient.WorkloadV1alpha1().ModelBoosters(testNamespace).Get(ctx, model.Name, metav1.GetOptions{})
-		if err != nil {
-			return false
-		}
-		return meta.IsStatusConditionPresentAndEqual(m.Status.Conditions,
-			string(workload.ModelStatusConditionTypeActive), metav1.ConditionTrue)
-	}, 5*time.Minute, 5*time.Second, "Model did not become Active")
-
-	t.Log("Model is active. Testing self-healing of ModelServing...")
-
+// assertModelBoosterChildrenSelfHeal verifies that deleting child resources triggers controller recreation.
+func assertModelBoosterChildrenSelfHeal(t *testing.T, ctx context.Context, kthenaClient *clientset.Clientset, model *workload.ModelBooster) {
+	t.Helper()
 	expectedChildName := mbutils.GetBackendResourceName(model.Name, model.Spec.Backend.Name)
 
+	t.Log("Testing self-healing of ModelServing...")
 	servingToDelete, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, expectedChildName, metav1.GetOptions{})
 	require.NoError(t, err, "Expected ModelServing to be generated with deterministic name")
 
@@ -283,8 +258,7 @@ func TestModelBoosterSelfHealing(t *testing.T) {
 		return recreated.UID != servingToDelete.UID
 	}, 1*time.Minute, 2*time.Second, "Controller failed to self-heal deleted ModelServing")
 
-	t.Log("ModelServing was successfully self-healed. Testing ModelServer...")
-
+	t.Log("Testing self-healing of ModelServer...")
 	serverToDelete, err := kthenaClient.NetworkingV1alpha1().ModelServers(testNamespace).Get(ctx, expectedChildName, metav1.GetOptions{})
 	require.NoError(t, err, "Expected ModelServer to be generated with deterministic name")
 
@@ -299,8 +273,7 @@ func TestModelBoosterSelfHealing(t *testing.T) {
 		return recreated.UID != serverToDelete.UID
 	}, 1*time.Minute, 2*time.Second, "Controller failed to self-heal deleted ModelServer")
 
-	t.Log("ModelServer was successfully self-healed. Testing ModelRoute...")
-
+	t.Log("Testing self-healing of ModelRoute...")
 	routeToDelete, err := kthenaClient.NetworkingV1alpha1().ModelRoutes(testNamespace).Get(ctx, model.Name, metav1.GetOptions{})
 	require.NoError(t, err, "Expected ModelRoute to be generated with model name")
 
@@ -314,8 +287,6 @@ func TestModelBoosterSelfHealing(t *testing.T) {
 		}
 		return recreated.UID != routeToDelete.UID
 	}, 1*time.Minute, 2*time.Second, "Controller failed to self-heal deleted ModelRoute")
-
-	t.Log("All child resources self-healed successfully. Test complete.")
 }
 
 func createValidModelBoosterForWebhookTest() *workload.ModelBooster {
