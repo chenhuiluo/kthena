@@ -241,6 +241,24 @@ func parseEnvFloat(key string, fallback float64) float64 {
 // 优先级 = tokenWeight × 用户Token用量 + requestNumWeight × 用户请求次数
 // 值越低 → 优先级越高 → 越先出队 (最近使用少的用户优先服务)
 func (r *Router) calculateRequestPriority(userID, modelName string) float64 {
+	// ──────────────────────────────────────────────────────────
+	// calculateRequestPriority: 公平调度优先级计算
+	//
+	// 原理: 用得越多的用户, 优先级越低 → 避免高频用户饿死低频用户
+	//
+	// 公式 (详见 datastore.CalculateFairnessPriority):
+	//   priority = tokenWeight * normalizedTokenUsage
+	//           + requestNumWeight * normalizedRequestCount
+	//
+	// 其中:
+	//   normalizedTokenUsage  = 用户近1h的Token用量 / 全局平均用量
+	//   normalizedRequestCount = 用户近1h的请求数 / 全局平均请求数
+	//   tokenWeight (默认0.7)  + requestNumWeight (默认0.3) = 1.0
+	//
+	// 返回值含义: 值越小 → 优先级越高 (越先出队)
+	//   未认证用户: math.MaxFloat64 (最低优先级)
+	//   计算失败: 0 (中等优先级, 不惩罚)
+	// ──────────────────────────────────────────────────────────
 	priority, err := datastore.CalculateFairnessPriority(r.store, userID, modelName, r.tokenWeight, r.requestNumWeight)
 	if err != nil {
 		klog.Warningf("failed to calculate fairness priority for user=%s model=%s: %v", userID, modelName, err)
@@ -802,10 +820,31 @@ func (r *Router) proxyModelEndpoint(
 	modelRequest ModelRequest,
 	port int32,
 ) error {
-	// Mark start of upstream processing
+	// ──────────────────────────────────────────────────────────
+	// proxyModelEndpoint: 请求代理的分流枢纽
+	//
+	// 根据 Schedule() 的结果, 将请求分流到两条完全不同的代理路径:
+	//   - ctx.BestPods != nil → 同构/PD聚合模式 (单阶段代理)
+	//     调度器已选出 TopN 候选 Pod, 逐个尝试直到成功;
+	//     这些 Pod 同时承担 prefill + decode, 无需跨 Pod 传输 KV Cache.
+	//   - ctx.BestPods == nil → PD分离模式 (两阶段代理)
+	//     调度器已选出 (DecodePods[], PrefillPods[]) 配对,
+	//     需要由 KV Connector 协调 prefill→decode 的 KV Cache 传输.
+	//
+	// 本函数还承担三个横切关注点:
+	//   1. 构建解码请求: BuildDecodeRequest 将路由别名(如 "gpt-4")替换为基础模型名,
+	//      因为后端推理引擎只认模型文件名, 不认路由别名.
+	//   2. 解析 Token Usage: 从流式/非流式响应中提取 CompletionTokens,
+	//      用于限流计数 (loadRateLimiter) 和公平调度指标 (UpdateTokenCount).
+	//   3. 更新用户配额: UpdateTokenCount 写入滑动窗口计数器,
+	//      影响该用户下次请求在 handleFairnessScheduling 中的优先级.
+	// ──────────────────────────────────────────────────────────
+
+	// [步骤1] 标记上游处理开始时间, 用于 access log 计算上游耗时 (TTFB 等)
 	accesslog.MarkUpstreamStart(c)
 
-	// Get metrics recorder from context
+	// [步骤2] 从 gin.Context 中提取指标记录器 (由中间件注入)
+	// 后续在解析 Token Usage 时, 将输出 token 数写入 Prometheus 指标
 	var metricsRecorder *metrics.RequestMetricsRecorder
 	if recorder, exists := c.Get("metricsRecorder"); exists {
 		if rec, ok := recorder.(*metrics.RequestMetricsRecorder); ok {
@@ -813,50 +852,86 @@ func (r *Router) proxyModelEndpoint(
 		}
 	}
 
-	// proxy to pd aggregated pod
+	// ═══════════ 分支 A: 同构/PD聚合模式 (ctx.BestPods != nil) ═══════════
+	// 调度器返回了 TopN 候选 Pod, 每个都同时运行 prefill + decode,
+	// 无需跨 Pod 传输 KV Cache, 代理逻辑最简单.
 	if ctx.BestPods != nil {
-		// build request
+		// [A-1] 构建解码请求
+		// BuildDecodeRequest 的核心作用: 将请求体中的 model 字段从路由别名
+		// 替换为基础模型名. 例如用户请求 model="gpt-4o-mini",
+		// 但后端 vLLM 只认 "Qwen2.5-72B-Instruct", 不做替换会 404.
 		decodeRequest := connectors.BuildDecodeRequest(c, req, modelRequest)
+
+		// [A-2] 判断是否为流式请求, 决定 proxy 内部的响应转发方式
+		// 流式: 逐行转发 SSE 事件; 非流式: TeeReader 边转发边缓冲解析
 		stream := isStreaming(modelRequest)
 		modelName := ctx.Model
 		userID := c.GetString(common.UserIdKey)
+
+		// [A-3] 调用 proxy 执行实际转发
+		// proxy 内部对 BestPods 逐个尝试, 直到某个 Pod 返回成功响应.
+		// onUsage 回调: 在解析到 Token Usage 时触发, 处理三个横切关注点.
 		err := r.proxy(c, decodeRequest, ctx, stream, port, func(resp handlers.OpenAIResponse) {
+			// onUsage 回调 — 仅在解析到有效 Token Usage 时触发
+			// (流式: 从最后一个 SSE chunk 解析; 非流式: 从完整 JSON 响应解析)
 			if resp.Usage.TotalTokens <= 0 {
 				return
 			}
-			// Record output tokens for rate limiting
+
+			// [横切1] 限流计数: 将输出 token 记入滑动窗口,
+			// 当窗口内 token 数超限时, 后续请求会被 handleFairnessScheduling 排队或降权.
+			// 这是"用得多的用户优先级低"公平调度的数据来源.
 			if r.loadRateLimiter != nil {
 				r.loadRateLimiter.RecordOutputTokens(modelName, resp.Usage.CompletionTokens)
 			}
-			// Update access log with output tokens
+
+			// [横切2] 访问日志: 将输出 token 数写入 access log context,
+			// 便于事后分析每个请求的 token 消耗分布.
 			if accessCtx := accesslog.GetAccessLogContext(c); accessCtx != nil {
 				accessCtx.SetTokenCounts(accessCtx.InputTokens, resp.Usage.CompletionTokens)
 			}
 
-			// Record output token metrics
+			// [横切3] Prometheus 指标: 将输出 token 数记录到指标,
+			// 用于 Grafana 面板展示全局/每模型 token 吞吐量.
 			if metricsRecorder != nil {
-				// Record output tokens
 				metricsRecorder.RecordOutputTokens(resp.Usage.CompletionTokens)
 			}
+
+			// [横切4] 用户配额更新: 将本次请求的 prompt/completion token 数
+			// 累加到该用户+模型的滑动窗口计数器 (默认 1h 窗口).
+			// 这直接影响该用户下次请求在 calculateRequestPriority 中的优先级得分:
+			//   窗口内用量越高 → 优先级越低 → 越可能被排队.
 			if userID == "" || modelName == "" {
 				return
 			}
 			_ = r.store.UpdateTokenCount(userID, modelName, float64(resp.Usage.PromptTokens), float64(resp.Usage.CompletionTokens))
 		})
 
-		// Mark end of upstream processing
+		// [A-4] 标记上游处理结束, 用于 access log 计算总上游耗时
 		accesslog.MarkUpstreamEnd(c)
 		return err
 	}
 
-	// Get appropriate connector for this model server
+	// ═══════════ 分支 B: PD分离模式 (ctx.BestPods == nil) ═══════════
+	// 调度器返回了 (DecodePods, PrefillPods) 配对列表,
+	// 需要由 KV Connector 协调 prefill→decode 的 KV Cache 传输.
+	// 详见 proxyToPDDisaggregated 的注释.
+
+	// [B-1] 获取该 ModelServer 对应的 KV Connector 实例
+	// 不同模型服务可能使用不同的 KV 传输实现 (HTTP/LMCache/MoonCake+NIXL/eBPF).
+	// getKVConnector 根据 ModelServer 的 annotation 选择 connector 类型.
 	kvConnector, err := r.getKVConnector(ctx.ModelServerName)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, fmt.Sprintf("failed to get KV connector: %v", err))
 		return fmt.Errorf("failed to get KV connector: %w", err)
 	}
 
-	// PD disaggregated mode - use KV connector
+	// [B-2] 进入 PD分离代理流程
+	// proxyToPDDisgregated 负责:
+	//   1. 向选中的 PrefillPod 发送 prefill 请求 (含 prompt)
+	//   2. PrefillPod 完成计算后, 通过 KV Connector 将 KV Cache 传给 DecodePod
+	//   3. 向选中的 DecodePod 发送 decode 请求 (接收 KV Cache, 逐 token 生成)
+	// 如果第一对 (decode, prefill) 失败, 依次 fallback 到后续配对.
 	return r.proxyToPDDisaggregated(c, req, ctx, kvConnector, modelRequest, port)
 }
 
@@ -1062,20 +1137,48 @@ func isStreaming(modelRequest ModelRequest) bool {
 //   2. 引擎推断: InferenceEngine == SGLang → ZMQ bootstrap 协议
 //   3. 默认回退: HTTP (通用 NIXL/MoonCake 传输层)
 func (r *Router) getKVConnector(modelServerName types.NamespacedName) (connectors.KVConnector, error) {
+	// ──────────────────────────────────────────────────────────
+	// getKVConnector: 获取 PD 分离场景的 KV Cache 传输连接器
+	//
+	// 背景: PD 分离模式下, prefill Pod 计算完 KV Cache 后,
+	// 需要将 KV Cache 传输到 decode Pod. 不同推理引擎/硬件
+	// 使用不同的传输协议, 因此需要通过此函数选择对应的
+	// KVConnector 实现.
+	//
+	// 选择策略 (优先级从高到低):
+	//   1. 用户显式指定: ModelServer.Spec.KVConnector.Type
+	//      (如 "nixl", "lmcache", "mooncake", "http")
+	//   2. 推理引擎推断: 如果引擎是 SGLang → 自动选 SGLang connector
+	//      (SGLang 使用 ZMQ bootstrap 协议, 要求 prefill/decode 并发)
+	//   3. 兜底默认: HTTP connector
+	//      (最简单的 prefill→decode 顺序调用, 无需特殊硬件支持)
+	//
+	// 5 种 Connector 差异:
+	//   HTTP:    prefill 顺序完成后, 通过 HTTP 传 KV Cache metadata, decode 再拉取
+	//   LMCache: 复用 HTTP connector 逻辑, 但使用 LMCache 库管理 KV Cache 存储层
+	//   MoonCake:使用 MoonCake 传输层 + NIXL 引擎, RDMA 高速传输
+	//   NIXL:   使用 NIXL 引擎直接 RDMA 传输 KV Cache 到共享内存
+	//   SGLang:  prefill + decode 并发启动 (ZMQ bootstrap 要求双方同时在线)
+	// ──────────────────────────────────────────────────────────
+
+	// [步骤1] 从 DataStore 获取 ModelServer CR 对象
 	modelServer := r.store.GetModelServer(modelServerName)
 	if modelServer == nil {
 		return nil, fmt.Errorf("model server %s not found", modelServerName)
 	}
 
-	// Determine connector type from ModelServer CRD.
-	// If kvConnector is explicitly set, use it; otherwise infer from inferenceEngine.
-	connectorType := v1alpha1.ConnectorTypeHTTP
+	// [步骤2] 确定 connector 类型: 显式指定 > 引擎推断 > 默认 HTTP
+	connectorType := v1alpha1.ConnectorTypeHTTP // 兜底: 最通用, 无需 RDMA 等特殊硬件
 	if modelServer.Spec.KVConnector != nil && modelServer.Spec.KVConnector.Type != "" {
+		// 用户在 CR 中显式指定了 connector 类型, 优先使用
 		connectorType = modelServer.Spec.KVConnector.Type
 	} else if modelServer.Spec.InferenceEngine == v1alpha1.SGLang {
+		// SGLang 引擎使用 ZMQ bootstrap 协议, 要求 prefill 和 decode 同时在线
+		// 不能用顺序 HTTP connector, 必须用 SGLang 专用 connector
 		connectorType = connectors.ConnectorTypeSGLang
 	}
 
+	// [步骤3] 从工厂获取对应类型的 connector 实例
 	connector := r.connectorFactory.GetConnector(connectorType)
 	if connector == nil {
 		return nil, fmt.Errorf("failed to get connector %s", connectorType)
@@ -1110,91 +1213,108 @@ func (r *Router) proxyToPDDisaggregated(
 	kvConnector connectors.KVConnector,
 	modelRequest ModelRequest,
 	port int32,
-) error {
-	// Get metrics recorder from context
-	var metricsRecorder *metrics.RequestMetricsRecorder
-	if recorder, exists := c.Get("metricsRecorder"); exists {
-		if rec, ok := recorder.(*metrics.RequestMetricsRecorder); ok {
-			metricsRecorder = rec
-		}
-	}
-
-	modelServerName := fmt.Sprintf("%s/%s", ctx.ModelServerName.Namespace, ctx.ModelServerName.Name)
-
-	// Get model route name from context
-	var modelRouteName string
-	if routeName, exists := c.Get("modelRouteName"); exists {
-		if name, ok := routeName.(string); ok {
-			modelRouteName = name
-		}
-	}
-
-	// Set upstream connection info in metrics recorder
-	if metricsRecorder != nil {
-		metricsRecorder.SetUpstreamConnectionInfo(modelServerName, modelRouteName)
-	}
-
-	// Try multiple prefill/decode pairs
-	maxRetry := len(ctx.DecodePods)
-	if len(ctx.PrefillPods) < maxRetry {
-		maxRetry = len(ctx.PrefillPods)
-	}
-
-	for i := 0; i < maxRetry; i++ {
-		if ctx.PrefillPods[i] == nil || ctx.DecodePods[i] == nil {
-			continue
-		}
-		prefillPod := ctx.PrefillPods[i].GetPod()
-		decodePod := ctx.DecodePods[i].GetPod()
-
-		// Build addresses for prefill and decode pods
-		prefillAddr := net.JoinHostPort(prefillPod.Status.PodIP, strconv.Itoa(int(port)))
-		decodeAddr := net.JoinHostPort(decodePod.Status.PodIP, strconv.Itoa(int(port)))
-
-		klog.V(4).Infof("Attempting PD disaggregated request: prefill=%s, decode=%s", prefillAddr, decodeAddr)
-
-		// Build on-flight hooks so the connector can update the per-pod counters
-		// at the precise point each phase starts and ends.
-		prefillPodName := types.NamespacedName{Namespace: prefillPod.Namespace, Name: prefillPod.Name}
-		decodePodName := types.NamespacedName{Namespace: decodePod.Namespace, Name: decodePod.Name}
-		hooks := &connectors.OnFlightHooks{
-			IncrPrefill: func() { r.store.IncrPodOnFlightRequests(prefillPodName) },
-			DecrPrefill: func() { r.store.DecrPodOnFlightRequests(prefillPodName) },
-			IncrDecode:  func() { r.store.IncrPodOnFlightRequests(decodePodName) },
-			DecrDecode:  func() { r.store.DecrPodOnFlightRequests(decodePodName) },
+	) error {
+		// [步骤1] 获取指标记录器 (与 proxyModelEndpoint 相同)
+		var metricsRecorder *metrics.RequestMetricsRecorder
+		if recorder, exists := c.Get("metricsRecorder"); exists {
+			if rec, ok := recorder.(*metrics.RequestMetricsRecorder); ok {
+				metricsRecorder = rec
+			}
 		}
 
-		// Execute the PD disaggregated proxy operation
-		outputTokens, err := kvConnector.Proxy(c, modelRequest, prefillAddr, decodeAddr, hooks)
+		modelServerName := fmt.Sprintf("%s/%s", ctx.ModelServerName.Namespace, ctx.ModelServerName.Name)
 
-		if err != nil {
-			klog.Errorf("proxy failed for prefill pod %s, decode pod %s: %v",
-				prefillPod.Name, decodePod.Name, err)
-			continue
+		// [步骤2] 获取 ModelRoute 名 (用于 Prometheus 指标标签)
+		var modelRouteName string
+		if routeName, exists := c.Get("modelRouteName"); exists {
+			if name, ok := routeName.(string); ok {
+				modelRouteName = name
+			}
 		}
 
-		// Record output tokens for rate limiting
-		if outputTokens > 0 && r.loadRateLimiter != nil {
-			r.loadRateLimiter.RecordOutputTokens(ctx.Model, outputTokens)
-		}
-
-		// Record output token metrics
+		// [步骤3] 将上游连接信息写入指标记录器
+		// 用于在 Grafana 中按 ModelServer/ModelRoute 维度查看请求延迟分布
 		if metricsRecorder != nil {
-			metricsRecorder.RecordOutputTokens(outputTokens)
+			metricsRecorder.SetUpstreamConnectionInfo(modelServerName, modelRouteName)
 		}
 
-		// Record successful operation in cache
-		r.scheduler.RunPostHooks(ctx, i)
+		// [步骤4] 确定最大重试次数 = min(decodePods数, prefillPods数)
+		// 因为每次重试需要消耗一对 (prefill, decode) Pod, 不能超过任何一侧的可用数量.
+		maxRetry := len(ctx.DecodePods)
+		if len(ctx.PrefillPods) < maxRetry {
+			maxRetry = len(ctx.PrefillPods)
+		}
 
-		klog.V(4).Infof("kv connector run successful for prefill pod %s, decode pod %s, output tokens: %d",
-			prefillPod.Name, decodePod.Name, outputTokens)
+		// [步骤5] 逐对尝试 PD 代理
+		for i := 0; i < maxRetry; i++ {
+			// 跳过空槽位 (调度器可能没有为某个 decode pod 找到配对的 prefill pod)
+			if ctx.PrefillPods[i] == nil || ctx.DecodePods[i] == nil {
+				continue
+			}
+			prefillPod := ctx.PrefillPods[i].GetPod()
+			decodePod := ctx.DecodePods[i].GetPod()
 
-		return nil
+			// [5-1] 构建 prefill 和 decode Pod 的地址 (IP:Port)
+			prefillAddr := net.JoinHostPort(prefillPod.Status.PodIP, strconv.Itoa(int(port)))
+			decodeAddr := net.JoinHostPort(decodePod.Status.PodIP, strconv.Itoa(int(port)))
+
+			klog.V(4).Infof("Attempting PD disaggregated request: prefill=%s, decode=%s", prefillAddr, decodeAddr)
+
+			// [5-2] 构建在途请求计数回调 (OnFlightHooks)
+			// 这些回调会被传入 kvConnector.Proxy(), connector 在以下时机调用:
+			//   IncrPrefill: prefill 请求即将发出前
+			//   DecrPrefill: prefill 请求完成后 (无论成功失败)
+			//   IncrDecode:  decode 请求即将发出前
+			//   DecrDecode:  decode 请求完成后 (无论成功失败)
+			// 这样 least-request 插件能在 Score 阶段看到精确的在途负载,
+			// 避免将请求堆到已经有大量在途请求的 Pod 上.
+			prefillPodName := types.NamespacedName{Namespace: prefillPod.Namespace, Name: prefillPod.Name}
+			decodePodName := types.NamespacedName{Namespace: decodePod.Namespace, Name: decodePod.Name}
+			hooks := &connectors.OnFlightHooks{
+				IncrPrefill: func() { r.store.IncrPodOnFlightRequests(prefillPodName) },
+				DecrPrefill: func() { r.store.DecrPodOnFlightRequests(prefillPodName) },
+				IncrDecode:  func() { r.store.IncrPodOnFlightRequests(decodePodName) },
+				DecrDecode:  func() { r.store.DecrPodOnFlightRequests(decodePodName) },
+			}
+
+			// [5-3] 执行 PD 分离代理
+			// kvConnector.Proxy() 内部封装了三种模式:
+			//   HTTP/NIXL:  顺序执行 prefill → 等待完成 → 发起 decode
+			//   SGLang:     并发执行 prefill + decode (ZMQ bootstrap 要求双方同时在线)
+			//   MoonCake:   使用 MoonCake 传输层, 类似 NIXL 流程
+			// 返回值: outputTokens (本次请求生成的 token 数), 0 表示无法解析
+			outputTokens, err := kvConnector.Proxy(c, modelRequest, prefillAddr, decodeAddr, hooks)
+
+			if err != nil {
+				klog.Errorf("proxy failed for prefill pod %s, decode pod %s: %v",
+					prefillPod.Name, decodePod.Name, err)
+				continue
+			}
+
+			// [步骤6] 成功后处理横切关注点 (与 proxyModelEndpoint 的 onUsage 回调对称)
+			// 限流计数: 将输出 token 记入滑动窗口
+			if outputTokens > 0 && r.loadRateLimiter != nil {
+				r.loadRateLimiter.RecordOutputTokens(ctx.Model, outputTokens)
+			}
+
+			// Prometheus 指标
+			if metricsRecorder != nil {
+				metricsRecorder.RecordOutputTokens(outputTokens)
+			}
+
+			// [步骤7] 执行 PostHooks (如 prefix-cache 插件写入缓存)
+			r.scheduler.RunPostHooks(ctx, i)
+
+			klog.V(4).Infof("kv connector run successful for prefill pod %s, decode pod %s, output tokens: %d",
+				prefillPod.Name, decodePod.Name, outputTokens)
+
+			return nil
+		}
+
+		// [步骤8] 所有配对都失败 → 500
+		c.AbortWithStatusJSON(http.StatusInternalServerError, "all prefill/decode attempts failed")
+		return fmt.Errorf("all prefill/decode attempts failed")
 	}
-
-	c.AbortWithStatusJSON(http.StatusInternalServerError, "all prefill/decode attempts failed")
-	return fmt.Errorf("all prefill/decode attempts failed")
-}
 
 // handleFairnessScheduling 公平调度/会话提升的排队流程
 //
@@ -1212,17 +1332,41 @@ func (r *Router) proxyToPDDisaggregated(
 //   a. NotifyChan 收到信号 → 请求被选中, 执行调度
 //   b. reqCtx.Done() → 超时 (504) 或客户端断连 (503)
 func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequest, requestID string, modelName string) error {
-	// Extract session ID from HTTP header for multi-turn conversation tracking.
+	// ──────────────────────────────────────────────────────────
+	// handleFairnessScheduling: 公平调度/会话提升的排队流程
+	//
+	// 背景: 当多个用户/租户同时发请求, 如果只看 Pod 负载 (least-request),
+	// 高频用户会持续占据所有 GPU 资源, 低频用户被饿死
+	//
+	// 解决方式: 请求先进优先队列排队, 按策略排序后逐个出队执行
+	//   - Fairness: 按用户最近 Token 用量排序, 用得少 → 优先级高 → 先出队
+	//   - SessionBoost: 按 session 亲和排序, 同 session → 优先级高 → 先出队
+	//
+	// 出队后执行 doLoadbalance(), 成功则 MarkSessionRequestCompleted()
+	// 让同 session 的后续请求获得 SessionBoost 优先级提升
+	//
+	// 两种退出方式:
+	//   a. NotifyChan 收到信号 → 请求被选中, 执行调度
+	//   b. reqCtx.Done() → 超时 (504) 或客户端断连 (503)
+	// ──────────────────────────────────────────────────────────
+
+	// [步骤1] 提取 Session ID — 多轮对话的会话标识
+	// Session ID 来自 HTTP Header (由用户或上层网关注入)
+	// 用于 SessionBoost: 同一 session 的后续请求自动获得更高优先级,
+	// 使它们路由到已有该 session KV Cache 的 Pod, 避免冷启动 prefill
 	sessionHeader := r.store.GetSessionIDHeader()
 	var sessionID string
 	if sessionHeader != "" {
 		sessionID = c.Request.Header.Get(sessionHeader)
 	}
-	// Use the request ID from header if available, otherwise fall back to the generated one
+
+	// [步骤2] 确定请求 ID — 优先使用客户端提供的 X-Request-ID
 	if headerReqID := c.Request.Header.Get("X-Request-ID"); headerReqID != "" {
 		requestID = headerReqID
 	}
 
+	// [步骤3] 提取用户 ID — 用于 Fairness 优先级计算
+	// 用户 ID 由 Auth 中间件从 JWT Token 中解析并注入 gin.Context
 	var userId string
 	if userIdVal, ok := c.Get(common.UserIdKey); ok {
 		if s, ok := userIdVal.(string); ok {
@@ -1236,22 +1380,28 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 	klog.V(4).Infof("[FairnessScheduling] incoming request: reqID=%s user=%s model=%s",
 		requestID, userId, modelName)
 
-	// Create request-scoped context that unifies client disconnect and server timeout
+	// [步骤4] 创建请求级上下文 — 统一客户端断连和服务端超时
+	// 超时时间由 Router.queueTimeout 控制 (默认 60s)
 	reqCtx, cancel := context.WithTimeout(c.Request.Context(), r.queueTimeout)
 	defer cancel()
 
+	// [步骤5] 计算排队优先级
+	// 两种模式的优先级策略不同:
+	//   SessionBoost 模式: pri=0, 队列按 session boost 排序 (非数值比较)
+	//   Fairness 模式:     pri=calculateRequestPriority() 计算值
+	//   未认证用户:        pri=MaxFloat64 (最低优先级, 防止饿死认证用户)
 	var pri float64
 	if EnableSessionBoost {
-		// In session-boost mode the queue orders by session boost, not per-user
-		// priority, so skip the token-tracker priority computation entirely.
 		pri = 0
 	} else if userId != "" {
 		pri = r.calculateRequestPriority(userId, modelName)
 	} else {
-		// Assign lowest priority to unauthenticated requests so they don't
-		// starve authenticated users (lower value = higher priority).
 		pri = math.MaxFloat64
 	}
+
+	// [步骤6] 构建请求对象并入队
+	// NotifyChan: 出队信号, 当请求被优先队列选中时关闭
+	// CancelCh:   取消信号, 超时或客户端断连时触发
 	queueReq := &datastore.Request{
 		UserID:      userId,
 		ModelName:   modelName,
@@ -1269,8 +1419,10 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 		return fmt.Errorf("failed to enqueue request: %v", err)
 	}
 
+	// [步骤7] 阻塞等待: 被选中 or 超时/断连
 	select {
 	case <-queueReq.NotifyChan:
+		// [7a] 请求被优先队列选中出队 → 执行实际调度
 		if queueReq.Release != nil {
 			defer queueReq.Release()
 		}
@@ -1278,23 +1430,28 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 			requestID, userId, modelName, queueReq.SessionBoost, time.Since(queueReq.RequestTime))
 		lbErr := r.doLoadbalance(c, modelRequest)
 
-		// After a successful proxy, mark the session request as completed so follow-up
-		// requests from the same session get priority boost for prefix cache. Skip on
-		// failure: a failed request did not warm any backend prefix cache.
+		// [7a-1] 调度成功后标记 session 完成
+		// 这一步是 SessionBoost 的关键: MarkSessionRequestCompleted 会让
+		// 同一 session 的后续请求在下次入队时获得 SessionBoost=true,
+		// 优先级高于所有非 session 请求, 从而路由到已有 KV Cache 的 Pod
+		// 失败时不标记: 因为失败的请求没有预热任何 Pod 的 prefix cache
 		if lbErr == nil && sessionID != "" {
 			r.store.MarkSessionRequestCompleted(modelName, sessionID)
 		}
 		return nil
 	case <-reqCtx.Done():
+		// [7b] 请求在队列中超时或客户端断连
 		if queueReq.Release != nil {
 			queueReq.Release()
 		}
 		if errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+			// 超时: 请求在队列中等待超过 queueTimeout → 504 Gateway Timeout
 			klog.Errorf("[FairnessScheduling] request timed out in queue: reqID=%s sessionID=%s user=%s model=%s timeout=%v",
 				requestID, sessionID, userId, modelName, r.queueTimeout)
 			c.AbortWithStatusJSON(http.StatusGatewayTimeout, "Request processing timed out")
 			return fmt.Errorf("request processing timed out in fairness queue")
 		}
+		// 客户端断连: 请求在等待时客户端已关闭连接 → 503 Service Unavailable
 		klog.V(4).Infof("[FairnessScheduling] request cancelled (client disconnected): reqID=%s sessionID=%s user=%s model=%s",
 			requestID, sessionID, userId, modelName)
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, "Client disconnected while waiting in fairness queue")
