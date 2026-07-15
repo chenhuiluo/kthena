@@ -718,11 +718,18 @@ func (r *Router) proxy(
 
 		if err != nil {
 			klog.Errorf(" pod request error: %v", err)
+			// Only a 5xx increments the counter; 4xx/transport errors leave it unchanged
+			var httpErr interface{ Code() int }
+			if errors.As(err, &httpErr) && httpErr.Code() >= 500 {
+				r.store.RecordPodProxyResult(podName, true)
+			}
 			if c.Writer.Written() {
 				return err
 			}
 			continue
 		}
+		// Success resets the pod's consecutive-5xx counter.
+		r.store.RecordPodProxyResult(podName, false)
 		// record in prefix cache
 		r.scheduler.RunPostHooks(ctx, i)
 		return nil
@@ -936,6 +943,19 @@ func proxyRequest(
 	return nil
 }
 
+// http5xxError wraps an upstream 5xx response for circuit-breaking
+type http5xxError struct{ code int }
+
+// Error returns the diagnostic message
+func (e *http5xxError) Error() string {
+	return fmt.Sprintf("upstream returned HTTP %d", e.code)
+}
+
+// Code returns the wrapped upstream HTTP status code (500-599)
+func (e *http5xxError) Code() int {
+	return e.code
+}
+
 func doRequest(
 	req *http.Request,
 	podIP string,
@@ -952,6 +972,10 @@ func doRequest(
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		resp.Body.Close()
+		// Wrap 5xx for circuit-breaking; 4xx/other non-2xx stay a plain error
+		if resp.StatusCode >= 500 {
+			return nil, &http5xxError{code: resp.StatusCode}
+		}
 		return nil, fmt.Errorf("http resp error, http code is %d", resp.StatusCode)
 	}
 	return resp, nil
@@ -1059,6 +1083,12 @@ func (r *Router) proxyToPDDisaggregated(
 		if err != nil {
 			klog.Errorf("proxy failed for prefill pod %s, decode pod %s: %v",
 				prefillPod.Name, decodePod.Name, err)
+			// Attribute a 5xx to both pods (cannot tell which side failed); success resets both
+			var httpErr interface{ Code() int }
+			if errors.As(err, &httpErr) && httpErr.Code() >= 500 {
+				r.store.RecordPodProxyResult(prefillPodName, true)
+				r.store.RecordPodProxyResult(decodePodName, true)
+			}
 			continue
 		}
 
@@ -1071,6 +1101,10 @@ func (r *Router) proxyToPDDisaggregated(
 		if metricsRecorder != nil {
 			metricsRecorder.RecordOutputTokens(outputTokens)
 		}
+
+		// Success resets both pods' consecutive-5xx counters.
+		r.store.RecordPodProxyResult(prefillPodName, false)
+		r.store.RecordPodProxyResult(decodePodName, false)
 
 		// Record successful operation in cache
 		r.scheduler.RunPostHooks(ctx, i)
