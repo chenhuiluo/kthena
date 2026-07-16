@@ -1329,8 +1329,8 @@ func TestModelRouteLoraShared(t *testing.T, testCtx *routercontext.RouterTestCon
 		require.NoError(t, err, "Failed to read response body")
 
 		// Non-existent LoRA adapter should return 404
-		assert.Equal(t, http.StatusNotFound, resp.StatusCode, "Expected HTTP 404 status code for non-existent LoRA adapter")
-		assert.Contains(t, string(body), "route not found", "Expected route-not-found response body")
+		require.Equal(t, http.StatusNotFound, resp.StatusCode, "Expected HTTP 404 status code for non-existent LoRA adapter")
+		require.Contains(t, string(body), "route not found", "Expected route-not-found response body")
 		t.Logf("Non-existent adapter error handling verified: StatusCode=%d, Response=%s", resp.StatusCode, body)
 	})
 
