@@ -165,7 +165,6 @@ func (s *SchedulerImpl) Schedule(ctx *framework.Context, pods []*datastore.PodIn
 				continue
 			}
 
-
 			selectedPods, err = s.RunFilterPlugins(selectedPods, ctx)
 			if err != nil {
 				klog.V(4).InfoS("prefill pods were filtered out", "decode instance", decodePodName, "error", err)
@@ -190,7 +189,6 @@ func (s *SchedulerImpl) Schedule(ctx *framework.Context, pods []*datastore.PodIn
 
 		return nil
 	}
-
 
 	pods, err := s.RunFilterPlugins(pods, ctx)
 	if err != nil {
