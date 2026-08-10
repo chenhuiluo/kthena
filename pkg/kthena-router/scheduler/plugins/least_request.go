@@ -28,6 +28,25 @@ import (
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/framework"
 )
 
+// =============================================================================
+// least-request 插件 — 唯一同时实现 Score + Filter 的插件, 核心是"按在途负载分发请求"
+// =============================================================================
+//
+// 【为什么用 onFlight 而非 running】
+//   running:  引擎上报的正在执行请求数, 来自 /metrics 采集 — 有 ~1s 轮询延迟。
+//   onFlight: router 自己记录的已分发但未收到响应的请求数, 零延迟更新。
+//   高负载下 1s 延迟足以让队列堆积, 故打分以 onFlight 为主, running 仅用于估算"排队量"。
+//
+// 【跨 router 的 onFlight 同步】
+//   router 通常多副本, 各副本只知道自己分发的请求。least-request 启用时,
+//   scheduler.Schedule() 开头会 syncOnFlight 从 Redis 同步全局在途计数,
+//   保证各副本看到一致的负载视图。见 scheduler_impl.go 的 syncOnFlight 字段。
+//
+// 【Filter vs Score】
+//   Filter: 队列深度(waiting) >= maxWaitingRequests 的 Pod 直接剔除 (硬门槛, 引擎已积压)
+//   Score:  onFlight 越少分越高, 且对"已分发但引擎未执行"(onFlight-running) 的排队强烈惩罚
+// =============================================================================
+
 const LeastRequestPluginName = "least-request"
 
 var _ framework.ScorePlugin = &LeastRequest{}
@@ -75,6 +94,14 @@ func (l *LeastRequest) Filter(ctx *framework.Context, pods []*datastore.PodInfo)
 	})
 }
 
+// Score 公式: base = onFlight + 100 × max(onFlight - running, 0), 越小分越高(归一化到[0,100])
+//
+//   - onFlight: router 自记录的在途请求(已分发未响应), 零延迟更新,
+//     充当当前 Pod 负载的实时代理, 避开引擎 /metrics ~1s 轮询延迟。
+//   - max(onFlight - running, 0): 估算"已分发但引擎还没开始执行"的排队请求数。
+//     ×100 强烈惩罚队列正在堆积的 Pod — 这种 Pod 已经是瓶颈, 不应再往它塞请求。
+//   - 归一化: (maxScore - base)/maxScore × 100, 负载最低的 Pod 得 100 分。
+//   - running 的 ~1s 延迟可能短暂高估排队量, 但作为"队列堆积的前瞻信号"可接受。
 func (l *LeastRequest) Score(ctx *framework.Context, pods []*datastore.PodInfo) map[*datastore.PodInfo]int {
 	scoreResults := make(map[*datastore.PodInfo]int)
 	if len(pods) == 0 {

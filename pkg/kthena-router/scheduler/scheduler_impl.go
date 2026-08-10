@@ -298,7 +298,6 @@ func (s *SchedulerImpl) Schedule(ctx *framework.Context, pods []*datastore.PodIn
 //   kthena-router:    每个 Filter 插件接收完整 Pod 列表，批量过滤后返回新列表 (更高效)
 //
 // 过滤规则: 任一 Filter 返回的 Pod 列表不包含某 Pod → 该 Pod 被剔除
-// 过滤规则: 任一 Filter 返回的 Pod 列表不包含某 Pod → 该 Pod 被剔除
 // 如果某个 Filter 把所有 Pod 都过滤掉了,直接返回错误 (避免后续无 Pod 可调度)
 //
 // 执行顺序: 按 filterPlugins 数组顺序 (即 ConfigMap 中的配置顺序)
@@ -332,10 +331,6 @@ func (s *SchedulerImpl) RunFilterPlugins(pods []*datastore.PodInfo, ctx *framewo
 //
 //   kube-scheduler:   ScorePlugin.Score() → NormalizeScore() → × weight → 加权总分
 //   kthena-router:    ScorePlugin.Score() (已含归一化到 [0,100]) → × weight → 加权总分
-//
-// 打分公式:
-//   finalScore(pod) = Σ plugin_i.Score(ctx, pods)[pod] × weight_i
-//
 //
 // 打分公式:
 //   总分[pod] = Σ (plugin.Score(ctx, pods)[pod] × plugin.Weight)

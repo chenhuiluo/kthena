@@ -169,6 +169,18 @@ func matchRatio(matched, total int) float64 {
 	return float64(matched) / float64(total)
 }
 
+// Score 对每个候选 Pod 打 prefix-cache 命中分 [0,100]。
+//
+// 原理: prompt 被切成固定块(默认64字节), 每块算一个滚动哈希(见 hashPrompt)。
+// 哈希链的特性 — 命中第 k 个哈希就保证前 k 块全部相同(前缀匹配)。
+// store.FindTopMatches 返回每个 Pod 最长匹配到第几个块(matchLen), 不匹配的 Pod 不在 map 里。
+//
+// 打分公式: score = matchLen / totalHashes × 100
+//   即"Pod 缓存住的前缀占 prompt 总块数的比例"。完全命中=100, 不命中=0。
+//   越高分 → 该 Pod 越可能已缓存这个 prompt 的前缀, 调度过去能省 prefill 计算。
+//
+// 副作用: 把 hashes 写回 ctx.Hashes, 供 PostSchedule 阶段把本次 prompt 哈希写入缓存。
+//   这样下次同前缀请求来时, 这个 Pod 就能命中(正反馈)。
 func (p *PrefixCache) Score(ctx *framework.Context, pods []*datastore.PodInfo) map[*datastore.PodInfo]int {
 	// Hash the prompt
 	hashes := p.hashPrompt(ctx.Model, utils.GetPromptString(ctx.Prompt))
@@ -189,37 +201,47 @@ func (p *PrefixCache) Score(ctx *framework.Context, pods []*datastore.PodInfo) m
 	for _, pod := range pods {
 		nsName := pod.GetPodNamespacedName()
 		if matchLen, ok := matchByName[nsName]; ok {
+			// 命中: 按匹配块数占比打分
 			scoreResults[pod] = int((float64(matchLen) / float64(totalHashes)) * 100)
 			if matchLen > longestMatch {
 				longestMatch = matchLen
 			}
 		} else {
+			// 未命中: 0 分
 			scoreResults[pod] = 0
 		}
 	}
 
 	if ctx.MetricsRecorder != nil {
-		// Fraction of the prompt's blocks the best-matching pod had cached; 0 on a miss.
+		// 记录最佳匹配 Pod 的命中率指标 (longestMatch/total), 0 表示完全 miss
 		ctx.MetricsRecorder.RecordPrefixCacheMatchRatio(matchRatio(longestMatch, totalHashes))
 	}
 
 	return scoreResults
 }
 
+// PostSchedule 在请求代理成功后, 把本次 prompt 的哈希链写入缓存 (正反馈)。
+//
+// 为什么需要: Score 只读缓存判命中, 但新 prompt 的哈希不会被任何 Pod 记住。
+// 必须在请求实际打到某 Pod 后, 把这个 prompt 的哈希"记到"该 Pod 名下,
+// 下次同前缀的请求来时 Score 就能命中该 Pod。
+//
+// index 是本次代理在 TopN 列表中的位置:
+//   同构: ctx.BestPods[index] 是实际承接请求的 Pod
+//   PD分离: ctx.DecodePods[index] + ctx.PrefillPods[index] 都要记 (decode/prefill 各自缓存)
 func (p *PrefixCache) PostSchedule(ctx *framework.Context, index int) {
 	if ctx.BestPods != nil {
-		// Add the best pod to the cache
+		// 同构模式: 把本次 prompt 哈希链记到实际承接的 Pod 名下
 		p.store.Add(ctx.Model, ctx.Hashes, ctx.BestPods[index])
 		return
 	}
 
+	// PD 分离模式: decode 和 prefill 分别记录 (各自可能缓存不同部分的前缀)
 	if index < len(ctx.DecodePods) && ctx.DecodePods[index] != nil && len(ctx.Hashes) > 0 {
-		// Add the selected pod and its hashes to the cache
 		p.store.Add(ctx.Model, ctx.Hashes, ctx.DecodePods[index])
 	}
 
 	if index < len(ctx.PrefillPods) && ctx.PrefillPods[index] != nil && len(ctx.Hashes) > 0 {
-		// Add the selected pod and its hashes to the cache
 		p.store.Add(ctx.Model, ctx.Hashes, ctx.PrefillPods[index])
 	}
 }

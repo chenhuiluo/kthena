@@ -23,6 +23,39 @@ with Redis-based distributed coordination.
 
 For detailed design documentation, architecture overview, and implementation details,
 see: docs/proposal/kvcache-aware-plugin-design.md
+
+=============================================================================
+中文说明 — kvcache-aware 插件设计
+=============================================================================
+
+【与 prefix-cache 的区别】
+  维度        prefix-cache              kvcache-aware
+  ──────      ──────────────            ──────────────────
+  匹配粒度    字节级 (prompt 切 64 字节块)  token 级 (tokenize 后切 16 token 块)
+  哈希算法    xxhash 滚动哈希链          SHA-256 独立块哈希
+  缓存存储    本地 LRU (单 router 副本)   Redis (跨 router 副本共享)
+  代价        极轻 (无网络/无 tokenize)   较重 (需远程 tokenize + Redis 查询)
+  精度        粗 (字节相同≠token 相同)     精 (token 相同=KV cache 真命中)
+
+  两者并存: prefix-cache 轻量兜底, kvcache-aware 精确但重 — 权重可配。
+
+【Score 主流程】
+  1. tokenize: 调用远程 Pod 的 /tokenize 端点, 把 prompt 转 token 序列
+     (vllm 端口 8000, sglang 端口 30000, 按 Pod 引擎类型选)
+  2. 分块哈希: tokens 按 blockSize(默认16) 切块, 每块算 SHA-256 取 63 位正整数
+     最多 maxBlocksToMatch(默认128) 块
+  3. Redis 查询: 用 pipeline 批量查每个块哈希 → 哪些 Pod 缓存了该块
+     key: "matrix:kv:block:{model}@{hash}", field: "pod-name.namespace", value: 时间戳
+  4. 前缀匹配: 从第 0 块开始, 要求 Pod 连续命中前缀块 — 任一块断链则该 Pod 出局
+     (与 prefix-cache 同理: 命中第 k 块保证前 k 块都命中)
+  5. 打分: score = 连续命中块数 / 总块数 × 100
+
+【GC 机制】
+  Redis 字段记录的是 Pod 最后缓存该块的时间戳。startGC 起一个后台 goroutine,
+  每小时 SCAN 一批 key, 删除超过 kvCacheFieldFreshDuration(24h) 未更新的 field。
+  原因: Pod 重启/下线后其缓存失效, 旧 field 会污染匹配结果, 必须定期清理。
+
+=============================================================================
 */
 
 package plugins
@@ -185,13 +218,36 @@ func (t *KVCacheAware) Name() string {
 	return t.name
 }
 
+// normalizeAndTokenizePrompt 把 prompt 文本 tokenize 成 token 序列。
+//
+// 【token 是怎么来的 — 完整链路】
+//   本函数 → tokenizerManager.TokenizePrompt(model, prompt, pods)
+//         → 从候选 pods 里随机选一个可用 Pod (避免单 Pod 压力)
+//         → 按 Pod 的推理引擎类型(vllm/sglang)选对应 adapter
+//         → HTTP POST 到该 Pod 的 /tokenize 端点:
+//             vllm:   http://{podIP}:8000/tokenize   (defaultVLLMTokenizerPort)
+//             sglang: http://{podIP}:30000/tokenize  (defaultSGLangTokenizerPort)
+//         → 请求体: {"model": model, "prompt": prompt文本}
+//         → 响应体: {"tokens": [token_id1, token_id2, ...]} (uint32 序列)
+//         → 返回 []uint32
+//
+//   为什么用远程 tokenize 而非本地分词器:
+//     本地需为每个模型加载 tokenizer 文件(几百MB), 多模型时内存爆炸;
+//     推理 Pod 本就有 tokenizer, 复用其 /tokenize 端点零成本、且与引擎实际分词一致。
+//   代价: 一次 HTTP 往返 (~ms 级), 有 retry(见 tokenization/remote_client.go)。
 func (t *KVCacheAware) normalizeAndTokenizePrompt(ctx *framework.Context, pods []*datastore.PodInfo) ([]uint32, error) {
 	if t.tokenizerManager == nil {
 		return nil, fmt.Errorf("tokenizer manager not available")
 	}
+	// 真正的 tokenize 发生在这行: 远程调用某个候选 Pod 的 /tokenize
 	return t.tokenizerManager.TokenizePrompt(ctx.Model, ctx.Prompt, pods)
 }
 
+// Score 对每个候选 Pod 打 KV cache 前缀命中分 [0,100]。
+//
+// 完整链路: tokenize(远程Pod /tokenize) → 分块SHA-256哈希 → Redis pipeline 查各块缓存Pod
+//          → 前缀连续匹配 → score = 连续命中块数/总块数 × 100
+// 任一步失败(无Redis/tokenize失败)返回 nil, 不参与本次打分 (不影响其他插件)
 func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) map[*datastore.PodInfo]int {
 	scoreStart := time.Now()
 	if ctx == nil || ctx.Prompt == nil {
@@ -212,6 +268,8 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 		return nil
 	}
 
+	// ===== 阶段 1: tokenize — 远程调用 Pod 的 /tokenize 把 prompt 转 token 序列 =====
+	// tokens 即 token id 序列 (如 [1234, 5678, 9012, ...]), 每个数对应模型词表里的一个 token
 	start := time.Now()
 	tokens, err := t.normalizeAndTokenizePrompt(ctx, pods)
 	tokenizerDuration := time.Since(start)
@@ -232,6 +290,8 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 		return nil
 	}
 
+	// ===== 阶段 2: 分块 + SHA-256 哈希 — tokens 切成 blockSize(默认16) 的块, 每块算一个哈希 =====
+	// blockHashes 是一个 []uint64, 每个元素代表一个 token 块的指纹, 最多 maxBlocksToMatch(128) 个
 	blockHashes := t.processor.TokensToBlockHashes(tokens, t.maxBlocksToMatch)
 	klog.V(4).Infof("KVCacheAware.Score: generated %d block hashes from %d tokens (blockSize=%d)",
 		len(blockHashes), len(tokens), t.processor.blockSize)
@@ -240,6 +300,8 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 		return nil
 	}
 
+	// ===== 阶段 3: Redis pipeline 查询 — 查每个块哈希被哪些 Pod 缓存过 =====
+	// blockToPods: map[blockHash]→[]podName, 即"哪些 Pod 的 KV cache 里有这个 token 块"
 	redisStart := time.Now()
 	blockToPods, err := t.queryRedisForBlocks(blockHashes, ctx.Model)
 	redisDuration := time.Since(redisStart)
@@ -257,10 +319,12 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 		ctx.MetricsRecorder.RecordKVCacheRedisDuration(redisDuration)
 	}
 
+	// ===== 阶段 4: 候选 Pod 过滤 — Redis 返回的 Pod 可能已不在本次候选列表, 只保留当前候选 Pod =====
 	candidateNames := make(map[string]struct{}, len(pods))
 	for _, p := range pods {
 		candidateNames[p.GetPodNamespacedName().Name] = struct{}{}
 	}
+	// 对每个 block 的 pod 列表做交集过滤: 只保留仍是本次候选的 Pod
 	for hash, podNames := range blockToPods {
 		kept := podNames[:0]
 		for _, name := range podNames {
@@ -292,8 +356,13 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 	return scoreResults
 }
 
-// queryRedisForBlocks queries Redis to find which pods have cached the given token block hashes
-// Returns a map from block hash to list of pod names that have cached that block
+// queryRedisForBlocks 查询哪些 Pod 缓存了给定的 token 块哈希。
+// 用 Redis pipeline 批量 HKeys(每个块哈希一个 key), 一次网络往返查全部块,
+// 避免逐块查询的 N 次 RTT。返回 map[blockHash]→[]podName。
+//
+// Redis 数据结构: key="matrix:kv:block:{model}@{hash}", 是个 hash,
+//   field = "pod-name.namespace", value = 时间戳(Pod 最后缓存该块的 Unix 时间)。
+// HKeys 只取 field 名(即 Pod 列表), 不取 value(时间戳由 GC 用)。
 func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName string) (map[uint64][]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -345,6 +414,8 @@ func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName strin
 	return blockToPods, nil
 }
 
+// startGC 启动后台 GC goroutine (Redis client 为 nil 则跳过)。
+// GC 定期清理 Redis 中过期的 Pod field, 避免已下线/重启 Pod 的旧缓存污染匹配结果。
 func (t *KVCacheAware) startGC() {
 	if t.redisClient == nil {
 		return
@@ -352,6 +423,7 @@ func (t *KVCacheAware) startGC() {
 	go t.runGC()
 }
 
+// runGC 每小时触发一次 gcStaleFields, 用游标增量扫描避免阻塞 Redis。
 func (t *KVCacheAware) runGC() {
 	ticker := time.NewTicker(kvCacheGCInterval)
 	defer ticker.Stop()
@@ -360,6 +432,11 @@ func (t *KVCacheAware) runGC() {
 	}
 }
 
+// gcStaleFields 增量扫描 Redis key, 删除超过 kvCacheFieldFreshDuration(24h) 未更新的 field。
+//   SCAN 用游标(gcCursor)每次扫 kvCacheGCScanSize(100) 个 key, 跨次调用推进游标, 最终遍历全库。
+//   对每个 key HGetAll 取所有 field(pod→timestamp), 时间戳超 24h 的收集起来批量删除。
+//   原因: Pod 重启后其 KV cache 清空, 但 Redis 里旧的 "pod→block" 记录还在,
+//   会误导 Score 把请求路由到已无缓存的 Pod, 故必须定期清理。
 func (t *KVCacheAware) gcStaleFields() {
 	if t.redisClient == nil {
 		return
@@ -395,6 +472,8 @@ func (t *KVCacheAware) gcStaleFields() {
 	}
 }
 
+// deleteStaleFields 用 Redis pipeline 批量删除各 key 下的过期 field (HDel)。
+// 按 key 分组, 一次 pipeline 提交所有删除, 减少网络往返。
 func (t *KVCacheAware) deleteStaleFields(staleFields map[string][]string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -408,6 +487,8 @@ func (t *KVCacheAware) deleteStaleFields(staleFields map[string][]string) {
 	}
 }
 
+// extractPodNameFromIdentifier 从 "pod-name.namespace" 格式取 pod-name 部分。
+// Redis field 存的是 "pod-name.namespace", 匹配候选 Pod 时只需 pod-name。
 func extractPodNameFromIdentifier(podIdentifier string) string {
 	if idx := strings.IndexByte(podIdentifier, '.'); idx >= 0 {
 		return podIdentifier[:idx]
@@ -415,7 +496,15 @@ func extractPodNameFromIdentifier(podIdentifier string) string {
 	return podIdentifier
 }
 
-// calculatePodScores returns per-pod scores and the longest block match length (used for the match_ratio metric).
+// calculatePodScores 做前缀连续匹配并打分, 返回每个 Pod 的分数 + 最长匹配块数(供命中率指标)。
+//
+// 匹配规则(与 prefix-cache 同理):
+//   - 第 0 块: 缓存了该块的 Pod 入 activePods, 起始分 1
+//   - 第 i 块: activePods 与该块缓存 Pod 取交集, 交集里的 Pod matchLen++ 仍 active;
+//     交集为空或某块无 Pod 缓存 → 前缀断链, 停止
+//   - score = matchLen / totalBlocks × 100
+//
+// 即"Pod 连续命中从第 0 块开始的前缀块数占比" — 命中第 k 块保证前 k 块都命中(KV cache 前缀特性)。
 func (t *KVCacheAware) calculatePodScores(blockHashes []uint64, blockToPods map[uint64][]string) (map[string]int, int) {
 	podScores := make(map[string]int)
 
@@ -484,21 +573,32 @@ func (t *KVCacheAware) calculatePodScores(blockHashes []uint64, blockToPods map[
 	return podScores, longestMatch
 }
 
+// TokensToBlockHashes 把 token 序列转成块哈希序列: tokens → chunks → hashes。
+// 两步: chunkTokens(按 blockSize 切块) → computeBlockHashes(每块 SHA-256)。
+// 返回 []uint64, 每个元素是一个 token 块的指纹, 长度 = min(块数, maxBlocks)。
 func (tbp *TokenBlockProcessor) TokensToBlockHashes(tokens []uint32, maxBlocks int) []uint64 {
 	if len(tokens) == 0 {
 		klog.V(4).Infof("KVCacheAware.TokensToBlockHashes: no tokens provided")
 		return nil
 	}
 
+	// 第一步: token 序列切成 blockSize 大小的块 (最后一块可能不足 blockSize)
 	chunks := tbp.chunkTokens(tokens, maxBlocks)
+	// 第二步: 每块算 SHA-256, 取前 8 字节为 uint64, 清 MSB 保证正数
 	hashes := tbp.computeBlockHashes(chunks)
 	klog.V(4).Infof("KVCacheAware.TokensToBlockHashes: %d tokens -> %d chunks -> %d hashes (blockSize=%d, maxBlocks=%d)",
 		len(tokens), len(chunks), len(hashes), tbp.blockSize, maxBlocks)
 	return hashes
 }
 
-// computeStandardizedHash generates a consistent hash for token sequences using SHA-256
-// Returns a 63-bit positive integer for Redis/database compatibility
+// computeStandardizedHash 对一个 token 块(token id 序列)算 SHA-256, 返回 63 位正整数。
+//
+//   为什么用 SHA-256 而非 xxhash(如 prefix-cache):
+//     kvcache-aware 跨 Pod/跨 router 共享 Redis, 不同 Pod 的 tokenizer 可能不同(token id 不同),
+//     但"相同 token 块"的 SHA-256 必须一致才能命中。SHA-256 确定性 + 抗碰撞, 适合做共享缓存键。
+//   为什么清 MSB(最高位):
+//     Redis 的 hash field/value 是字符串, 负数会带 '-' 前缀导致排序/比较混乱,
+//     清 MSB 保证 uint64 正数, 字符串形式干净。
 func computeStandardizedHash(tokenIds []uint32) uint64 {
 	if len(tokenIds) == 0 {
 		return 0
@@ -520,22 +620,27 @@ func computeStandardizedHash(tokenIds []uint32) uint64 {
 	return result
 }
 
+// chunkTokens 把 token 序列切成 blockSize 大小的块 (最后一块可能不足 blockSize)。
+// 块数上限 maxBlocks, 超出则截断 (只取前 maxBlocks 块, 即 prompt 前缀部分)。
+// 例: 200 tokens, blockSize=16, maxBlocks=128 → 13 块 (前 12 块各 16, 末块 8)
 func (tbp *TokenBlockProcessor) chunkTokens(tokens []uint32, maxBlocks int) [][]uint32 {
-	numBlocks := (len(tokens) + tbp.blockSize - 1) / tbp.blockSize
+	numBlocks := (len(tokens) + tbp.blockSize - 1) / tbp.blockSize // 向上取整的块数
 	if numBlocks > maxBlocks {
-		numBlocks = maxBlocks
+		numBlocks = maxBlocks // 超上限截断
 	}
 	chunks := make([][]uint32, 0, numBlocks)
 	for i := 0; i < len(tokens) && len(chunks) < maxBlocks; i += tbp.blockSize {
 		end := i + tbp.blockSize
 		if end > len(tokens) {
-			end = len(tokens)
+			end = len(tokens) // 末块不足 blockSize, 截到实际长度
 		}
 		chunks = append(chunks, tokens[i:end])
 	}
 	return chunks
 }
 
+// computeBlockHashes 对每个 token 块调用 computeStandardizedHash, 得到块哈希序列。
+// 输入 chunks(每块 []uint32), 输出 []uint64(每块一个哈希)。
 func (tbp *TokenBlockProcessor) computeBlockHashes(chunks [][]uint32) []uint64 {
 	hashes := make([]uint64, len(chunks))
 	for i, chunk := range chunks {
