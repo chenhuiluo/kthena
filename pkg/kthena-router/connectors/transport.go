@@ -44,7 +44,18 @@ func (b *cancelOnClose) Close() error {
 	return err
 }
 
-func roundTrip(req *http.Request, timeout time.Duration) (*http.Response, error) {
+// upstreamRoundTripper returns the per-ModelServer transport stashed on the
+// gin context, falling back to the shared upstreamTransport when none is set.
+func upstreamRoundTripper(c *gin.Context) http.RoundTripper {
+	if v, ok := c.Get(common.UpstreamTransportKey); ok {
+		if rt, ok := v.(*http.Transport); ok && rt != nil {
+			return rt
+		}
+	}
+	return upstreamTransport
+}
+
+func roundTrip(req *http.Request, timeout time.Duration, rt http.RoundTripper) (*http.Response, error) {
 	// Stop the timeout after response headers so long-running streams can finish.
 	cancel := context.CancelFunc(func() {})
 	if timeout > 0 {
@@ -55,7 +66,7 @@ func roundTrip(req *http.Request, timeout time.Duration) (*http.Response, error)
 		req = req.WithContext(ctx)
 	}
 
-	resp, err := upstreamTransport.RoundTrip(req)
+	resp, err := rt.RoundTrip(req)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -66,8 +77,8 @@ func roundTrip(req *http.Request, timeout time.Duration) (*http.Response, error)
 	return resp, nil
 }
 
-func prefillerProxy(_ *gin.Context, req *http.Request, timeout time.Duration) error {
-	resp, err := roundTrip(req, timeout)
+func prefillerProxy(req *http.Request, timeout time.Duration, rt http.RoundTripper) error {
+	resp, err := roundTrip(req, timeout, rt)
 	if err != nil {
 		return fmt.Errorf("prefill request failed: %w", err)
 	}
@@ -81,8 +92,8 @@ func prefillerProxy(_ *gin.Context, req *http.Request, timeout time.Duration) er
 	return nil
 }
 
-func decoderProxy(c *gin.Context, req *http.Request, timeout time.Duration) (int, error) {
-	resp, err := roundTrip(req, timeout)
+func decoderProxy(c *gin.Context, req *http.Request, timeout time.Duration, rt http.RoundTripper) (int, error) {
+	resp, err := roundTrip(req, timeout, rt)
 	if err != nil {
 		return 0, fmt.Errorf("decode request failed: %w", err)
 	}

@@ -36,6 +36,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 	// Group=networking.serving.volcano.sh, Version=v1alpha1
 	case v1alpha1.SchemeGroupVersion.WithKind("BodyMatch"):
 		return &networkingv1alpha1.BodyMatchApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("ConnectionPool"):
+		return &networkingv1alpha1.ConnectionPoolApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ExternalModelProvider"):
 		return &networkingv1alpha1.ExternalModelProviderApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ExternalModelProviderSpec"):

@@ -402,7 +402,7 @@ func TestNIXLPrefillTimeoutIncludesResponseBody(t *testing.T) {
 
 	connector := NewNIXLConnector().(*NIXLConnector)
 	start := time.Now()
-	_, err = connector.prefill(req, server.Listener.Addr().String(), 100*time.Millisecond)
+	_, err = connector.prefill(req, server.Listener.Addr().String(), 100*time.Millisecond, upstreamTransport)
 	if err == nil {
 		t.Fatal("prefill succeeded after response body stalled")
 	}

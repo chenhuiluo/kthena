@@ -18,6 +18,7 @@ package webhook
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
@@ -26,6 +27,8 @@ import (
 
 	networkingv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 )
+
+func ptrInt32(v int32) *int32 { return &v }
 
 func TestValidateModelRoute(t *testing.T) {
 	weight0 := uint32(0)
@@ -814,6 +817,68 @@ func TestValidateModelServer(t *testing.T) {
 			},
 			expectValid:    false,
 			expectedReason: "validation failed:   - spec.workloadSelector.pdGroup.groupKey: Required value: groupKey must be specified  - spec.workloadSelector.pdGroup.prefillLabels: Required value: labels must contain at least one label  - spec.workloadSelector.pdGroup.decodeLabels: Required value: labels must contain at least one label",
+		},
+		{
+			name: "valid model server with connection pool",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-server", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "test-server"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							MaxIdleConnections:        ptrInt32(100),
+							MaxIdleConnectionsPerHost: ptrInt32(64),
+							MaxConnectionsPerHost:     ptrInt32(0),
+							IdleTimeout:               &metav1.Duration{Duration: 90 * time.Second},
+						},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			name: "invalid connection pool - negative max idle per host",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-server", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "test-server"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							MaxIdleConnectionsPerHost: ptrInt32(-1),
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.trafficPolicy.connectionPool.maxIdleConnectionsPerHost: Invalid value: -1: must be non-negative",
+		},
+		{
+			name: "invalid connection pool - non-positive idle timeout",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-server", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "test-server"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							IdleTimeout: &metav1.Duration{Duration: 0},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.trafficPolicy.connectionPool.idleTimeout: Invalid value: 0: must be a positive duration",
 		},
 	}
 

@@ -81,6 +81,7 @@ func (s *SGLangConnector) Name() string {
 // The decode request carries bootstrap_host = prefillHost so the decode receiver can
 // locate the prefill's bootstrap server; both requests carry the same bootstrap_room.
 func (s *SGLangConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, timeout time.Duration, hooks *OnFlightHooks) (int, error) {
+	rt := upstreamRoundTripper(c)
 	// A bootstrap room identifies one prefill/decode attempt. Generate it here
 	// so retries cannot observe state left behind by an earlier worker pair.
 	bootstrapRoom := s.newBootstrapRoom()
@@ -162,7 +163,7 @@ func (s *SGLangConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, 
 	prefillCh := make(chan prefillOutcome, 1)
 
 	go func() {
-		err := s.prefill(prefillRequest.WithContext(prefillCtx), prefillAddr, bootstrapRoom, timeout)
+		err := s.prefill(prefillRequest.WithContext(prefillCtx), prefillAddr, bootstrapRoom, timeout, rt)
 		if err != nil {
 			cancelDecode()
 		}
@@ -176,7 +177,7 @@ func (s *SGLangConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, 
 
 	// Run decode in the current goroutine so that streaming writes reach the
 	// gin.Context from the request-handling goroutine.
-	result, decodeErr := s.decode(c, decodeRequest.WithContext(decodeCtx), decodeAddr, bootstrapRoom, timeout)
+	result, decodeErr := s.decode(c, decodeRequest.WithContext(decodeCtx), decodeAddr, bootstrapRoom, timeout, rt)
 
 	if hooks != nil && hooks.DecrDecode != nil {
 		hooks.DecrDecode()
@@ -215,18 +216,18 @@ func (s *SGLangConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, 
 	return result, decodeErr
 }
 
-func (s *SGLangConnector) prefill(req *http.Request, prefillAddr string, bootstrapRoom int64, timeout time.Duration) error {
+func (s *SGLangConnector) prefill(req *http.Request, prefillAddr string, bootstrapRoom int64, timeout time.Duration, rt http.RoundTripper) error {
 	req.URL.Host = prefillAddr
 	req.URL.Scheme = "http"
 	klog.V(4).Infof("sglang prefill: sending to %s (bootstrap_room=%d)", req.URL.String(), bootstrapRoom)
-	return prefillerProxy(nil, req, timeout)
+	return prefillerProxy(req, timeout, rt)
 }
 
-func (s *SGLangConnector) decode(c *gin.Context, req *http.Request, decodeAddr string, bootstrapRoom int64, timeout time.Duration) (int, error) {
+func (s *SGLangConnector) decode(c *gin.Context, req *http.Request, decodeAddr string, bootstrapRoom int64, timeout time.Duration, rt http.RoundTripper) (int, error) {
 	req.URL.Host = decodeAddr
 	req.URL.Scheme = "http"
 	klog.V(4).Infof("sglang decode: sending to %s (bootstrap_room=%d)", req.URL.String(), bootstrapRoom)
-	return decoderProxy(c, req, timeout)
+	return decoderProxy(c, req, timeout, rt)
 }
 
 func buildRequest(req *http.Request, reqBody map[string]interface{}) (*http.Request, error) {

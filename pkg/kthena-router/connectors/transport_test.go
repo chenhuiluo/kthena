@@ -559,7 +559,7 @@ func TestPrefillerProxy(t *testing.T) {
 			require.NoError(t, err)
 			testReq.Header.Set("Content-Type", "application/json")
 
-			err = prefillerProxy(c, testReq, 0)
+			err = prefillerProxy(testReq, 0, upstreamTransport)
 
 			if tt.expectError {
 				assert.Error(t, err)
@@ -589,7 +589,7 @@ func TestPrefillerProxyHonorsTimeout(t *testing.T) {
 	require.NoError(t, err)
 
 	start := time.Now()
-	err = prefillerProxy(nil, req, 100*time.Millisecond)
+	err = prefillerProxy(req, 100*time.Millisecond, upstreamTransport)
 
 	assert.Error(t, err)
 	assert.Less(t, time.Since(start), time.Second)
@@ -667,7 +667,7 @@ func TestDecoderProxy(t *testing.T) {
 			require.NoError(t, err)
 			testReq.Header.Set("Content-Type", "application/json")
 
-			_, err = decoderProxy(c, testReq, 0)
+			_, err = decoderProxy(c, testReq, 0, upstreamTransport)
 
 			if tt.expectError {
 				assert.Error(t, err)
@@ -696,7 +696,7 @@ func TestDecoderProxyTimeoutDoesNotTruncateStream(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, server.URL, nil)
 	require.NoError(t, err)
 
-	_, err = decoderProxy(c, req, 50*time.Millisecond)
+	_, err = decoderProxy(c, req, 50*time.Millisecond, upstreamTransport)
 
 	assert.NoError(t, err)
 	assert.Contains(t, w.Body.String(), "data: [DONE]")

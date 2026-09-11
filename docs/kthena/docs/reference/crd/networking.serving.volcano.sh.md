@@ -33,6 +33,24 @@ _Appears in:_
 | `model` _string_ | Model is the name of the model or lora adapter to match.<br />If this field is not specified, any model or lora adapter will be matched. |  |  |
 
 
+#### ConnectionPool
+
+
+
+ConnectionPool configures the HTTP connection pool for a ModelServer.
+
+
+
+_Appears in:_
+- [TrafficPolicy](#trafficpolicy)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `maxIdleConnections` _integer_ | MaxIdleConnections is the total idle connections across all endpoints.<br />Defaults to 100 when omitted. |  | Minimum: 0 <br /> |
+| `maxIdleConnectionsPerHost` _integer_ | MaxIdleConnectionsPerHost is the idle connections per pod/endpoint.<br />Defaults to 64 when omitted. |  | Minimum: 0 <br /> |
+| `maxConnectionsPerHost` _integer_ | MaxConnectionsPerHost limits dialing, active and idle connections per host.<br />0 means unlimited. Defaults to 0 when omitted. |  | Minimum: 0 <br /> |
+
+
 #### ExternalModelProvider
 
 
@@ -548,6 +566,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `retry` _[Retry](#retry)_ | The retry policy for the inference request. |  |  |
+| `connectionPool` _[ConnectionPool](#connectionpool)_ | ConnectionPool configures the upstream HTTP connection pool used when<br />forwarding to this ModelServer's pods. When omitted, a shared default<br />pool is used. Each ModelServer that sets this gets its own isolated pool. |  |  |
 
 
 #### WorkloadPort

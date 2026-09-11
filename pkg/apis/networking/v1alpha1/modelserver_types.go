@@ -131,8 +131,36 @@ type TrafficPolicy struct {
 	// The retry policy for the inference request.
 	// +optional
 	Retry *Retry `json:"retry,omitempty"`
+	// ConnectionPool configures the upstream HTTP connection pool used when
+	// forwarding to this ModelServer's pods. When omitted, a shared default
+	// pool is used. Each ModelServer that sets this gets its own isolated pool.
+	// +optional
+	ConnectionPool *ConnectionPool `json:"connectionPool,omitempty"`
 
 	// TODO: add LoadBalancer policy
+}
+
+// ConnectionPool configures the HTTP connection pool for a ModelServer.
+type ConnectionPool struct {
+	// MaxIdleConnections is the total idle connections across all endpoints.
+	// Defaults to 100 when omitted.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxIdleConnections *int32 `json:"maxIdleConnections,omitempty"`
+	// MaxIdleConnectionsPerHost is the idle connections per pod/endpoint.
+	// Defaults to 64 when omitted.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxIdleConnectionsPerHost *int32 `json:"maxIdleConnectionsPerHost,omitempty"`
+	// MaxConnectionsPerHost limits dialing, active and idle connections per host.
+	// 0 means unlimited. Defaults to 0 when omitted.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxConnectionsPerHost *int32 `json:"maxConnectionsPerHost,omitempty"`
+	// IdleTimeout is how long an idle connection stays open before closing.
+	// Defaults to 90s when omitted.
+	// +optional
+	IdleTimeout *metav1.Duration `json:"idleTimeout,omitempty"`
 }
 
 type Retry struct {

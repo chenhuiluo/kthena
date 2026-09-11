@@ -19,8 +19,12 @@ package common
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	v1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 )
 
 const testMaxIdleConnsPerHost = 64
@@ -41,4 +45,65 @@ func TestNewPooledTransportWiderThanStdlibDefault(t *testing.T) {
 // Streaming prefill/decode must not be cut off mid-flight.
 func TestNewPooledTransportNoResponseHeaderTimeout(t *testing.T) {
 	assert.Zero(t, NewPooledTransport(testMaxIdleConnsPerHost).ResponseHeaderTimeout)
+}
+
+func TestNewPooledTransportWithConfig(t *testing.T) {
+	cfg := PoolConfig{
+		MaxIdleConns:        7,
+		MaxIdleConnsPerHost: 9,
+		MaxConnsPerHost:     3,
+		IdleConnTimeout:     5 * time.Second,
+	}
+	transport := NewPooledTransportWithConfig(cfg)
+	assert.Equal(t, 7, transport.MaxIdleConns)
+	assert.Equal(t, 9, transport.MaxIdleConnsPerHost)
+	assert.Equal(t, 3, transport.MaxConnsPerHost)
+	assert.Equal(t, 5*time.Second, transport.IdleConnTimeout)
+}
+
+func TestDefaultPoolConfig(t *testing.T) {
+	cfg := DefaultPoolConfig()
+	assert.Equal(t, 100, cfg.MaxIdleConns)
+	assert.Equal(t, 64, cfg.MaxIdleConnsPerHost)
+	assert.Zero(t, cfg.MaxConnsPerHost)
+	assert.Equal(t, 90*time.Second, cfg.IdleConnTimeout)
+}
+
+func TestPoolConfigFromCRD(t *testing.T) {
+	maxIdle := int32(8)
+	perHost := int32(5)
+	maxConns := int32(2)
+
+	tests := []struct {
+		name string
+		cp   *v1alpha1.ConnectionPool
+		want PoolConfig
+	}{
+		{
+			name: "nil connectionPool applies defaults",
+			cp:   nil,
+			want: DefaultPoolConfig(),
+		},
+		{
+			name: "empty connectionPool applies defaults",
+			cp:   &v1alpha1.ConnectionPool{},
+			want: DefaultPoolConfig(),
+		},
+		{
+			name: "explicit fields override defaults",
+			cp: &v1alpha1.ConnectionPool{
+				MaxIdleConnections:        &maxIdle,
+				MaxIdleConnectionsPerHost: &perHost,
+				MaxConnectionsPerHost:     &maxConns,
+				IdleTimeout:               &metav1.Duration{Duration: 13 * time.Second},
+			},
+			want: PoolConfig{MaxIdleConns: 8, MaxIdleConnsPerHost: 5, MaxConnsPerHost: 2, IdleConnTimeout: 13 * time.Second},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, PoolConfigFromCRD(tt.cp))
+		})
+	}
 }

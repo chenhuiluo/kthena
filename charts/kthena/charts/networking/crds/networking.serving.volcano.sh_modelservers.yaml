@@ -87,6 +87,39 @@ spec:
               trafficPolicy:
                 description: Traffic Policy for accessing the model server instance.
                 properties:
+                  connectionPool:
+                    description: |-
+                      ConnectionPool configures the upstream HTTP connection pool used when
+                      forwarding to this ModelServer's pods. When omitted, a shared default
+                      pool is used. Each ModelServer that sets this gets its own isolated pool.
+                    properties:
+                      idleTimeout:
+                        description: |-
+                          IdleTimeout is how long an idle connection stays open before closing.
+                          Defaults to 90s when omitted.
+                        type: string
+                      maxConnectionsPerHost:
+                        description: |-
+                          MaxConnectionsPerHost limits dialing, active and idle connections per host.
+                          0 means unlimited. Defaults to 0 when omitted.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      maxIdleConnections:
+                        description: |-
+                          MaxIdleConnections is the total idle connections across all endpoints.
+                          Defaults to 100 when omitted.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      maxIdleConnectionsPerHost:
+                        description: |-
+                          MaxIdleConnectionsPerHost is the idle connections per pod/endpoint.
+                          Defaults to 64 when omitted.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                    type: object
                   retry:
                     description: The retry policy for the inference request.
                     properties:

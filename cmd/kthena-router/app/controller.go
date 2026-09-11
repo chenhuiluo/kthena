@@ -37,6 +37,7 @@ import (
 
 	clientset "github.com/volcano-sh/kthena/client-go/clientset/versioned"
 	kthenaInformers "github.com/volcano-sh/kthena/client-go/informers/externalversions"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/controller"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kube"
@@ -52,7 +53,7 @@ type aggregatedController struct {
 
 var _ Controller = &aggregatedController{}
 
-func startControllers(store datastore.Store, stop <-chan struct{}, enableGatewayAPI bool, defaultPort string, enableGatewayAPIInferenceExtension bool, kubeAPIQPS float32, kubeAPIBurst int) Controller {
+func startControllers(store datastore.Store, stop <-chan struct{}, enableGatewayAPI bool, defaultPort string, enableGatewayAPIInferenceExtension bool, kubeAPIQPS float32, kubeAPIBurst int, transportRegistry *common.TransportRegistry) Controller {
 	cfg, err := kube.BuildConfig("", "")
 	if err != nil {
 		klog.Fatalf("Error building kubeconfig: %s", err.Error())
@@ -86,7 +87,7 @@ func startControllers(store datastore.Store, stop <-chan struct{}, enableGateway
 	if err != nil {
 		klog.Fatalf("Error creating external model provider controller: %s", err.Error())
 	}
-	modelServerController, err := controller.NewModelServerController(kthenaInformerFactory, kubeInformerFactory, store)
+	modelServerController, err := controller.NewModelServerController(kthenaInformerFactory, kubeInformerFactory, store, transportRegistry)
 	if err != nil {
 		klog.Fatalf("Error creating model server controller: %s", err.Error())
 	}

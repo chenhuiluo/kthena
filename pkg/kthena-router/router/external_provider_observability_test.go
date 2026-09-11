@@ -38,6 +38,7 @@ import (
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/accesslog"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/providers"
@@ -658,7 +659,7 @@ type externalObservabilityFixture struct {
 func newExternalObservabilityFixture(t *testing.T, suffix string, providerType aiv1alpha1.ExternalProviderType, baseURL string) externalObservabilityFixture {
 	t.Helper()
 	store := datastore.New()
-	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml", common.NewTransportRegistry())
 	clientModel := "observability-client-" + suffix
 	providerModel := "observability-upstream-" + suffix
 	providerName := "observability-provider-" + suffix

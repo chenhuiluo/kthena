@@ -106,6 +106,10 @@ type Router struct {
 	// KV Connector management
 	connectorFactory *connectors.Factory
 
+	// Per-ModelServer upstream transports (nil entries fall back to shared
+	// proxyTransport/upstreamTransport).
+	transportRegistry *common.TransportRegistry
+
 	// Priority queue configuration
 	queueTimeout     time.Duration
 	tokenWeight      float64 // Weight for token-based priority in the fairness strategy (default 1.0)
@@ -123,7 +127,7 @@ func (r *Router) ActiveRequestCount() int64 {
 	return r.metrics.ActiveRequestsCount()
 }
 
-func NewRouter(store datastore.Store, routerConfigPath string) *Router {
+func NewRouter(store datastore.Store, routerConfigPath string, transportRegistry *common.TransportRegistry) *Router {
 	// User fairness and session boost are mutually exclusive scheduling strategies.
 	// Enabling both is a configuration error.
 	if EnableFairnessScheduling && EnableSessionBoost {
@@ -195,17 +199,18 @@ func NewRouter(store datastore.Store, routerConfigPath string) *Router {
 	}
 
 	return &Router{
-		store:            store,
-		scheduler:        scheduler.NewScheduler(store, routerConfig),
-		authenticator:    auth.NewJWTAuthenticator(routerConfig),
-		loadRateLimiter:  loadRateLimiter,
-		accessLogger:     accessLogger,
-		metrics:          metricsInstance,
-		tokenizer:        tokenizerInstance,
-		connectorFactory: connectors.NewDefaultFactory(),
-		queueTimeout:     parseQueueTimeout(),
-		tokenWeight:      parseEnvFloat("FAIRNESS_PRIORITY_TOKEN_WEIGHT", 1.0),
-		requestNumWeight: parseEnvFloat("FAIRNESS_PRIORITY_REQUEST_NUM_WEIGHT", 0.0),
+		store:             store,
+		scheduler:         scheduler.NewScheduler(store, routerConfig),
+		authenticator:     auth.NewJWTAuthenticator(routerConfig),
+		loadRateLimiter:   loadRateLimiter,
+		accessLogger:      accessLogger,
+		metrics:           metricsInstance,
+		tokenizer:         tokenizerInstance,
+		connectorFactory:  connectors.NewDefaultFactory(),
+		transportRegistry: transportRegistry,
+		queueTimeout:      parseQueueTimeout(),
+		tokenWeight:       parseEnvFloat("FAIRNESS_PRIORITY_TOKEN_WEIGHT", 1.0),
+		requestNumWeight:  parseEnvFloat("FAIRNESS_PRIORITY_REQUEST_NUM_WEIGHT", 0.0),
 
 		sessionBoostTimeout: parseSessionBoostTimeout(),
 	}
@@ -698,6 +703,15 @@ func upstreamTimeoutFor(ms *v1alpha1.ModelServer) time.Duration {
 	return ms.Spec.TrafficPolicy.Timeout.Duration
 }
 
+// transportFor returns the per-ModelServer upstream transport, or nil when no
+// connectionPool is configured (callers fall back to a shared transport).
+func (r *Router) transportFor(name types.NamespacedName) *http.Transport {
+	if r.transportRegistry == nil {
+		return nil
+	}
+	return r.transportRegistry.Get(name)
+}
+
 func ParseModelRequest(c *gin.Context) (ModelRequest, error) {
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -837,6 +851,7 @@ func (r *Router) proxy(
 	stream bool,
 	port int32,
 	timeout time.Duration,
+	rt http.RoundTripper,
 	onUsage func(u providers.TokenUsage),
 ) error {
 	// Capture body bytes once so each retry attempt gets a fresh reader.
@@ -867,7 +882,7 @@ func (r *Router) proxy(
 		}
 
 		// Request dispatched to the pod.
-		err := proxyRequest(c, req, podObj.Status.PodIP, port, stream, timeout, onUsage)
+		err := proxyRequest(c, req, podObj.Status.PodIP, port, stream, timeout, rt, onUsage)
 
 		if ctx.MetricsRecorder != nil {
 			ctx.MetricsRecorder.DecActiveUpstreamRequests()
@@ -911,14 +926,26 @@ func (r *Router) proxyModelEndpoint(
 		}
 	}
 
+	// Resolve the per-ModelServer transport. May be nil (no connectionPool
+	// configured, or InferencePool/external path); callers fall back to the
+	// shared proxyTransport/upstreamTransport.
+	rt := r.transportFor(ctx.ModelServerName)
+	// Stash it for the PD-disaggregated connectors path; upstreamRoundTripper
+	// falls back to upstreamTransport when nil.
+	c.Set(common.UpstreamTransportKey, rt)
+
 	// proxy to pd aggregated pod
 	if ctx.BestPods != nil {
+		effRT := http.RoundTripper(proxyTransport)
+		if rt != nil {
+			effRT = rt
+		}
 		// build request
 		decodeRequest := connectors.BuildDecodeRequest(c, req, modelRequest)
 		stream := isStreaming(modelRequest)
 		modelName := ctx.Model
 		userID := c.GetString(common.UserIdKey)
-		err := r.proxy(c, decodeRequest, ctx, stream, port, timeout, func(usage providers.TokenUsage) {
+		err := r.proxy(c, decodeRequest, ctx, stream, port, timeout, effRT, func(usage providers.TokenUsage) {
 			if usage.TotalTokens <= 0 {
 				return
 			}
@@ -1129,9 +1156,10 @@ func proxyRequest(
 	port int32,
 	stream bool,
 	timeout time.Duration,
+	rt http.RoundTripper,
 	onUsage func(u providers.TokenUsage),
 ) error {
-	resp, err := doRequest(req, podIP, port, timeout)
+	resp, err := doRequest(req, podIP, port, timeout, rt)
 	if resp != nil {
 		defer resp.Body.Close()
 		accesslog.SetUpstreamInfo(c, resp.StatusCode, 0)
@@ -1326,6 +1354,7 @@ func doRequest(
 	podIP string,
 	port int32,
 	timeout time.Duration,
+	rt http.RoundTripper,
 ) (*http.Response, error) {
 	// step 1: change request URL to prefill pod URL.
 	req.URL.Host = net.JoinHostPort(podIP, strconv.Itoa(int(port)))
@@ -1342,7 +1371,7 @@ func doRequest(
 		req = req.WithContext(ctx)
 	}
 
-	resp, err := proxyTransport.RoundTrip(req)
+	resp, err := rt.RoundTrip(req)
 	if err != nil {
 		cancel()
 		return nil, err
