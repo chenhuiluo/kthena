@@ -18,6 +18,7 @@ package datastore
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
@@ -37,12 +38,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	inferencev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
+	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/backend"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 )
@@ -203,6 +206,15 @@ func WithRedisOnFlightCounter(counter OnFlightCounter) Option {
 	}
 }
 
+// WithKubeClient configures the store to patch traffic-drained annotations onto
+// draining pods during lossless upgrade. Optional: without it draining pods are
+// still excluded from scheduling but the controller falls back to drainTimeout.
+func WithKubeClient(client kubernetes.Interface) Option {
+	return func(s *store) {
+		s.kubeClient = client
+	}
+}
+
 // Store is an interface for storing and retrieving data
 type Store interface {
 	// Add modelServer which are selected by modelServer.Spec.WorkloadSelector
@@ -219,6 +231,9 @@ type Store interface {
 	AppendModelServerToPod(pod *corev1.Pod, modelServers []*aiv1alpha1.ModelServer) error
 	// Refresh Store and ModelServer when delete a pod
 	DeletePod(podName types.NamespacedName) error
+	// SetPodDraining marks a pod as draining (lossless upgrade): the pod stays
+	// in the store (in-flight still tracked) but is excluded from scheduling.
+	SetPodDraining(podName types.NamespacedName, draining bool)
 
 	// New methods for routing functionality
 	MatchModelTarget(modelName string, request *http.Request, gatewayKey string) (ModelTarget, bool, *aiv1alpha1.ModelRoute, error)
@@ -346,6 +361,11 @@ type PodInfo struct {
 	// kept in sync with the global Redis counter so it reflects cross-router traffic.
 	onFlightRequestNum atomic.Int64
 
+	// draining is set true when the pod is annotated traffic-draining during
+	// lossless upgrade: the router stops scheduling new requests to it but keeps
+	// the PodInfo in the store so in-flight requests can finish and decrement.
+	draining atomic.Bool
+
 	mutex sync.RWMutex // Protects concurrent access to Pod, engine, metrics, models and modelServer fields
 	// Protected fields - use accessor methods for thread-safe access
 	models      sets.Set[string]               // running models. Including base model and lora adapters.
@@ -432,6 +452,12 @@ type store struct {
 	rootCtx               context.Context // Lifecycle context for queue goroutines, set by Run()
 	fairnessQueueConfig   FairnessQueueConfig
 	metricsScrapeInterval time.Duration
+
+	// kubeClient is optional. When non-nil, the store patches traffic-drained
+	// annotations onto draining pods during lossless upgrade (B1). When nil,
+	// draining pods are still excluded from scheduling but the controller relies
+	// solely on its drainTimeout to delete them.
+	kubeClient kubernetes.Interface
 }
 
 func New(opts ...Option) Store {
@@ -628,6 +654,7 @@ func (s *store) Run(ctx context.Context) {
 						defer func() { <-sem }()
 						s.updatePodMetrics(pod)
 						s.updatePodModels(pod)
+						s.markPodDrainedIfZero(ctx, pod)
 					}(p)
 				}
 				return true
@@ -641,6 +668,51 @@ func (s *store) Run(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// markPodDrainedIfZero patches traffic-drained=true onto a draining pod once its
+// engine-reported in-flight requests reach zero (lossless upgrade). Idempotent:
+// skips pods already drained. Runs inside the store.Run scrape loop, so it
+// piggybacks on the existing per-pod goroutine and semaphore — no new goroutine.
+// No-op when the store has no kubeClient (controller falls back to drainTimeout).
+func (s *store) markPodDrainedIfZero(ctx context.Context, pod *PodInfo) {
+	if s.kubeClient == nil || !pod.IsDraining() {
+		return
+	}
+	podObj := pod.GetPod()
+	if podObj == nil {
+		return
+	}
+	if _, already := podObj.Annotations[workloadv1alpha1.TrafficDrainedAnnotation]; already {
+		return
+	}
+	// Only drain when the engine has no running or waiting requests. Scrape
+	// failure leaves the previous (non-zero) values, so this never falsely fires.
+	if pod.GetRequestRunningNum() != 0 || pod.GetRequestWaitingNum() != 0 {
+		return
+	}
+	patch, err := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]string{
+				workloadv1alpha1.TrafficDrainedAnnotation: "true",
+			},
+		},
+	})
+	if err != nil {
+		klog.Errorf("failed to marshal traffic-drained patch for pod %s/%s: %v", podObj.Namespace, podObj.Name, err)
+		return
+	}
+	if _, err := s.kubeClient.CoreV1().Pods(podObj.Namespace).Patch(
+		ctx, podObj.Name, types.MergePatchType, patch, metav1.PatchOptions{},
+	); err != nil {
+		klog.Errorf("failed to patch traffic-drained on pod %s/%s: %v", podObj.Namespace, podObj.Name, err)
+		return
+	}
+	// Mark the in-memory pod object so the next scrape cycle sees it already
+	// drained and skips the patch (PodInfo.Pod is not refreshed by the API server
+	// until an informer update arrives).
+	pod.SetPodDrained()
+	klog.V(2).Infof("Pod %s/%s drained (in-flight zero), annotated traffic-drained", podObj.Namespace, podObj.Name)
 }
 
 // SyncOnFlightCounts fetches current on-flight counts for all tracked pods from
@@ -958,7 +1030,11 @@ func (s *store) GetPodsByModelServer(name types.NamespacedName) ([]*PodInfo, err
 
 	for _, podName := range podNames {
 		if value, ok := s.pods.Load(podName); ok {
-			pods = append(pods, value.(*PodInfo))
+			pi := value.(*PodInfo)
+			if pi.IsDraining() {
+				continue // lossless upgrade: exclude draining pods from scheduling
+			}
+			pods = append(pods, pi)
 		}
 	}
 
@@ -1023,7 +1099,11 @@ func (s *store) GetDecodePods(modelServerName types.NamespacedName) ([]*PodInfo,
 
 	for _, podName := range decodePodNames {
 		if value, ok := s.pods.Load(podName); ok {
-			decodePods = append(decodePods, value.(*PodInfo))
+			pi := value.(*PodInfo)
+			if pi.IsDraining() {
+				continue
+			}
+			decodePods = append(decodePods, pi)
 		}
 	}
 
@@ -1043,7 +1123,11 @@ func (s *store) GetPrefillPods(modelServerName types.NamespacedName) ([]*PodInfo
 
 	for _, podName := range prefillPodNames {
 		if value, ok := s.pods.Load(podName); ok {
-			prefillPods = append(prefillPods, value.(*PodInfo))
+			pi := value.(*PodInfo)
+			if pi.IsDraining() {
+				continue
+			}
+			prefillPods = append(prefillPods, pi)
 		}
 	}
 
@@ -1068,7 +1152,11 @@ func (s *store) GetPrefillPodsForDecodeGroup(modelServerName types.NamespacedNam
 	prefillPods := make([]*PodInfo, 0, len(prefillPodNames))
 	for _, podName := range prefillPodNames {
 		if value, ok := s.pods.Load(podName); ok {
-			prefillPods = append(prefillPods, value.(*PodInfo))
+			pi := value.(*PodInfo)
+			if pi.IsDraining() {
+				continue
+			}
+			prefillPods = append(prefillPods, pi)
 		}
 	}
 
@@ -1162,6 +1250,15 @@ func (s *store) AppendModelServerToPod(pod *corev1.Pod, modelServers []*aiv1alph
 	}
 
 	return nil
+}
+
+// SetPodDraining marks a pod as draining (lossless upgrade). The pod remains in
+// the store so in-flight requests can finish and decrement; it is only excluded
+// from scheduling candidates via IsDraining checks in the query methods.
+func (s *store) SetPodDraining(podName types.NamespacedName, draining bool) {
+	if value, ok := s.pods.Load(podName); ok {
+		value.(*PodInfo).SetDraining(draining)
+	}
 }
 
 func (s *store) DeletePod(podName types.NamespacedName) error {
@@ -2059,6 +2156,33 @@ func (p *PodInfo) GetOnFlightRequestNum() int64 {
 	return p.onFlightRequestNum.Load()
 }
 
+// SetDraining marks the pod as draining (lossless upgrade): the router stops
+// scheduling new requests to it. Lock-free like onFlightRequestNum.
+func (p *PodInfo) SetDraining(b bool) {
+	p.draining.Store(b)
+}
+
+// IsDraining reports whether the pod is draining and should be excluded from
+// scheduling candidates (in-flight requests still tracked).
+func (p *PodInfo) IsDraining() bool {
+	return p.draining.Load()
+}
+
+// SetPodDrained marks the in-memory pod object with traffic-drained so the
+// scrape loop does not re-patch it (PodInfo.Pod is not refreshed by the API
+// server until an informer update arrives).
+func (p *PodInfo) SetPodDrained() {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	if p.Pod == nil {
+		return
+	}
+	if p.Pod.Annotations == nil {
+		p.Pod.Annotations = map[string]string{}
+	}
+	p.Pod.Annotations[workloadv1alpha1.TrafficDrainedAnnotation] = "true"
+}
+
 // GetTPOT returns the time per output token
 func (p *PodInfo) GetTPOT() float64 {
 	p.mutex.RLock()
@@ -2362,7 +2486,7 @@ func (s *store) GetPodsByInferencePool(name types.NamespacedName) ([]*PodInfo, e
 	s.pods.Range(func(key, value interface{}) bool {
 		podInfo := value.(*PodInfo)
 		pod := podInfo.GetPod()
-		if pod != nil && pod.Namespace == name.Namespace && selector.Matches(labels.Set(podInfo.GetPodLabels())) {
+		if pod != nil && pod.Namespace == name.Namespace && selector.Matches(labels.Set(podInfo.GetPodLabels())) && !podInfo.IsDraining() {
 			pods = append(pods, podInfo)
 		}
 		return true

@@ -36,6 +36,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	kubefake "k8s.io/client-go/kubernetes/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
@@ -2905,4 +2906,114 @@ func BenchmarkSelectRuleRegex(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// TestPodInfoDraining verifies the draining flag excludes a pod from scheduling
+// candidate queries while keeping it in the store (in-flight still tracked).
+func TestPodInfoDrainingExcludesFromCandidates(t *testing.T) {
+	s := New().(*store)
+	msName := types.NamespacedName{Namespace: "ns", Name: "ms"}
+	ms := &aiv1alpha1.ModelServer{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "ms"},
+		Spec: aiv1alpha1.ModelServerSpec{WorkloadSelector: &aiv1alpha1.WorkloadSelector{
+			MatchLabels: map[string]string{"app": "ms"},
+		}},
+	}
+
+	ready := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "pod-ready",
+		Labels: map[string]string{"app": "ms"},
+	}}
+	draining := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "pod-draining",
+		Labels: map[string]string{"app": "ms"},
+	}}
+
+	assert.NoError(t, s.AddOrUpdateModelServer(ms, sets.New(types.NamespacedName{Namespace: "ns", Name: "pod-ready"}, types.NamespacedName{Namespace: "ns", Name: "pod-draining"})))
+	assert.NoError(t, s.AddOrUpdatePod(ready, []*aiv1alpha1.ModelServer{ms}))
+	assert.NoError(t, s.AddOrUpdatePod(draining, []*aiv1alpha1.ModelServer{ms}))
+
+	// Mark one pod draining via the store API.
+	s.SetPodDraining(types.NamespacedName{Namespace: "ns", Name: "pod-draining"}, true)
+	assert.True(t, s.GetPodInfo(types.NamespacedName{Namespace: "ns", Name: "pod-draining"}).IsDraining())
+
+	// Candidates exclude the draining pod.
+	got, err := s.GetPodsByModelServer(msName)
+	assert.NoError(t, err)
+	assert.Len(t, got, 1)
+	assert.Equal(t, "pod-ready", got[0].GetPod().Name)
+
+	// The draining pod is still in the store (in-flight tracking intact).
+	assert.NotNil(t, s.GetPodInfo(types.NamespacedName{Namespace: "ns", Name: "pod-draining"}))
+
+	// Clearing draining re-includes it.
+	s.SetPodDraining(types.NamespacedName{Namespace: "ns", Name: "pod-draining"}, false)
+	got, err = s.GetPodsByModelServer(msName)
+	assert.NoError(t, err)
+	assert.Len(t, got, 2)
+}
+
+// TestMarkPodDrainedIfZero verifies the store.Run drain check patches
+// traffic-drained=true onto a draining pod only when its engine in-flight
+// metrics reach zero.
+func TestMarkPodDrainedIfZero(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
+	s := New(WithKubeClient(kubeClient)).(*store)
+
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "pod-d",
+		Labels: map[string]string{"app": "ms"},
+	}}
+	_, err := kubeClient.CoreV1().Pods("ns").Create(context.TODO(), pod, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	ms := &aiv1alpha1.ModelServer{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "ms"},
+		Spec: aiv1alpha1.ModelServerSpec{WorkloadSelector: &aiv1alpha1.WorkloadSelector{MatchLabels: map[string]string{"app": "ms"}}}}
+	assert.NoError(t, s.AddOrUpdateModelServer(ms, sets.New(types.NamespacedName{Namespace: "ns", Name: "pod-d"})))
+	assert.NoError(t, s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}))
+
+	pi := s.GetPodInfo(types.NamespacedName{Namespace: "ns", Name: "pod-d"})
+	s.SetPodDraining(types.NamespacedName{Namespace: "ns", Name: "pod-d"}, true)
+
+	// Not drained while in-flight > 0.
+	pi.mutex.Lock()
+	pi.RequestRunningNum = 2
+	pi.mutex.Unlock()
+	s.markPodDrainedIfZero(context.Background(), pi)
+	for _, a := range kubeClient.Actions() {
+		assert.NotEqual(t, "patch", a.GetVerb())
+	}
+
+	// Drained once in-flight reaches 0 (waiting already 0).
+	pi.mutex.Lock()
+	pi.RequestRunningNum = 0
+	pi.mutex.Unlock()
+	s.markPodDrainedIfZero(context.Background(), pi)
+	patched, err := kubeClient.CoreV1().Pods("ns").Get(context.TODO(), "pod-d", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, "true", patched.Annotations[workloadv1alpha1.TrafficDrainedAnnotation])
+
+	// Idempotent: second call does not re-patch.
+	countPatches := func() int {
+		n := 0
+		for _, a := range kubeClient.Actions() {
+			if a.GetVerb() == "patch" {
+				n++
+			}
+		}
+		return n
+	}
+	before := countPatches()
+	s.markPodDrainedIfZero(context.Background(), pi)
+	assert.Equal(t, before, countPatches(), "already-drained pod must not be re-patched")
+}
+
+// TestMarkPodDrainedIfZeroNoKubeClient verifies the drain check is a no-op when
+// the store has no kubeClient (router without API-server write access).
+func TestMarkPodDrainedIfZeroNoKubeClient(t *testing.T) {
+	s := New().(*store) // no WithKubeClient
+	pi := NewPodInfo(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "p"}}, "vLLM")
+	s.SetPodDraining(types.NamespacedName{Namespace: "ns", Name: "p"}, true)
+	// Should not panic and should do nothing.
+	assert.NotPanics(t, func() { s.markPodDrainedIfZero(context.Background(), pi) })
 }

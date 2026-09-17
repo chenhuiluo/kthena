@@ -19,6 +19,7 @@ package controller
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -113,6 +114,15 @@ type ModelServingController struct {
 	initialSync     bool     // indicates whether the initial sync has been completed
 	pluginsRegistry *plugins.Registry
 	recorder        record.EventRecorder
+
+	// drainTimeout bounds the wait for in-flight requests to drain before
+	// deleting pods during lossless upgrade. 0 disables draining.
+	drainTimeout time.Duration
+}
+
+// SetDrainTimeout sets the lossless-upgrade drain timeout. 0 disables draining.
+func (c *ModelServingController) SetDrainTimeout(d time.Duration) {
+	c.drainTimeout = d
 }
 
 func NewModelServingController(kubeClientSet kubernetes.Interface, modelServingClient clientset.Interface, volcanoClient volcano.Interface, apiextClient apiextClientSet.Interface) (*ModelServingController, error) {
@@ -350,6 +360,12 @@ func (c *ModelServingController) updatePod(_, newObj interface{}) {
 			klog.Errorf("get model Serving failed when update pod %s/%s: %v", newPod.Namespace, newPod.Name, err)
 		}
 		return
+	}
+
+	// Lossless upgrade fast path: when the router writes traffic-drained onto a
+	// pod, re-enqueue the ModelServing so the drain gate can complete promptly.
+	if _, drained := newPod.Annotations[utils.TrafficDrainedAnnotation]; drained {
+		c.enqueueModelServing(ms)
 	}
 
 	if c.shouldSkipHandling(ms, servingGroupName, newPod) {
@@ -1294,6 +1310,17 @@ func (c *ModelServingController) DeleteRole(ctx context.Context, ms *workloadv1a
 	if roleStatus == datastore.RoleDeleting {
 		return
 	}
+
+	// Lossless upgrade: drain in-flight requests before deleting. When the gate
+	// handles the request (drain in progress or just initiated), return now;
+	// the ModelServing is re-enqueued to re-check drain completion.
+	if handled, err := c.drainRoleGate(ctx, ms, groupName, roleName, roleID, roleStatus); err != nil {
+		klog.Errorf("drain gate failed for role %s/%s: %v", roleName, roleID, err)
+		return
+	} else if handled {
+		return
+	}
+
 	err := c.store.UpdateRoleStatus(utils.GetNamespaceName(ms), groupName, roleName, roleID, datastore.RoleDeleting)
 	klog.V(4).Infof("Setting role %s/%s status to Deleting", ms.GetName(), roleID)
 	if err != nil {
@@ -2812,9 +2839,234 @@ func (c *ModelServingController) createPod(
 	return nil
 }
 
+// patchTrafficDraining annotates pods with traffic-draining=<RFC3339 timestamp>
+// so the router stops sending them new traffic (lossless upgrade). The timestamp
+// lets the controller bound the drain wait (drainTimeout). Each pod is patched
+// with up to 3 retries (100ms/200ms/400ms backoff) to ride out apiserver hiccups.
+// Returns the pods that could not be annotated after retries — the caller force-
+// deletes them (K8s deletion triggers router traffic removal via DeletionTimestamp).
+func (c *ModelServingController) patchTrafficDraining(ctx context.Context, pods []*corev1.Pod) []*corev1.Pod {
+	now := time.Now().Format(time.RFC3339)
+	patch, err := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]string{
+				utils.TrafficDrainingAnnotation: now,
+			},
+		},
+	})
+	if err != nil {
+		klog.Errorf("failed to marshal traffic-draining patch: %v", err)
+		return pods
+	}
+	backoff := []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond}
+	var failed []*corev1.Pod
+	for _, pod := range pods {
+		if _, ok := pod.Annotations[utils.TrafficDrainingAnnotation]; ok {
+			continue // already draining
+		}
+		var patchErr error
+		for attempt := 0; attempt < len(backoff); attempt++ {
+			_, patchErr = c.kubeClientSet.CoreV1().Pods(pod.Namespace).Patch(
+				ctx, pod.Name, types.MergePatchType, patch, metav1.PatchOptions{},
+			)
+			if patchErr == nil {
+				break
+			}
+			// Don't retry on terminal errors (e.g. pod already gone, forbidden).
+			if apierrors.IsNotFound(patchErr) || apierrors.IsForbidden(patchErr) || apierrors.IsInvalid(patchErr) {
+				break
+			}
+			klog.V(4).Infof("patch traffic-draining attempt %d on pod %s/%s failed: %v", attempt+1, pod.Namespace, pod.Name, patchErr)
+			if attempt < len(backoff)-1 {
+				time.Sleep(backoff[attempt])
+			}
+		}
+		if patchErr != nil {
+			klog.Warningf("failed to patch traffic-draining on pod %s/%s after retries: %v (will force-delete to remove traffic)", pod.Namespace, pod.Name, patchErr)
+			failed = append(failed, pod)
+		}
+	}
+	return failed
+}
+
+// forceDeletePods deletes the given pods by name, used when traffic-draining
+// annotation could not be applied (apiserver persisted failures). K8s deletion
+// sets DeletionTimestamp, which the router observes and removes the pod from
+// scheduling — so traffic is still removed, and preStop/gracePeriod drains the
+// in-flight requests as a fallback.
+func (c *ModelServingController) forceDeletePods(ctx context.Context, ms *workloadv1alpha1.ModelServing, pods []*corev1.Pod) {
+	for _, pod := range pods {
+		// On NotFound the pod is already gone — nothing to force.
+		if err := c.kubeClientSet.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			klog.Errorf("force-delete pod %s/%s failed: %v", pod.Namespace, pod.Name, err)
+		}
+	}
+}
+
+// allPodsDrained returns true when every pod has the traffic-drained annotation.
+// Pods already gone (in-flight drain completed) are treated as drained.
+func allPodsDrained(pods []*corev1.Pod) bool {
+	for _, pod := range pods {
+		if _, ok := pod.Annotations[utils.TrafficDrainedAnnotation]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// drainServingGroupGate implements the two-phase drain for ServingGroup deletion.
+// Returns (handled, error): when handled is true the caller returns immediately
+// (drain in progress or just initiated). When handled is false, drain has
+// completed (or is disabled) and the caller proceeds with the original deletion.
+func (c *ModelServingController) drainServingGroupGate(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupName string, currentStatus datastore.ServingGroupStatus) (bool, error) {
+	// drainTimeout == 0 disables lossless drain; proceed to immediate deletion.
+	if c.drainTimeout == 0 {
+		return false, nil
+	}
+
+	msName := utils.GetNamespaceName(ms)
+	if currentStatus != datastore.ServingGroupDraining {
+		// Phase 1: mark draining and annotate pods, then requeue.
+		if err := c.store.UpdateServingGroupStatus(msName, servingGroupName, datastore.ServingGroupDraining); err != nil {
+			klog.ErrorS(err, "Failed to set ServingGroup status to Draining", "servingGroup", servingGroupName)
+			return false, err
+		}
+		pods, err := c.getPodsByIndex(GroupNameKey, fmt.Sprintf("%s/%s", ms.Namespace, servingGroupName))
+		if err != nil {
+			return false, err
+		}
+		failed := c.patchTrafficDraining(ctx, pods)
+		if len(failed) > 0 {
+			// Pods that could not be annotated have a control-plane problem; force
+			// delete them so the router drops their traffic via DeletionTimestamp.
+			c.forceDeletePods(ctx, ms, failed)
+		}
+		klog.V(2).Infof("ServingGroup %s draining: annotated %d pods (%d force-deleted), waiting for in-flight to finish", servingGroupName, len(pods)-len(failed), len(failed))
+		c.enqueueModelServingAfter(ms, enqueueAfter)
+		return true, nil
+	}
+
+	// Phase 2: already draining — re-patch stragglers, check completion or timeout.
+	pods, err := c.getPodsByIndex(GroupNameKey, fmt.Sprintf("%s/%s", ms.Namespace, servingGroupName))
+	if err != nil {
+		return false, err
+	}
+	if len(pods) == 0 {
+		return false, nil // nothing left to drain
+	}
+	// Re-patch pods still missing the draining annotation (e.g. a prior patch
+	// failed mid-reconcile). Force-delete those that fail again.
+	failed := c.patchTrafficDraining(ctx, pods)
+	if len(failed) > 0 {
+		c.forceDeletePods(ctx, ms, failed)
+	}
+	if allPodsDrained(pods) {
+		klog.V(2).Infof("ServingGroup %s drained, proceeding to delete", servingGroupName)
+		return false, nil
+	}
+	if c.drainingTimedOut(ms, servingGroupName, "", "") {
+		klog.Warningf("ServingGroup %s drain timed out, forcing delete", servingGroupName)
+		return false, nil
+	}
+	c.enqueueModelServingAfter(ms, enqueueAfter)
+	return true, nil
+}
+
+// drainRoleGate implements the two-phase drain for Role deletion (RoleRollingUpdate).
+func (c *ModelServingController) drainRoleGate(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName, roleName, roleID string, currentStatus datastore.RoleStatus) (bool, error) {
+	if c.drainTimeout == 0 {
+		return false, nil
+	}
+
+	msName := utils.GetNamespaceName(ms)
+	if currentStatus != datastore.RoleDraining {
+		if err := c.store.UpdateRoleStatus(msName, groupName, roleName, roleID, datastore.RoleDraining); err != nil {
+			klog.Errorf("failed to set role %s status to Draining: %v", roleID, err)
+			return false, err
+		}
+		pods, err := c.getPodsByIndex(RoleIDKey, fmt.Sprintf("%s/%s/%s/%s", ms.Namespace, groupName, roleName, roleID))
+		if err != nil {
+			return false, err
+		}
+		failed := c.patchTrafficDraining(ctx, pods)
+		if len(failed) > 0 {
+			c.forceDeletePods(ctx, ms, failed)
+		}
+		klog.V(2).Infof("Role %s/%s draining: annotated %d pods (%d force-deleted), waiting for in-flight to finish", roleName, roleID, len(pods)-len(failed), len(failed))
+		c.enqueueModelServingAfter(ms, enqueueAfter)
+		return true, nil
+	}
+
+	pods, err := c.getPodsByIndex(RoleIDKey, fmt.Sprintf("%s/%s/%s/%s", ms.Namespace, groupName, roleName, roleID))
+	if err != nil {
+		return false, err
+	}
+	if len(pods) == 0 {
+		return false, nil
+	}
+	// Re-patch stragglers; force-delete those that fail again.
+	failed := c.patchTrafficDraining(ctx, pods)
+	if len(failed) > 0 {
+		c.forceDeletePods(ctx, ms, failed)
+	}
+	if allPodsDrained(pods) {
+		klog.V(2).Infof("Role %s/%s drained, proceeding to delete", roleName, roleID)
+		return false, nil
+	}
+	if c.drainingTimedOut(ms, groupName, roleName, roleID) {
+		klog.Warningf("Role %s/%s drain timed out, forcing delete", roleName, roleID)
+		return false, nil
+	}
+	c.enqueueModelServingAfter(ms, enqueueAfter)
+	return true, nil
+}
+
+// drainingTimedOut reports whether the drain wait has exceeded drainTimeout.
+// The drain start time is read from the first draining pod's annotation
+// (set by patchTrafficDraining is a single batch, so they start together).
+// When the group/role has no pods left to inspect, it returns false.
+func (c *ModelServingController) drainingTimedOut(ms *workloadv1alpha1.ModelServing, servingGroupName, roleName, roleID string) bool {
+	var indexName, indexValue string
+	if roleName != "" {
+		indexName = RoleIDKey
+		indexValue = fmt.Sprintf("%s/%s/%s/%s", ms.Namespace, servingGroupName, roleName, roleID)
+	} else {
+		indexName = GroupNameKey
+		indexValue = fmt.Sprintf("%s/%s", ms.Namespace, servingGroupName)
+	}
+	pods, err := c.getPodsByIndex(indexName, indexValue)
+	if err != nil || len(pods) == 0 {
+		return false
+	}
+	// Use the earliest draining annotation timestamp across pods as the drain start.
+	var start time.Time
+	for _, pod := range pods {
+		ts, ok := pod.Annotations[utils.TrafficDrainingAnnotation]
+		if !ok {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, ts); err == nil && (start.IsZero() || t.Before(start)) {
+			start = t
+		}
+	}
+	if start.IsZero() {
+		return false
+	}
+	return time.Since(start) >= c.drainTimeout
+}
+
 func (c *ModelServingController) deleteServingGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupName string) error {
 	status := c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName)
 	if status == datastore.ServingGroupNotFound {
+		return nil
+	}
+
+	// Lossless upgrade: drain in-flight requests before deleting. When the gate
+	// handles the request (drain in progress or just initiated), return now;
+	// the ModelServing is re-enqueued to re-check drain completion.
+	if handled, err := c.drainServingGroupGate(ctx, ms, servingGroupName, status); err != nil {
+		return err
+	} else if handled {
 		return nil
 	}
 

@@ -45,6 +45,9 @@ spec:
             {{- if .Values.controllerManager.autoscalingSyncPeriodSeconds }}
             - --autoscaling-sync-period-seconds={{ .Values.controllerManager.autoscalingSyncPeriodSeconds }}
             {{- end }}
+            {{- if .Values.controllerManager.drainTimeout }}
+            - --drain-timeout={{ .Values.controllerManager.drainTimeout }}
+            {{- end }}
           imagePullPolicy: {{ .Values.controllerManager.image.pullPolicy }}
           resources:
             {{- toYaml .Values.controllerManager.resource | nindent 12 }}
