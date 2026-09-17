@@ -9000,3 +9000,140 @@ func TestResolveRoleTemplateHash_ReturnsEmptyWhenControllerRevisionNotFound(t *t
 	hash := controller.resolveRoleTemplateHash(ms, roleName, pod)
 	assert.Equal(t, "", hash)
 }
+
+// TestDeleteServingGroupDrainGate verifies the lossless-upgrade drain gate:
+// drainTimeout>0 defers deletion by annotating pods and setting Draining; once
+// all pods have traffic-drained the gate lets deletion proceed; drainTimeout=0
+// skips drain and deletes immediately.
+func TestDeleteServingGroupDrainGate(t *testing.T) {
+	makeController := func(t *testing.T, drainTimeout time.Duration) (*ModelServingController, *kubefake.Clientset, *workloadv1alpha1.ModelServing, string, *corev1.Pod) {
+		client := kubefake.NewSimpleClientset()
+		kthenaClient := kthenafake.NewSimpleClientset()
+		volcanoClient := volcanofake.NewSimpleClientset()
+		apiextClient := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
+		controller, err := NewModelServingController(client, kthenaClient, volcanoClient, apiextClient)
+		assert.NoError(t, err)
+		controller.podGroupManager = &fakePodGroupManager{deleteFunc: podgroupmanager.NewManager(client, volcanoClient, apiextClient, nil).DeletePodGroup}
+		controller.SetDrainTimeout(drainTimeout)
+
+		ms := &workloadv1alpha1.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "drain-ms", Namespace: "default"}}
+		sgName := "drain-ms-0"
+		nsn := utils.GetNamespaceName(ms)
+		controller.store.AddServingGroup(nsn, 0, "rev-1")
+		controller.store.UpdateServingGroupStatus(nsn, sgName, datastore.ServingGroupRunning)
+
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: "drain-pod", Namespace: "default",
+			Labels: map[string]string{workloadv1alpha1.GroupNameLabelKey: sgName},
+		}}
+		_, err = client.CoreV1().Pods("default").Create(context.TODO(), pod, metav1.CreateOptions{})
+		assert.NoError(t, err)
+		assert.NoError(t, controller.podsInformer.GetIndexer().Add(pod))
+		drainWorkqueue(t, controller.workqueue)
+		return controller, client, ms, sgName, pod
+	}
+
+	t.Run("drain_enabled_defers_deletion_and_annotates", func(t *testing.T) {
+		controller, client, ms, sgName, _ := makeController(t, 5*time.Minute)
+		nsn := utils.GetNamespaceName(ms)
+
+		err := controller.deleteServingGroup(context.Background(), ms, sgName)
+		assert.NoError(t, err)
+		// Drain phase: status is Draining, not Deleting; pod still exists.
+		assert.Equal(t, datastore.ServingGroupDraining, controller.store.GetServingGroupStatus(nsn, sgName))
+		gotPod, perr := client.CoreV1().Pods("default").Get(context.TODO(), "drain-pod", metav1.GetOptions{})
+		assert.NoError(t, perr)
+		assert.NotNil(t, gotPod.Annotations[workloadv1alpha1.TrafficDrainingAnnotation],
+			"pod should be annotated traffic-draining")
+		// No DeleteCollection issued.
+		assert.NotContains(t, client.Actions()[len(client.Actions())-1].GetVerb(), "delete-collection")
+	})
+
+	t.Run("drain_completed_then_deletes", func(t *testing.T) {
+		controller, client, ms, sgName, _ := makeController(t, 5*time.Minute)
+		nsn := utils.GetNamespaceName(ms)
+
+		// Phase 1: initiate drain.
+		assert.NoError(t, controller.deleteServingGroup(context.Background(), ms, sgName))
+		assert.Equal(t, datastore.ServingGroupDraining, controller.store.GetServingGroupStatus(nsn, sgName))
+
+		// Simulate router writing traffic-drained onto the pod (in cache + client).
+		patched := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: "drain-pod", Namespace: "default",
+			Labels:      map[string]string{workloadv1alpha1.GroupNameLabelKey: sgName},
+			Annotations: map[string]string{workloadv1alpha1.TrafficDrainedAnnotation: "true"},
+		}}
+		_, err := client.CoreV1().Pods("default").Update(context.TODO(), patched, metav1.UpdateOptions{})
+		assert.NoError(t, err)
+		assert.NoError(t, controller.podsInformer.GetIndexer().Update(patched))
+		drainWorkqueue(t, controller.workqueue)
+
+		// Phase 2: gate sees all drained, proceeds to delete.
+		err = controller.deleteServingGroup(context.Background(), ms, sgName)
+		assert.NoError(t, err)
+		assert.Equal(t, datastore.ServingGroupDeleting, controller.store.GetServingGroupStatus(nsn, sgName))
+	})
+
+	t.Run("drain_disabled_deletes_immediately", func(t *testing.T) {
+		controller, _, ms, sgName, _ := makeController(t, 0)
+		nsn := utils.GetNamespaceName(ms)
+
+		err := controller.deleteServingGroup(context.Background(), ms, sgName)
+		assert.NoError(t, err)
+		// drainTimeout=0: goes straight to Deleting, no Draining phase.
+		assert.Equal(t, datastore.ServingGroupDeleting, controller.store.GetServingGroupStatus(nsn, sgName))
+	})
+}
+
+// TestPatchTrafficDrainingRetriesThenForceDeletes verifies that when patching
+// traffic-draining fails after retries, the pod is force-deleted (so the router
+// drops its traffic via DeletionTimestamp) instead of being left to time out.
+func TestPatchTrafficDrainingRetriesThenForceDeletes(t *testing.T) {
+	client := kubefake.NewSimpleClientset()
+	kthenaClient := kthenafake.NewSimpleClientset()
+	volcanoClient := volcanofake.NewSimpleClientset()
+	apiextClient := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
+	controller, err := NewModelServingController(client, kthenaClient, volcanoClient, apiextClient)
+	assert.NoError(t, err)
+	controller.podGroupManager = &fakePodGroupManager{deleteFunc: podgroupmanager.NewManager(client, volcanoClient, apiextClient, nil).DeletePodGroup}
+	controller.SetDrainTimeout(5 * time.Minute)
+
+	// Make every patch on this pod fail (apiserver unavailable).
+	client.PrependReactor("patch", "pods", func(action kubetesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("apiserver unavailable")
+	})
+
+	ms := &workloadv1alpha1.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "ms", Namespace: "default"}}
+	sgName := "ms-0"
+	controller.store.AddServingGroup(utils.GetNamespaceName(ms), 0, "rev-1")
+	controller.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), sgName, datastore.ServingGroupRunning)
+
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "p", Namespace: "default",
+		Labels: map[string]string{workloadv1alpha1.GroupNameLabelKey: sgName},
+	}}
+	_, err = client.CoreV1().Pods("default").Create(context.TODO(), pod, metav1.CreateOptions{})
+	assert.NoError(t, err)
+	assert.NoError(t, controller.podsInformer.GetIndexer().Add(pod))
+	drainWorkqueue(t, controller.workqueue)
+
+	// Phase 1: patch fails 3x -> force-delete the pod.
+	err = controller.deleteServingGroup(context.Background(), ms, sgName)
+	assert.NoError(t, err)
+
+	// A delete should have been issued for the pod (force-delete on patch failure).
+	deleteCount := 0
+	patchCount := 0
+	for _, a := range client.Actions() {
+		switch a.GetVerb() {
+		case "delete":
+			deleteCount++
+		case "patch":
+			patchCount++
+		}
+	}
+	assert.Equal(t, 1, deleteCount, "pod should be force-deleted when drain annotation patch fails")
+
+	// And the patch was attempted 3 times (retries) before force-delete.
+	assert.Equal(t, 3, patchCount, "patch should be retried 3 times before force-delete")
+}
