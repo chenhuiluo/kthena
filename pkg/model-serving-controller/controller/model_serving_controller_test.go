@@ -8142,6 +8142,97 @@ func TestDeleteOutdatedRolesForRoleRollingUpdateWithMaxUnavailable(t *testing.T)
 	}
 }
 
+// TestManageRollingUpdateRoleRollingUpdateSgRevisionRebuiltToNew verifies the
+// restart-rebuild bug: when the controller restarts, the ServingGroup revision
+// is rebuilt from the first pod seen and can end up at the new revision even
+// though the group still contains old-revision roles. RoleRollingUpdate must
+// still treat such a group as outdated (by per-role template hash) and delete
+// the old roles; otherwise the old role is never drained/deleted and the
+// surge replica is never reclaimed, leaving ready replicas > spec.replicas.
+func TestManageRollingUpdateRoleRollingUpdateSgRevisionRebuiltToNew(t *testing.T) {
+	ns := "kthena-test"
+	msName := "qwen36-kthena-sglang"
+	groupName := "qwen36-kthena-sglang-0"
+	newRevision := "5d474d4564"
+	oldRevision := "647b9c7687"
+
+	kubeClient := kubefake.NewSimpleClientset()
+	modelServingClient := kthenafake.NewSimpleClientset()
+	apiextensionsClient := apiextfake.NewSimpleClientset()
+	controller, err := NewModelServingController(kubeClient, modelServingClient, nil, apiextensionsClient)
+	require.NoError(t, err)
+	controller.store = datastore.New()
+
+	role := workloadv1alpha1.Role{
+		Name:     "inference",
+		Replicas: ptr.To[int32](2),
+		RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+			MaxUnavailable: ptr.To(intstr.FromInt(0)),
+			MaxSurge:       ptr.To(intstr.FromInt(1)),
+		},
+		EntryTemplate: workloadv1alpha1.PodTemplateSpec{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "nginx"}}},
+		},
+	}
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: msName},
+		Spec: workloadv1alpha1.ModelServingSpec{
+			Replicas:        ptr.To[int32](1),
+			RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
+			Template:        workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{role}},
+		},
+	}
+	newHash := utils.CalRoleTemplateHash(role)
+	oldHash := "6f69d7bdd5" // differs from newHash
+
+	nsn := utils.GetNamespaceName(ms)
+	// Post-restart state: SG.Revision rebuilt to new (new-revision pod seen
+	// first), but the group still holds an old-revision role (inference-1)
+	// plus a surge replica (inference-2). The surge makes allReplicas=3 so
+	// maxUnavailable:0 leaves a deletion budget (3-2-0=1).
+	controller.store.AddServingGroup(nsn, 0, newRevision)
+	controller.store.AddRole(nsn, groupName, "inference", "inference-0", newRevision, newHash)
+	require.NoError(t, controller.store.UpdateRoleStatus(nsn, groupName, "inference", "inference-0", datastore.RoleRunning))
+	controller.store.AddRole(nsn, groupName, "inference", "inference-1", oldRevision, oldHash)
+	require.NoError(t, controller.store.UpdateRoleStatus(nsn, groupName, "inference", "inference-1", datastore.RoleRunning))
+	controller.store.AddRole(nsn, groupName, "inference", "inference-2", newRevision, newHash)
+	require.NoError(t, controller.store.UpdateRoleStatus(nsn, groupName, "inference", "inference-2", datastore.RoleRunning))
+
+	// All roles are Running, so the ServingGroup is Running.
+	require.NoError(t, controller.store.UpdateServingGroupStatus(nsn, groupName, datastore.ServingGroupRunning))
+
+	// Pre-create the old-revision pod for DeleteRole's drain path (drainTimeout
+	// defaults to 0 on a fresh controller, so the gate falls through to deletion).
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      "qwen36-kthena-sglang-0-inference-1-0",
+			Labels: map[string]string{
+				workloadv1alpha1.GroupNameLabelKey: groupName,
+				workloadv1alpha1.RoleLabelKey:      "inference",
+				workloadv1alpha1.RoleIDKey:         "inference-1",
+			},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main"}}},
+	}
+	_, err = kubeClient.CoreV1().Pods(ns).Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	err = controller.manageRollingUpdate(context.Background(), ms, newRevision)
+	require.NoError(t, err)
+
+	// The old-revision role (inference-1) must be deleted even though
+	// SG.Revision == newRevision. Without the fix, SG.Revision == revision
+	// short-circuits the group out of the outdated list and no deletion occurs.
+	deletions := 0
+	for _, action := range kubeClient.Actions() {
+		if action.Matches("delete-collection", "pods") || action.Matches("delete", "pods") {
+			deletions++
+		}
+	}
+	assert.Greater(t, deletions, 0, "old-revision role must be deleted even when SG.Revision is rebuilt to new on restart")
+}
+
 func TestRolesToDeleteForRoleRollingUpdate(t *testing.T) {
 	ns := "default"
 	msName := "test-ms"

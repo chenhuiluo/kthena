@@ -1220,6 +1220,28 @@ func (c *ModelServingController) hasUpdateableOutdatedRole(
 	return false
 }
 
+// sgHasOutdatedRole reports whether a ServingGroup has any outdated role replica
+// (template hash differs from the spec) across its roleSpecs. Inspects per-role
+// hashes rather than SG.Revision, which can be rebuilt to the new revision on
+// restart before all roles are updated. Partition-protected and Deleting roles
+// are skipped, matching hasUpdateableOutdatedRole semantics.
+func (c *ModelServingController) sgHasOutdatedRole(
+	ms *workloadv1alpha1.ModelServing,
+	sg datastore.ServingGroup,
+) bool {
+	for _, roleSpec := range ms.Spec.Template.Roles {
+		roleList, err := c.store.GetRoleList(utils.GetNamespaceName(ms), sg.Name, roleSpec.Name)
+		if err != nil {
+			klog.Errorf("sgHasOutdatedRole: failed to get roles for role %s in ServingGroup %s: %v", roleSpec.Name, sg.Name, err)
+			continue
+		}
+		if c.hasUpdateableOutdatedRole(ms, sg.Name, roleSpec, roleList) {
+			return true
+		}
+	}
+	return false
+}
+
 // roleTemplateForReplica resolves the role template, revision, and hash to use when recreating pods for a replica.
 // Partition-protected replicas keep the revision recorded on the role (or CurrentRevision) and load the old template from ControllerRevision.
 func (c *ModelServingController) roleTemplateForReplica(
@@ -1415,14 +1437,20 @@ func (c *ModelServingController) manageRollingUpdate(ctx context.Context, ms *wo
 	groupsAfterPartition := servingGroupList[partition:]
 
 	newServingGroupUnavailableCount := 0
+	// RoleRollingUpdate judges outdated per-role by hash; SG.Revision may be
+	// rebuilt to the new revision on restart before all roles update, so a group
+	// still containing old-revision roles must still be treated as outdated.
+	// ServingGroupRollingUpdate replaces whole groups and keeps the SG.Revision check.
+	isRoleRollingUpdate := ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.Type == workloadv1alpha1.RoleRollingUpdate
 	for _, sg := range groupsAfterPartition {
+		roleOutdated := isRoleRollingUpdate && c.sgHasOutdatedRole(ms, sg)
 		if sg.Status != datastore.ServingGroupRunning {
-			if sg.Revision == revision {
+			if sg.Revision == revision && !roleOutdated {
 				newServingGroupUnavailableCount++
 			} else {
 				notRunningOutdatedGroups = append(notRunningOutdatedGroups, sg)
 			}
-		} else if sg.Revision != revision {
+		} else if sg.Revision != revision || roleOutdated {
 			runningOutdatedGroups = append(runningOutdatedGroups, sg)
 		}
 	}
