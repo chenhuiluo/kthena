@@ -35,10 +35,12 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -702,15 +704,23 @@ func (s *store) markPodDrainedIfZero(ctx context.Context, pod *PodInfo) {
 		klog.Errorf("failed to marshal traffic-drained patch for pod %s/%s: %v", podObj.Namespace, podObj.Name, err)
 		return
 	}
-	if _, err := s.kubeClient.CoreV1().Pods(podObj.Namespace).Patch(
-		ctx, podObj.Name, types.MergePatchType, patch, metav1.PatchOptions{},
-	); err != nil {
-		klog.Errorf("failed to patch traffic-drained on pod %s/%s: %v", podObj.Namespace, podObj.Name, err)
+	// Retry transient errors with client-go backoff (terminal NotFound/Forbidden/
+	// Invalid skipped). The Patch is idempotent (merge-patch traffic-drained=true);
+	// on success SetPodDrained below makes the next scrape cycle short-circuit.
+	patchErr := retry.OnError(retry.DefaultRetry, func(e error) bool {
+		return !apierrors.IsNotFound(e) && !apierrors.IsForbidden(e) && !apierrors.IsInvalid(e)
+	}, func() error {
+		_, e := s.kubeClient.CoreV1().Pods(podObj.Namespace).Patch(
+			ctx, podObj.Name, types.MergePatchType, patch, metav1.PatchOptions{},
+		)
+		return e
+	})
+	if patchErr != nil {
+		klog.Errorf("failed to patch traffic-drained on pod %s/%s after retries: %v", podObj.Namespace, podObj.Name, patchErr)
 		return
 	}
-	// Mark the in-memory pod object so the next scrape cycle sees it already
-	// drained and skips the patch (PodInfo.Pod is not refreshed by the API server
-	// until an informer update arrives).
+	// In-memory mark so the next scrape cycle skips the patch (PodInfo.Pod isn't
+	// refreshed by the API server until an informer update arrives).
 	pod.SetPodDrained()
 	klog.V(2).Infof("Pod %s/%s drained (in-flight zero), annotated traffic-drained", podObj.Namespace, podObj.Name)
 }

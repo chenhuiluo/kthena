@@ -2869,10 +2869,10 @@ func (c *ModelServingController) createPod(
 
 // patchTrafficDraining annotates pods with traffic-draining=<RFC3339 timestamp>
 // so the router stops sending them new traffic (lossless upgrade). The timestamp
-// lets the controller bound the drain wait (drainTimeout). Each pod is patched
-// with up to 3 retries (100ms/200ms/400ms backoff) to ride out apiserver hiccups.
-// Returns the pods that could not be annotated after retries — the caller force-
-// deletes them (K8s deletion triggers router traffic removal via DeletionTimestamp).
+// lets the controller bound the drain wait (drainTimeout). Retries transient
+// errors with client-go backoff (terminal NotFound/Forbidden/Invalid skipped);
+// pods that still fail are returned for force-delete (K8s DeletionTimestamp
+// removes them from scheduling).
 func (c *ModelServingController) patchTrafficDraining(ctx context.Context, pods []*corev1.Pod) []*corev1.Pod {
 	now := time.Now().Format(time.RFC3339)
 	patch, err := json.Marshal(map[string]interface{}{
@@ -2886,29 +2886,20 @@ func (c *ModelServingController) patchTrafficDraining(ctx context.Context, pods 
 		klog.Errorf("failed to marshal traffic-draining patch: %v", err)
 		return pods
 	}
-	backoff := []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond}
 	var failed []*corev1.Pod
 	for _, pod := range pods {
 		if _, ok := pod.Annotations[utils.TrafficDrainingAnnotation]; ok {
 			continue // already draining
 		}
-		var patchErr error
-		for attempt := 0; attempt < len(backoff); attempt++ {
-			_, patchErr = c.kubeClientSet.CoreV1().Pods(pod.Namespace).Patch(
+		patchErr := retry.OnError(retry.DefaultRetry, func(err error) bool {
+			// Don't retry terminal errors (e.g. pod already gone, forbidden).
+			return !apierrors.IsNotFound(err) && !apierrors.IsForbidden(err) && !apierrors.IsInvalid(err)
+		}, func() error {
+			_, e := c.kubeClientSet.CoreV1().Pods(pod.Namespace).Patch(
 				ctx, pod.Name, types.MergePatchType, patch, metav1.PatchOptions{},
 			)
-			if patchErr == nil {
-				break
-			}
-			// Don't retry on terminal errors (e.g. pod already gone, forbidden).
-			if apierrors.IsNotFound(patchErr) || apierrors.IsForbidden(patchErr) || apierrors.IsInvalid(patchErr) {
-				break
-			}
-			klog.V(4).Infof("patch traffic-draining attempt %d on pod %s/%s failed: %v", attempt+1, pod.Namespace, pod.Name, patchErr)
-			if attempt < len(backoff)-1 {
-				time.Sleep(backoff[attempt])
-			}
-		}
+			return e
+		})
 		if patchErr != nil {
 			klog.Warningf("failed to patch traffic-draining on pod %s/%s after retries: %v (will force-delete to remove traffic)", pod.Namespace, pod.Name, patchErr)
 			failed = append(failed, pod)
