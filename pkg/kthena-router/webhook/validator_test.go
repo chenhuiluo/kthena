@@ -18,16 +18,22 @@ package webhook
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
 	networkingv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 )
 
+func ptrInt32(v int32) *int32 { return &v }
+
 func TestValidateModelRoute(t *testing.T) {
 	weight0 := uint32(0)
+	weight20 := uint32(20)
+	weight80 := uint32(80)
 	invalidHeaderRegex := "["
 	invalidURIRegex := "["
 
@@ -146,6 +152,57 @@ func TestValidateModelRoute(t *testing.T) {
 			expectValid: true,
 		},
 		{
+			name: "valid model route with external provider target",
+			modelRoute: &networkingv1alpha1.ModelRoute{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelRoute",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-route",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelRouteSpec{
+					ModelName: "test-model",
+					Rules: []*networkingv1alpha1.Rule{
+						{
+							Name: "test-rule",
+							TargetModels: []*networkingv1alpha1.TargetModel{
+								{ExternalModelProviderName: "openai-provider"},
+							},
+						},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			name: "valid model route with weighted internal and external targets",
+			modelRoute: &networkingv1alpha1.ModelRoute{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelRoute",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-route",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelRouteSpec{
+					ModelName: "test-model",
+					Rules: []*networkingv1alpha1.Rule{
+						{
+							Name: "test-rule",
+							TargetModels: []*networkingv1alpha1.TargetModel{
+								{ModelServerName: "test-server", Weight: &weight80},
+								{ExternalModelProviderName: "openai-provider", Weight: &weight20},
+							},
+						},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
 			name: "invalid model route - missing both model name and lora adapters",
 			modelRoute: &networkingv1alpha1.ModelRoute{
 				TypeMeta: metav1.TypeMeta{
@@ -170,7 +227,7 @@ func TestValidateModelRoute(t *testing.T) {
 				},
 			},
 			expectValid:    false,
-			expectedReason: "validation failed:   - spec: Required value: either modelName or loraAdapters must be specified",
+			expectedReason: "validation failed:\n  - spec: Required value: either modelName or loraAdapters must be specified",
 		},
 		{
 			name: "invalid model route - empty string in lora adapters",
@@ -198,7 +255,7 @@ func TestValidateModelRoute(t *testing.T) {
 				},
 			},
 			expectValid:    false,
-			expectedReason: "validation failed:   - spec.loraAdapters[1]: Invalid value: \"\": lora adapter name cannot be an empty string",
+			expectedReason: "validation failed:\n  - spec.loraAdapters[1]: Invalid value: \"\": lora adapter name cannot be an empty string",
 		},
 		{
 			name: "invalid model route - multiple empty strings in lora adapters",
@@ -226,7 +283,7 @@ func TestValidateModelRoute(t *testing.T) {
 				},
 			},
 			expectValid:    false,
-			expectedReason: "validation failed:   - spec.loraAdapters[0]: Invalid value: \"\": lora adapter name cannot be an empty string  - spec.loraAdapters[2]: Invalid value: \"\": lora adapter name cannot be an empty string",
+			expectedReason: "validation failed:\n  - spec.loraAdapters[0]: Invalid value: \"\": lora adapter name cannot be an empty string\n  - spec.loraAdapters[2]: Invalid value: \"\": lora adapter name cannot be an empty string",
 		},
 		{
 			name: "invalid model route - all lora adapters are empty",
@@ -254,7 +311,7 @@ func TestValidateModelRoute(t *testing.T) {
 				},
 			},
 			expectValid:    false,
-			expectedReason: "validation failed:   - spec.loraAdapters[0]: Invalid value: \"\": lora adapter name cannot be an empty string  - spec.loraAdapters[1]: Invalid value: \"\": lora adapter name cannot be an empty string",
+			expectedReason: "validation failed:\n  - spec.loraAdapters[0]: Invalid value: \"\": lora adapter name cannot be an empty string\n  - spec.loraAdapters[1]: Invalid value: \"\": lora adapter name cannot be an empty string",
 		},
 		{
 			name: "invalid model route - empty model name and empty lora adapters list",
@@ -283,7 +340,7 @@ func TestValidateModelRoute(t *testing.T) {
 				},
 			},
 			expectValid:    false,
-			expectedReason: "validation failed:   - spec: Required value: either modelName or loraAdapters must be specified",
+			expectedReason: "validation failed:\n  - spec: Required value: either modelName or loraAdapters must be specified",
 		},
 		{
 			name: "invalid model route - rule with empty targetModels",
@@ -307,7 +364,7 @@ func TestValidateModelRoute(t *testing.T) {
 				},
 			},
 			expectValid:    false,
-			expectedReason: "validation failed:   - spec.rules[0].targetModels: Required value: each rule must have at least one target model",
+			expectedReason: "validation failed:\n  - spec.rules[0].targetModels: Required value: each rule must have at least one target model",
 		},
 		{
 			name: "invalid model route - multiple rules with empty targetModels",
@@ -337,10 +394,10 @@ func TestValidateModelRoute(t *testing.T) {
 				},
 			},
 			expectValid:    false,
-			expectedReason: "validation failed:   - spec.rules[1].targetModels: Required value: each rule must have at least one target model",
+			expectedReason: "validation failed:\n  - spec.rules[1].targetModels: Required value: each rule must have at least one target model",
 		},
 		{
-			name: "invalid model route - empty modelServerName",
+			name: "invalid model route - empty target reference",
 			modelRoute: &networkingv1alpha1.ModelRoute{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: "networking.serving.volcano.sh/v1alpha1",
@@ -363,7 +420,88 @@ func TestValidateModelRoute(t *testing.T) {
 				},
 			},
 			expectValid:    false,
-			expectedReason: "validation failed:   - spec.rules[0].targetModels[0].modelServerName: Invalid value: \"\": modelServerName cannot be an empty string",
+			expectedReason: "validation failed:\n  - spec.rules[0].targetModels[0]: Invalid value: \"/\": exactly one of modelServerName or externalModelProviderName must be set",
+		},
+		{
+			name: "invalid model route - target has both model server and external provider",
+			modelRoute: &networkingv1alpha1.ModelRoute{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelRoute",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-route",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelRouteSpec{
+					ModelName: "test-model",
+					Rules: []*networkingv1alpha1.Rule{
+						{
+							Name: "test-rule",
+							TargetModels: []*networkingv1alpha1.TargetModel{
+								{
+									ModelServerName:           "test-server",
+									ExternalModelProviderName: "openai-provider",
+								},
+							},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:\n  - spec.rules[0].targetModels[0]: Invalid value: \"test-server/openai-provider\": exactly one of modelServerName or externalModelProviderName must be set",
+		},
+		{
+			name: "invalid model route - target has neither model server nor external provider",
+			modelRoute: &networkingv1alpha1.ModelRoute{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelRoute",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-route",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelRouteSpec{
+					ModelName: "test-model",
+					Rules: []*networkingv1alpha1.Rule{
+						{
+							Name: "test-rule",
+							TargetModels: []*networkingv1alpha1.TargetModel{
+								{},
+							},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:\n  - spec.rules[0].targetModels[0]: Invalid value: \"/\": exactly one of modelServerName or externalModelProviderName must be set",
+		},
+		{
+			name: "invalid model route - lora route uses external provider",
+			modelRoute: &networkingv1alpha1.ModelRoute{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelRoute",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-route",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelRouteSpec{
+					LoraAdapters: []string{"adapter1"},
+					Rules: []*networkingv1alpha1.Rule{
+						{
+							Name: "test-rule",
+							TargetModels: []*networkingv1alpha1.TargetModel{
+								{ExternalModelProviderName: "openai-provider"},
+							},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:\n  - spec.rules[0].targetModels[0].externalModelProviderName: Invalid value: \"openai-provider\": lora routes must target modelServerName",
 		},
 		{
 			name: "invalid model route - all target weights are zero",
@@ -390,7 +528,7 @@ func TestValidateModelRoute(t *testing.T) {
 				},
 			},
 			expectValid:    false,
-			expectedReason: "validation failed:   - spec.rules[0].targetModels: Invalid value: 0: total weight must be greater than zero",
+			expectedReason: "validation failed:\n  - spec.rules[0].targetModels: Invalid value: 0: total weight must be greater than zero",
 		},
 		{
 			name: "invalid model route - invalid header regex",
@@ -421,7 +559,7 @@ func TestValidateModelRoute(t *testing.T) {
 				},
 			},
 			expectValid:    false,
-			expectedReason: "validation failed:   - spec.rules[0].modelMatch.headers[x-user].regex: Invalid value: \"[\": error parsing regexp: missing closing ]: `[`",
+			expectedReason: "validation failed:\n  - spec.rules[0].modelMatch.headers[x-user].regex: Invalid value: \"[\": error parsing regexp: missing closing ]: `[`",
 		},
 		{
 			name: "invalid model route - invalid uri regex",
@@ -452,7 +590,7 @@ func TestValidateModelRoute(t *testing.T) {
 				},
 			},
 			expectValid:    false,
-			expectedReason: "validation failed:   - spec.rules[0].modelMatch.uri.regex: Invalid value: \"[\": error parsing regexp: missing closing ]: `[`",
+			expectedReason: "validation failed:\n  - spec.rules[0].modelMatch.uri.regex: Invalid value: \"[\": error parsing regexp: missing closing ]: `[`",
 		},
 		{
 			name: "invalid model route - nil rule",
@@ -473,7 +611,7 @@ func TestValidateModelRoute(t *testing.T) {
 				},
 			},
 			expectValid:    false,
-			expectedReason: "validation failed:   - spec.rules[0]: Invalid value: null: rule must not be nil",
+			expectedReason: "validation failed:\n  - spec.rules[0]: Invalid value: null: rule must not be nil",
 		},
 		{
 			name: "invalid model route - combined errors: missing model name and empty targetModels",
@@ -496,7 +634,7 @@ func TestValidateModelRoute(t *testing.T) {
 				},
 			},
 			expectValid:    false,
-			expectedReason: "validation failed:   - spec: Required value: either modelName or loraAdapters must be specified  - spec.rules[0].targetModels: Required value: each rule must have at least one target model",
+			expectedReason: "validation failed:\n  - spec: Required value: either modelName or loraAdapters must be specified\n  - spec.rules[0].targetModels: Required value: each rule must have at least one target model",
 		},
 	}
 
@@ -517,4 +655,563 @@ func TestValidateModelRoute(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateModelRouteRejectsNilTargetModel(t *testing.T) {
+	validator := NewKthenaRouterValidator(fake.NewSimpleClientset(), 8080)
+	allowed, reason := validator.validateModelRoute(&networkingv1alpha1.ModelRoute{
+		Spec: networkingv1alpha1.ModelRouteSpec{
+			ModelName: "test-model",
+			Rules: []*networkingv1alpha1.Rule{{
+				TargetModels: []*networkingv1alpha1.TargetModel{nil},
+			}},
+		},
+	})
+
+	assert.False(t, allowed)
+	assert.Contains(t, reason, "spec.rules[0].targetModels[0]")
+	assert.Contains(t, reason, "target model must not be nil")
+}
+
+func TestValidateModelServer(t *testing.T) {
+	tests := []struct {
+		name           string
+		modelServer    *networkingv1alpha1.ModelServer
+		expectValid    bool
+		expectedReason string
+	}{
+		{
+			name: "valid model server",
+			modelServer: &networkingv1alpha1.ModelServer{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelServer",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-server",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{
+							"app": "test-server",
+						},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{
+						Port: 8000,
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			name: "valid model server with pd group",
+			modelServer: &networkingv1alpha1.ModelServer{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelServer",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-server",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{
+							"app": "test-server",
+						},
+						PDGroup: &networkingv1alpha1.PDGroup{
+							GroupKey: "pd-group",
+							PrefillLabels: map[string]string{
+								"role": "prefill",
+							},
+							DecodeLabels: map[string]string{
+								"role": "decode",
+							},
+						},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{
+						Port: 8000,
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			name: "invalid model server - empty workload selector",
+			modelServer: &networkingv1alpha1.ModelServer{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelServer",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-server",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine:  networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{
+						Port: 8000,
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.workloadSelector.matchLabels: Required value: labels must contain at least one label",
+		},
+		{
+			name: "invalid model server - invalid match labels",
+			modelServer: &networkingv1alpha1.ModelServer{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelServer",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-server",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{
+							"app@name": "test-server",
+						},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{
+						Port: 8000,
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.workloadSelector.matchLabels: Invalid value: {\"app@name\":\"test-server\"}: invalid selector: key: Invalid value: \"app@name\": name part must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyName',  or 'my.name',  or '123-abc', regex used for validation is '([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]')",
+		},
+		{
+			name: "invalid model server - empty pd group",
+			modelServer: &networkingv1alpha1.ModelServer{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "networking.serving.volcano.sh/v1alpha1",
+					Kind:       "ModelServer",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-server",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{
+							"app": "test-server",
+						},
+						PDGroup: &networkingv1alpha1.PDGroup{
+							GroupKey:      "",
+							PrefillLabels: map[string]string{},
+							DecodeLabels:  map[string]string{},
+						},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{
+						Port: 8000,
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.workloadSelector.pdGroup.groupKey: Required value: groupKey must be specified  - spec.workloadSelector.pdGroup.prefillLabels: Required value: labels must contain at least one label  - spec.workloadSelector.pdGroup.decodeLabels: Required value: labels must contain at least one label",
+		},
+		{
+			name: "valid model server with connection pool",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-server", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "test-server"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							MaxIdleConnections:        ptrInt32(100),
+							MaxIdleConnectionsPerHost: ptrInt32(64),
+							MaxConnectionsPerHost:     ptrInt32(0),
+							IdleTimeout:               &metav1.Duration{Duration: 90 * time.Second},
+						},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			name: "invalid connection pool - negative max idle per host",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-server", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "test-server"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							MaxIdleConnectionsPerHost: ptrInt32(-1),
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.trafficPolicy.connectionPool.maxIdleConnectionsPerHost: Invalid value: -1: must be non-negative",
+		},
+		{
+			name: "invalid connection pool - non-positive idle timeout",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-server", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "test-server"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							IdleTimeout: &metav1.Duration{Duration: 0},
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.trafficPolicy.connectionPool.idleTimeout: Invalid value: 0: must be a positive duration",
+		},
+		{
+			// SGLang with no explicit kvConnector uses the SGLang connector (concurrent
+			// prefill-decode); a capped maxConnectionsPerHost would deadlock.
+			name: "SGLang with maxConnectionsPerHost cap rejected",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "sglang-capped", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.SGLang,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "sglang-capped"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							MaxConnectionsPerHost: ptrInt32(1),
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:   - spec.trafficPolicy.connectionPool.maxConnectionsPerHost: Invalid value: 1: not supported for SGLang: concurrent prefill-decode requires unlimited per-host connections to avoid deadlock",
+		},
+		{
+			// SGLang with maxConnectionsPerHost unset (0/unlimited) is fine.
+			name: "SGLang without maxConnectionsPerHost cap accepted",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "sglang-uncapped", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.SGLang,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "sglang-uncapped"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							MaxIdleConnectionsPerHost: ptrInt32(64),
+						},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			// SGLang engine with an explicit nixl connector uses serial prefill-decode,
+			// so a capped maxConnectionsPerHost is allowed (no deadlock).
+			name: "SGLang with explicit nixl connector and maxConnectionsPerHost cap accepted",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "sglang-nixl", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.SGLang,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "sglang-nixl"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					KVConnector:  &networkingv1alpha1.KVConnectorSpec{Type: networkingv1alpha1.ConnectorTypeNIXL},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							MaxConnectionsPerHost: ptrInt32(1),
+						},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			// vLLM with a capped maxConnectionsPerHost is fine (serial prefill-decode).
+			name: "vLLM with maxConnectionsPerHost cap accepted",
+			modelServer: &networkingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "vllm-capped", Namespace: "default"},
+				Spec: networkingv1alpha1.ModelServerSpec{
+					InferenceEngine: networkingv1alpha1.VLLM,
+					WorkloadSelector: &networkingv1alpha1.WorkloadSelector{
+						MatchLabels: map[string]string{"app": "vllm-capped"},
+					},
+					WorkloadPort: networkingv1alpha1.WorkloadPort{Port: 8000},
+					TrafficPolicy: &networkingv1alpha1.TrafficPolicy{
+						ConnectionPool: &networkingv1alpha1.ConnectionPool{
+							MaxConnectionsPerHost: ptrInt32(1),
+						},
+					},
+				},
+			},
+			expectValid: true,
+		},
+	}
+
+	kubeClient := fake.NewSimpleClientset()
+	validator := NewKthenaRouterValidator(kubeClient, 8080)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			allowed, reason := validator.validateModelServer(tt.modelServer)
+
+			assert.Equal(t, tt.expectValid, allowed, "Expected validation result should match")
+
+			if !tt.expectValid {
+				assert.Equal(t, tt.expectedReason, reason, "Error message should match expected reason")
+			} else {
+				assert.Empty(t, reason, "Reason should be empty for valid model servers")
+			}
+		})
+	}
+}
+
+func TestValidateExternalModelProvider(t *testing.T) {
+	optionalTrue := true
+
+	tests := []struct {
+		name           string
+		provider       *networkingv1alpha1.ExternalModelProvider
+		expectValid    bool
+		expectedReason string
+	}{
+		{
+			name: "valid openai provider",
+			provider: &networkingv1alpha1.ExternalModelProvider{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "openai-provider",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: networkingv1alpha1.OpenAI,
+					Model:        ptrString("gpt-4o-mini"),
+					BaseURL:      "https://api.openai.com/v1",
+					Auth: &networkingv1alpha1.ProviderAuth{
+						SecretRef: corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "openai-api-key"},
+							Key:                  "apiKey",
+						},
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			name: "valid anthropic provider with version header",
+			provider: &networkingv1alpha1.ExternalModelProvider{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "anthropic-provider",
+					Namespace: "default",
+				},
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: networkingv1alpha1.Anthropic,
+					Model:        ptrString("claude-sonnet"),
+					BaseURL:      "https://api.anthropic.com",
+					Auth: &networkingv1alpha1.ProviderAuth{
+						Scheme: networkingv1alpha1.ProviderAuthSchemeBearer,
+						SecretRef: corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "anthropic-api-key"},
+							Key:                  "apiKey",
+						},
+					},
+					Headers: map[string]string{
+						"anthropic-version": "2023-06-01",
+					},
+				},
+			},
+			expectValid: true,
+		},
+		{
+			name: "invalid provider - unsupported auth scheme",
+			provider: &networkingv1alpha1.ExternalModelProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "bad-provider", Namespace: "default"},
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: networkingv1alpha1.Anthropic,
+					BaseURL:      "https://api.example.com",
+					Auth: &networkingv1alpha1.ProviderAuth{
+						Scheme: "Basic",
+						SecretRef: corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "provider-secret"},
+							Key:                  "apiKey",
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:\n  - spec.auth.scheme: Unsupported value: \"Basic\": supported values: \"Bearer\", \"APIKey\"",
+		},
+		{
+			name: "invalid provider - http baseURL",
+			provider: &networkingv1alpha1.ExternalModelProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "bad-provider", Namespace: "default"},
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: networkingv1alpha1.OpenAI,
+					BaseURL:      "http://api.example.com",
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:\n  - spec.baseURL: Invalid value: \"http://api.example.com\": baseURL must use https",
+		},
+		{
+			name: "invalid provider - url contains userinfo query and fragment",
+			provider: &networkingv1alpha1.ExternalModelProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "bad-provider", Namespace: "default"},
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: networkingv1alpha1.OpenAI,
+					BaseURL:      "https://user@example.com/v1?debug=true#frag",
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:\n  - spec.baseURL: Invalid value: \"https://user@example.com/v1?debug=true#frag\": baseURL must not contain userinfo, query, or fragment",
+		},
+		{
+			name: "invalid provider - reserved static authorization header",
+			provider: &networkingv1alpha1.ExternalModelProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "bad-provider", Namespace: "default"},
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: networkingv1alpha1.OpenAI,
+					BaseURL:      "https://api.example.com/v1",
+					Headers: map[string]string{
+						"authorization": "Bearer unsafe",
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:\n  - spec.headers[authorization]: Invalid value: \"authorization\": header is reserved and cannot be configured as a static header",
+		},
+		{
+			name: "invalid provider - reserved static x-api-key header",
+			provider: &networkingv1alpha1.ExternalModelProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "bad-provider", Namespace: "default"},
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: networkingv1alpha1.Anthropic,
+					BaseURL:      "https://api.anthropic.com",
+					Headers: map[string]string{
+						"X-API-Key": "unsafe",
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:\n  - spec.headers[X-API-Key]: Invalid value: \"X-API-Key\": header is reserved and cannot be configured as a static header",
+		},
+		{
+			name: "invalid provider - malformed static header name",
+			provider: &networkingv1alpha1.ExternalModelProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "bad-provider", Namespace: "default"},
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: networkingv1alpha1.OpenAI,
+					BaseURL:      "https://api.example.com/v1",
+					Headers: map[string]string{
+						"Bad Header": "value",
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:\n  - spec.headers[Bad Header]: Invalid value: \"Bad Header\": header name is invalid",
+		},
+		{
+			name: "invalid provider - static header value contains newline",
+			provider: &networkingv1alpha1.ExternalModelProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "bad-provider", Namespace: "default"},
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: networkingv1alpha1.OpenAI,
+					BaseURL:      "https://api.example.com/v1",
+					Headers: map[string]string{
+						"X-Tenant": "tenant-a\r\nX-Injected: true",
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:\n  - spec.headers[X-Tenant]: Invalid value: \"tenant-a\\r\\nX-Injected: true\": header value must be a valid HTTP header field value",
+		},
+		{
+			name: "invalid provider - static header value contains DEL",
+			provider: &networkingv1alpha1.ExternalModelProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "bad-provider", Namespace: "default"},
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: networkingv1alpha1.OpenAI,
+					BaseURL:      "https://api.example.com/v1",
+					Headers: map[string]string{
+						"X-Tenant": "tenant-a\x7f",
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:\n  - spec.headers[X-Tenant]: Invalid value: \"tenant-a\\x7f\": header value must be a valid HTTP header field value",
+		},
+		{
+			name: "invalid provider - optional secret ref",
+			provider: &networkingv1alpha1.ExternalModelProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "bad-provider", Namespace: "default"},
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					ProviderType: networkingv1alpha1.OpenAI,
+					BaseURL:      "https://api.example.com/v1",
+					Auth: &networkingv1alpha1.ProviderAuth{
+						SecretRef: corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "openai-api-key"},
+							Key:                  "apiKey",
+							Optional:             &optionalTrue,
+						},
+					},
+				},
+			},
+			expectValid:    false,
+			expectedReason: "validation failed:\n  - spec.auth.secretRef.optional: Invalid value: true: optional must be false or unset",
+		},
+		{
+			name: "invalid provider - multiple validation errors use separate lines",
+			provider: &networkingv1alpha1.ExternalModelProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "bad-provider", Namespace: "default"},
+				Spec: networkingv1alpha1.ExternalModelProviderSpec{
+					BaseURL: "http://api.example.com",
+					Auth: &networkingv1alpha1.ProviderAuth{
+						SecretRef: corev1.SecretKeySelector{},
+					},
+				},
+			},
+			expectValid: false,
+			expectedReason: "validation failed:\n" +
+				"  - spec.baseURL: Invalid value: \"http://api.example.com\": baseURL must use https\n" +
+				"  - spec.auth.secretRef.name: Required value: secret name is required\n" +
+				"  - spec.auth.secretRef.key: Required value: secret key is required",
+		},
+	}
+
+	kubeClient := fake.NewSimpleClientset()
+	validator := NewKthenaRouterValidator(kubeClient, 8080)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			allowed, reason := validator.validateExternalModelProvider(tt.provider)
+
+			assert.Equal(t, tt.expectValid, allowed, "Expected validation result should match")
+			if !tt.expectValid {
+				assert.Equal(t, tt.expectedReason, reason, "Error message should match expected reason")
+			} else {
+				assert.Empty(t, reason, "Reason should be empty for valid providers")
+			}
+		})
+	}
+}
+
+func ptrString(value string) *string {
+	return &value
 }

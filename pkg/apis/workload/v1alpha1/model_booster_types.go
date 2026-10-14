@@ -24,6 +24,10 @@ import (
 )
 
 // ModelBoosterSpec defines the desired state of ModelBooster.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 type ModelBoosterSpec struct {
 	// Name is the name of the model. ModelBooster CR name is restricted by kubernetes, for example, can't contain uppercase letters.
 	// So we use this field to specify the ModelBooster name.
@@ -45,17 +49,42 @@ type ModelBoosterSpec struct {
 }
 
 // ModelBackend defines the configuration for a model backend.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 type ModelBackend struct {
 	// Name is the name of the backend. Can't duplicate with other ModelBackend name in the same ModelBooster CR.
-	// Note: update name will cause the old modelInfer deletion and a new modelInfer creation.
+	// Note: update name will cause the old ModelServing deletion and a new ModelServing creation.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	Name string `json:"name"`
 	// Type is the type of the backend.
 	Type ModelBackendType `json:"type"`
-	// ModelURI is the URI where you download the model. Support hf://, s3://, pvc://, ms://.
-	// +kubebuilder:validation:Pattern=`^(hf://|s3://|pvc://|ms://).+`
+	// ModelURI is the source from which the model is fetched by the downloader init container.
+	// Supported schemes:
+	//   hf://NAMESPACE/REPO         — Hugging Face Hub repository
+	//   ms://NAMESPACE/REPO         — ModelScope repository
+	//   s3://BUCKET/PATH            — S3-compatible object storage
+	//   obs://BUCKET/PATH           — Huawei Object Storage Service (OBS)
+	//   pvc:///CLAIM_NAME/PATH      — path inside a PVC already mounted via CacheURI
+	//
+	// When using pvc://, the downloader reads the given path from the container filesystem.
+	// The downloader init container only mounts the volume specified by CacheURI, so the
+	// modelURI path must be reachable through that mount.  Both CacheURI and modelURI must
+	// reference the same PVC, and the modelURI path must start with the CacheURI mount point.
+	// Example: CacheURI: pvc://model-storage, ModelURI: pvc:///model-storage/models/Qwen
+	// +kubebuilder:validation:Pattern=`^(hf://|s3://|obs://|pvc://|ms://).+`
 	ModelURI string `json:"modelURI"`
-	// CacheURI is the URI where the downloaded model stored. Support hostpath://, pvc://.
+	// CacheURI specifies where the downloaded model is stored and how the storage volume is
+	// mounted inside every pod (both the downloader init container and the inference engine).
+	// Supported schemes:
+	//   pvc://CLAIM_NAME    — PersistentVolumeClaim; the PVC is mounted at /CLAIM_NAME
+	//   hostpath://PATH     — host-local directory; mounted at /PATH
+	//   (empty)             — an ephemeral EmptyDir volume is used (no persistence)
+	//
+	// The downloader writes model files under a hashed sub-directory of this mount path.
+	// The inference engine reads from the same path.  When ModelURI uses pvc://, CacheURI
+	// must also use pvc:// and reference the same PVC so the source path is visible.
 	// +kubebuilder:validation:Pattern=`^(hostpath://|pvc://).+`
 	CacheURI string `json:"cacheURI,omitempty"`
 	// List of sources to populate environment variables in the container.
@@ -101,6 +130,10 @@ type ModelBackend struct {
 }
 
 // ModelBackendType defines the type of model backend.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 // +kubebuilder:validation:Enum=vLLM;vLLMDisaggregated
 type ModelBackendType string
 
@@ -118,6 +151,10 @@ const (
 )
 
 // ModelWorker defines the model worker configuration.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 type ModelWorker struct {
 	// Type is the type of the model worker.
 	// +kubebuilder:default=server
@@ -149,6 +186,10 @@ type ModelWorker struct {
 }
 
 // ModelWorkerType defines the type of model worker.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 // +kubebuilder:validation:Enum=server;prefill;decode;controller;coordinator
 type ModelWorkerType string
 
@@ -166,6 +207,10 @@ const (
 )
 
 // ModelStatus defines the observed state of ModelBooster.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 type ModelStatus struct {
 	// Conditions represents the latest available observations of the model's state.
 	// +listType=map
@@ -176,6 +221,11 @@ type ModelStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
+// ModelStatusConditionType defines a condition type reported by ModelBooster.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 type ModelStatusConditionType string
 
 const (
@@ -188,8 +238,14 @@ const (
 // +kubebuilder:subresource:status
 // +kubebuilder:storageversion
 // +genclient
+// +kubebuilder:printcolumn:name="Active",type="string",JSONPath=".status.conditions[?(@.type=='Active')].status",description="Whether the model booster is active"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // ModelBooster is the Schema for the models API.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 type ModelBooster struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -201,6 +257,10 @@ type ModelBooster struct {
 // +kubebuilder:object:root=true
 
 // ModelBoosterList contains a list of ModelBooster.
+//
+// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
+// Use ModelServing, ModelServer, and ModelRoute instead.
+// ModelBooster will be removed no earlier than Kthena v1.5.
 type ModelBoosterList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`

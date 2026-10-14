@@ -38,7 +38,8 @@ type ModelServerSpec struct {
 	WorkloadSelector *WorkloadSelector `json:"workloadSelector"`
 
 	// WorkloadPort defines the port and protocol configuration for the model server.
-	WorkloadPort WorkloadPort `json:"workloadPort,omitempty"`
+	// +kubebuilder:validation:Required
+	WorkloadPort WorkloadPort `json:"workloadPort"`
 
 	// Traffic Policy for accessing the model server instance.
 	// +optional
@@ -120,15 +121,46 @@ type KVConnectorSpec struct {
 }
 
 type TrafficPolicy struct {
-	// The request timeout for the inference request.
-	// By default, there is no timeout.
+	// Timeout bounds how long the router waits for the backend to start responding,
+	// covering connection setup, sending the request and waiting for the response
+	// headers. It does not bound inference response bodies, so a streamed response
+	// may run longer. Connector setup exchanges may use the timeout for their
+	// complete response. By default, there is no timeout.
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 	// The retry policy for the inference request.
 	// +optional
 	Retry *Retry `json:"retry,omitempty"`
+	// ConnectionPool configures the upstream HTTP connection pool used when
+	// forwarding to this ModelServer's pods. When omitted, a shared default
+	// pool is used. Each ModelServer that sets this gets its own isolated pool.
+	// +optional
+	ConnectionPool *ConnectionPool `json:"connectionPool,omitempty"`
 
 	// TODO: add LoadBalancer policy
+}
+
+// ConnectionPool configures the HTTP connection pool for a ModelServer.
+type ConnectionPool struct {
+	// MaxIdleConnections is the total idle connections across all endpoints.
+	// Defaults to 100 when omitted.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxIdleConnections *int32 `json:"maxIdleConnections,omitempty"`
+	// MaxIdleConnectionsPerHost is the idle connections per pod/endpoint.
+	// Defaults to 64 when omitted.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxIdleConnectionsPerHost *int32 `json:"maxIdleConnectionsPerHost,omitempty"`
+	// MaxConnectionsPerHost limits dialing, active and idle connections per host.
+	// 0 means unlimited. Defaults to 0 when omitted.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxConnectionsPerHost *int32 `json:"maxConnectionsPerHost,omitempty"`
+	// IdleTimeout is how long an idle connection stays open before closing.
+	// Defaults to 90s when omitted.
+	// +optional
+	IdleTimeout *metav1.Duration `json:"idleTimeout,omitempty"`
 }
 
 type Retry struct {
@@ -151,6 +183,10 @@ type ModelServerStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:storageversion
 // +genclient
+// +kubebuilder:printcolumn:name="Engine",type="string",JSONPath=".spec.inferenceEngine",description="Inference engine used to serve the model"
+// +kubebuilder:printcolumn:name="Port",type="integer",JSONPath=".spec.workloadPort.port",description="Model server port"
+// +kubebuilder:printcolumn:name="Protocol",type="string",JSONPath=".spec.workloadPort.protocol",description="Model server protocol"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 //
 // ModelServer is the Schema for the modelservers API.
 type ModelServer struct {

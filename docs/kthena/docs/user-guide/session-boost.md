@@ -30,7 +30,9 @@ flowchart TD
     E --> F
     F -- Yes --> G[Dispatch to backend]
     F -- No --> H[Wait / backpressure]
-    H --> F
+    H --> K{Waited longer than<br/>SESSION_BOOST_TIMEOUT?}
+    K -- Yes --> R[Reject with HTTP 504]
+    K -- No --> F
     G --> I[Request completes]
     I --> J[Mark session completed<br/>promote in LRU cache]
     J --> M[Dequeue next request]
@@ -73,6 +75,7 @@ networking:
       header: "X-Session-ID"
       maxSessions: 4096          # LRU cache of recently-completed sessions kept warm
       inflightPerPod: 16         # total inflight = inflightPerPod x backend pod count
+      timeout: "30s"             # reject requests that wait longer than this with HTTP 504 (set "0s" to disable)
 ```
 
 Apply with Helm:
@@ -98,16 +101,19 @@ env:
   value: "4096"
 - name: SESSION_BOOST_INFLIGHT_PER_POD
   value: "16"                 # total inflight = perPod x backend pod count
+- name: SESSION_BOOST_TIMEOUT
+  value: "30s"               # reject requests that wait longer than this with HTTP 504 (set "0s" to disable)
 ```
 
 ## Configuration Reference
 
-| Environment Variable             | Purpose                                                                          | Default        | Notes                                                                                                                                                                                      |
-| -------------------------------- | -------------------------------------------------------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `ENABLE_SESSION_BOOST`           | Enable the session-boost scheduling strategy                                     | `false`        | Mutually exclusive with `ENABLE_FAIRNESS_SCHEDULING`                                                                                                                                       |
-| `SESSION_BOOST_HEADER`           | HTTP header used to identify conversation sessions                               | `X-Session-ID` | Must match what your clients send                                                                                                                                                          |
-| `SESSION_BOOST_MAX_SESSIONS`     | Max number of recently-completed sessions kept "warm" for boosting (LRU-bounded) | `4096`         | When the cache is full, the least-recently-used session is evicted automatically. Size it by the number of concurrent conversations you want to keep boosted—no time-based tuning required |
-| `SESSION_BOOST_INFLIGHT_PER_POD` | Inflight requests admitted per backend pod                                       | `16`           | The total inflight limit is this value multiplied by the number of backend pods. Size it from the per-pod concurrency (e.g., vLLM's `--max-num-seqs`)                                      |
+| Environment Variable             | Purpose                                                                          | Default        | Notes                                                                                                                                                                                                                                                             |
+| -------------------------------- | -------------------------------------------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ENABLE_SESSION_BOOST`           | Enable the session-boost scheduling strategy                                     | `false`        | Mutually exclusive with `ENABLE_FAIRNESS_SCHEDULING`                                                                                                                                                                                                              |
+| `SESSION_BOOST_HEADER`           | HTTP header used to identify conversation sessions                               | `X-Session-ID` | Must match what your clients send                                                                                                                                                                                                                                 |
+| `SESSION_BOOST_MAX_SESSIONS`     | Max number of recently-completed sessions kept "warm" for boosting (LRU-bounded) | `4096`         | When the cache is full, the least-recently-used session is evicted automatically. Size it by the number of concurrent conversations you want to keep boosted—no time-based tuning required                                                                        |
+| `SESSION_BOOST_INFLIGHT_PER_POD` | Inflight requests admitted per backend pod                                       | `16`           | The total inflight limit is this value multiplied by the number of backend pods. Size it from the per-pod concurrency (e.g., vLLM's `--max-num-seqs`)                                                                                                             |
+| `SESSION_BOOST_TIMEOUT`          | Maximum time a request may wait in the queue before it is rejected with 504      | `30s`          | Enabled by default. A request queued longer than this is rejected with `504 Gateway Timeout`. Set a non-positive duration (e.g. `0s`) to disable it. This is the only server-side queue-wait bound in session-boost mode; `FAIRNESS_QUEUE_TIMEOUT` does not apply |
 
 > `SESSION_BOOST_GRACE_PERIOD` is intentionally omitted from the table above. It is an advanced, scenario-specific knob that is disabled by default; see [Advanced: Grace Period](#advanced-grace-period-use-with-caution).
 
@@ -163,7 +169,10 @@ This design is intentional: inference engines such as vLLM evict their prefix (K
 The session boost queue uses a simple two-level priority:
 
 1. **Boosted requests** (session tracked in the LRU cache) are always dequeued before non-boosted requests.
-2. **Within the same boost level**, requests are served in FIFO order (earliest arrival first).
+2. **Within the boosted group**, requests are ordered by their session's **completion time**: the session whose previous turn completed most recently is served first. Its prefix (KV) cache is the most likely to still be warm on the backend, so serving it first maximizes cache reuse. This ordering does not depend on when the follow-up request arrived, only on how recently the session's last turn finished; ties are broken FIFO by arrival time.
+3. **Among non-boosted requests**, ordering is FIFO (earliest arrival first).
+
+Ordering by completion time (rather than a plain LIFO on arrival) keeps the queue fair: a boosted request cannot be starved by newer arrivals, because a session's completion time is fixed once its turn finishes and does not keep getting pushed back. Every boosted request also still leapfrogs the entire non-boosted tier, so a follow-up turn is always prioritized over unrelated traffic.
 
 ### Backpressure Control
 
@@ -174,17 +183,30 @@ The queue uses two-level admission control to avoid flooding backends:
 
 When a request completes, the queue immediately attempts to dequeue the next request (release-driven dequeue) rather than waiting for the next metrics refresh.
 
+### Queue Wait Timeout (504 Rejection)
+
+Under heavy load a request may sit in the queue for a long time before backend capacity frees up. Session boost does **not** apply the fairness queue timeout (`FAIRNESS_QUEUE_TIMEOUT` only governs the user-fairness queue). Instead, session boost bounds the wait with its own **queue wait timeout** so latency-sensitive front ends **fail fast** and can retry or shed load rather than waiting indefinitely.
+
+The wait timeout rejects over-queued requests with `504 Gateway Timeout`:
+
+- It is controlled by `SESSION_BOOST_TIMEOUT` and **enabled by default** at `30s`.
+- Set a non-positive duration (e.g. `0s`) to disable it; a session-boost request is then bounded only by client disconnect.
+
+If a request waits in the queue longer than `SESSION_BOOST_TIMEOUT`, the router removes it from the queue and responds with `504 Gateway Timeout`. The 504 signals that the request *timed out* waiting for backend capacity (the queue is saturated); the client can retry later or shed load.
+
+> `SESSION_BOOST_TIMEOUT` is the only server-side queue-wait bound in session-boost mode. `FAIRNESS_QUEUE_TIMEOUT` has no effect here—it applies exclusively to the user-fairness strategy. When `SESSION_BOOST_TIMEOUT` is disabled (a non-positive value), a session-boost request is bounded only by client disconnect.
+
 ## Session Boost vs User Fairness
 
 Session boost and user fairness are two mutually exclusive scheduling strategies for the per-model request queue; they configure that queue for different goals:
 
-| Aspect           | Session Boost                      | User Fairness                     |
-| ---------------- | ---------------------------------- | --------------------------------- |
-| Goal             | Maximize prefix cache hits         | Equitable resource allocation     |
-| Activation       | `ENABLE_SESSION_BOOST=true`        | `ENABLE_FAIRNESS_SCHEDULING=true` |
-| Requires user ID | No                                 | Yes                               |
-| Priority logic   | Boosted > non-boosted, FIFO within | Lower recent usage wins           |
-| Best for         | Multi-turn latency optimization    | Multi-tenant contention           |
+| Aspect           | Session Boost                                                | User Fairness                     |
+| ---------------- | ------------------------------------------------------------ | --------------------------------- |
+| Goal             | Maximize prefix cache hits                                   | Equitable resource allocation     |
+| Activation       | `ENABLE_SESSION_BOOST=true`                                  | `ENABLE_FAIRNESS_SCHEDULING=true` |
+| Requires user ID | No                                                           | Yes                               |
+| Priority logic   | Boosted > non-boosted; most-recently-completed session first | Lower recent usage wins           |
+| Best for         | Multi-turn latency optimization                              | Multi-tenant contention           |
 
 The two strategies are **mutually exclusive**; enabling both is a configuration error. Enable one or the other based on your primary scheduling concern.
 
@@ -249,6 +271,14 @@ Session boost only controls queue ordering. If the boosted request is routed to 
 
 Each tracked session consumes minimal memory (just a session ID). The tracker is a bounded LRU cache, so total memory is capped at `SESSION_BOOST_MAX_SESSIONS` entries regardless of how much traffic flows through the router. If memory is a concern, reduce `SESSION_BOOST_MAX_SESSIONS`.
 
+### Clients receive HTTP 504 responses
+
+When `SESSION_BOOST_TIMEOUT` is set (enabled by default at `30s`), the router returns `504 Gateway Timeout` for requests that wait in the queue longer than it. This is expected load-shedding under sustained overload—it means the backends cannot keep up with demand. If you see more 504s than desired:
+
+1. Confirm the backends are healthy and scaled appropriately; add capacity if they are saturated.
+2. Increase `SESSION_BOOST_TIMEOUT` to allow requests to wait longer before rejection.
+3. Disable the timeout by setting `SESSION_BOOST_TIMEOUT` to a non-positive value (e.g. `0s`) so requests are no longer rejected on a wait timeout (they then wait until backend capacity frees up or the client disconnects).
+
 ## Advanced: Grace Period (Use With Caution)
 
 :::warning
@@ -259,9 +289,9 @@ The grace period is an **advanced, scenario-specific** tuning knob. It is **disa
 
 By default, when a request completes the queue immediately dequeues the next request. The grace period (`SESSION_BOOST_GRACE_PERIOD`) instead makes the queue **briefly hold the freed dequeue slot** after a completion, waiting for a follow-up from the *same* session to arrive so it can ride the still-warm prefix cache:
 
-- If a boosted (same-session) request arrives during the grace window, it is admitted first when the window ends, because boosted requests outrank others in the queue.
+- If a boosted (same-session) request arrives during the grace window, it is admitted first when the window ends, because boosted requests outrank others in the queue—and among boosted requests the one whose session completed most recently is at the head.
 - If no boosted request arrives before the window expires, the next non-boosted request proceeds as normal.
-- If the head of the queue is already a boosted request, the grace period is skipped entirely.
+- The queue always waits for the full grace window even when a boosted request is already at the head, because a still-newer same-session follow-up may yet arrive and should be the one to ride the warm prefix cache.
 
 ### When it might help
 

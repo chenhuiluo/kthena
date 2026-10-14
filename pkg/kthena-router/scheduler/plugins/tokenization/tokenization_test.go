@@ -19,9 +19,12 @@ package tokenization
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -74,9 +77,9 @@ func TestIntToByteArray(t *testing.T) {
 // Test TokenizerManager
 func TestTokenizerManager(t *testing.T) {
 	config := TokenizerManagerConfig{
-		EndpointTemplates: map[string]string{
-			EngineVLLM:   "http://%s:8000",
-			EngineSGLang: "http://%s:30000",
+		EndpointPorts: map[string]int{
+			EngineVLLM:   8000,
+			EngineSGLang: 30000,
 		},
 	}
 
@@ -144,6 +147,100 @@ func TestTokenizerManager(t *testing.T) {
 			t.Fatal("Expected non-nil tokenizer for SGLang pod")
 		}
 	})
+
+	// Test IPv6 endpoint construction through the manager path.
+	t.Run("IPv6 endpoint", func(t *testing.T) {
+		pod := testutil.PodInfoWithEngine("pod-vllm-ipv6", "default", "fd00::1", EngineVLLM)
+
+		tok := manager.GetTokenizer("test-model", []*datastore.PodInfo{pod})
+		remote, ok := tok.(*remoteTokenizerImpl)
+		if !ok {
+			t.Fatalf("Expected remote tokenizer, got %T", tok)
+		}
+		if got, want := remote.GetEndpoint(), "http://[fd00::1]:8000"; got != want {
+			t.Fatalf("Tokenizer endpoint = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestBuildTokenizerEndpoint(t *testing.T) {
+	tests := []struct {
+		name  string
+		podIP string
+		port  int
+		want  string
+	}{
+		{
+			name:  "IPv4",
+			podIP: "10.1.2.3",
+			port:  8000,
+			want:  "http://10.1.2.3:8000",
+		},
+		{
+			name:  "IPv6",
+			podIP: "fd00::1",
+			port:  30000,
+			want:  "http://[fd00::1]:30000",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := buildTokenizerEndpoint(tt.podIP, tt.port); got != tt.want {
+				t.Fatalf("buildTokenizerEndpoint() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTokenizerManagerRejectsOutOfRangePort(t *testing.T) {
+	manager := NewTokenizerManager(TokenizerManagerConfig{
+		EndpointPorts: map[string]int{EngineVLLM: maxEndpointPort + 1},
+	})
+	pod := testutil.PodInfoWithEngine("pod-vllm", "default", "10.0.0.10", EngineVLLM)
+
+	if tokenizer := manager.GetTokenizer("test-model", []*datastore.PodInfo{pod}); tokenizer != nil {
+		t.Fatalf("expected no tokenizer for an out-of-range endpoint port, got %T", tokenizer)
+	}
+}
+
+func TestTokenizerManagerReusesHTTPConnections(t *testing.T) {
+	const requests = 20
+
+	var newConnections atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":  3,
+			"tokens": []int{1, 2, 3},
+		})
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			newConnections.Add(1)
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	address := server.Listener.Addr().(*net.TCPAddr)
+	manager := NewTokenizerManager(TokenizerManagerConfig{
+		EndpointPorts: map[string]int{EngineVLLM: address.Port},
+	})
+	defer manager.client.HTTPClient.CloseIdleConnections()
+	pod := testutil.PodInfoWithEngine("pod-vllm", "default", address.IP.String(), EngineVLLM)
+	prompt := &common.ChatMessage{Text: "hello"}
+
+	for range requests {
+		if _, err := manager.TokenizePrompt("test-model", prompt, []*datastore.PodInfo{pod}); err != nil {
+			t.Fatalf("TokenizePrompt failed: %v", err)
+		}
+	}
+
+	if got := newConnections.Load(); got != 1 {
+		t.Fatalf("new TCP connections after %d sequential requests = %d, want 1", requests, got)
+	}
 }
 
 // Test error types
@@ -770,14 +867,14 @@ func TestJSONSerialization(t *testing.T) {
 // Test concurrent access
 func TestConcurrentAccess(t *testing.T) {
 	// Create a mock server for concurrent testing
-	requestCount := 0
+	var requestCount atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		count := requestCount.Add(1)
 		time.Sleep(10 * time.Millisecond) // Simulate processing time
 		response := map[string]interface{}{
 			"count":         1,
 			"max_model_len": 1024,
-			"tokens":        []int{requestCount},
+			"tokens":        []int32{count},
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
@@ -815,8 +912,8 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 
 	// Verify that all requests were processed
-	if requestCount != numRequests {
-		t.Errorf("Expected %d requests, got %d", numRequests, requestCount)
+	if got := requestCount.Load(); got != numRequests {
+		t.Errorf("Expected %d requests, got %d", numRequests, got)
 	}
 }
 
@@ -862,7 +959,7 @@ func BenchmarkTokenizeInputText(b *testing.B) {
 // Test TokenizerManager.TokenizePrompt
 func TestTokenizerManagerTokenizePrompt(t *testing.T) {
 	config := TokenizerManagerConfig{
-		EndpointTemplates: map[string]string{EngineVLLM: "http://%s:8000"},
+		EndpointPorts: map[string]int{EngineVLLM: 8000},
 	}
 
 	manager := NewTokenizerManager(config)

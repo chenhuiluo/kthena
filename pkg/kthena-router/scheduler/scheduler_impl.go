@@ -217,12 +217,6 @@ func (s *SchedulerImpl) Schedule(ctx *framework.Context, pods []*datastore.PodIn
 		s.store.SyncOnFlightCounts()
 	}
 
-	// ===== 第 1 阶段: Filter — 过滤不合格 Pod =====
-	pods, err := s.RunFilterPlugins(pods, ctx)
-	if err != nil {
-		return err
-	}
-
 	// ===== PD 分离分支 =====
 	if ctx.PDGroup != nil {
 		klog.V(4).Info("Using optimized PD disaggregated scheduling")
@@ -238,7 +232,14 @@ func (s *SchedulerImpl) Schedule(ctx *framework.Context, pods []*datastore.PodIn
 			return fmt.Errorf("no decode pod found")
 		}
 
-		// 对 decode Pod 运行 Score 插件打分
+		// The initial pod list contains both prefill and decode roles. Filter the
+		// role-specific list after retrieving it from the store so overloaded
+		// decode pods cannot bypass filters in the optimized PD path.
+		decodePods, err = s.RunFilterPlugins(decodePods, ctx)
+		if err != nil {
+			return err
+		}
+
 		klog.V(4).Info("Running score plugins for decode pod")
 		scores := s.RunScorePlugins(decodePods, ctx)
 
@@ -262,7 +263,12 @@ func (s *SchedulerImpl) Schedule(ctx *framework.Context, pods []*datastore.PodIn
 				continue
 			}
 
-			// 对 prefill Pod 运行 Score 插件打分
+			selectedPods, err = s.RunFilterPlugins(selectedPods, ctx)
+			if err != nil {
+				klog.V(4).InfoS("prefill pods were filtered out", "decode instance", decodePodName, "error", err)
+				continue
+			}
+
 			klog.V(4).Info("Running score plugins for prefill pod")
 			scores = s.RunScorePlugins(selectedPods, ctx)
 			bestPrefillPod := TopNPodInfos(scores, 1)
@@ -284,6 +290,11 @@ func (s *SchedulerImpl) Schedule(ctx *framework.Context, pods []*datastore.PodIn
 	}
 
 	// ===== 同构/PD 聚合分支 =====
+	pods, err := s.RunFilterPlugins(pods, ctx)
+	if err != nil {
+		return err
+	}
+
 	klog.V(4).Info("Running score plugins for PD aggregated pod")
 	scores := s.RunScorePlugins(pods, ctx)
 	// 取 Top5 Pod 作为候选,供上层 proxy() 函数逐个尝试代理
@@ -350,7 +361,9 @@ func (s *SchedulerImpl) RunFilterPlugins(pods []*datastore.PodInfo, ctx *framewo
 //   - gpu-usage: 按 GPU 利用率打分
 //   - random: 随机打分 (用于测试)
 func (s *SchedulerImpl) RunScorePlugins(pods []*datastore.PodInfo, ctx *framework.Context) map[*datastore.PodInfo]int {
-	res := make(map[*datastore.PodInfo]int)
+	res := make(map[*datastore.PodInfo]int, len(pods))
+	// Checked once: V(4) arguments are boxed before klog can discard them
+	logScores := klog.V(4).Enabled()
 	for _, scorePlugin := range s.scorePlugins {
 		// 记录插件执行耗时
 		startTime := time.Now()
@@ -362,11 +375,15 @@ func (s *SchedulerImpl) RunScorePlugins(pods []*datastore.PodInfo, ctx *framewor
 			ctx.MetricsRecorder.RecordSchedulerPluginDuration(scorePlugin.plugin.Name(), metrics.PluginTypeScore, duration)
 		}
 
-		klog.V(4).Infof("ScorePlugin: %s", scorePlugin.plugin.Name())
+		if logScores {
+			klog.Infof("ScorePlugin: %s", scorePlugin.plugin.Name())
+		}
 		// 将各插件打分 × 权重 累加到总分
 		for k, v := range scores {
-			if podName := k.GetPodNamespacedName(); podName.Name != "" {
-				klog.V(4).Infof("Pod: %s/%s, Score: %d", podName.Namespace, podName.Name, v)
+			if logScores {
+				if podName := k.GetPodNamespacedName(); podName.Name != "" {
+					klog.Infof("Pod: %s/%s, Score: %d", podName.Namespace, podName.Name, v)
+				}
 			}
 			if _, ok := res[k]; !ok {
 				res[k] = v * scorePlugin.weight // 首次出现: 直接赋值加权分
@@ -377,7 +394,7 @@ func (s *SchedulerImpl) RunScorePlugins(pods []*datastore.PodInfo, ctx *framewor
 	}
 
 	// 日志输出最终加权总分 (用于调试)
-	if klog.V(4).Enabled() {
+	if logScores {
 		klog.Info("Final Pod Scores:")
 		for k, v := range res {
 			if podName := k.GetPodNamespacedName(); podName.Name != "" {
@@ -410,7 +427,8 @@ func (s *SchedulerImpl) RunPostHooks(ctx *framework.Context, index int) {
 // 用于 Schedule() 的最后一步: 将所有 Score 插件的加权总分排序后取 Top5
 // 排序规则: 分数降序 (score 越高 = 越优)
 func TopNPodInfos(m map[*datastore.PodInfo]int, n int) []*datastore.PodInfo {
-	var list []podInfoWithValue
+	// One entry per scored pod, so the length is known before the loop
+	list := make([]podInfoWithValue, 0, len(m))
 	for k, v := range m {
 		list = append(list, podInfoWithValue{pod: k, score: v})
 	}
@@ -419,11 +437,15 @@ func TopNPodInfos(m map[*datastore.PodInfo]int, n int) []*datastore.PodInfo {
 		return list[i].score > list[j].score
 	})
 
-	res := []*datastore.PodInfo{}
-	for i := range list {
-		if i >= n {
-			break
-		}
+	// Clamp first, make() panics on a negative capacity
+	if n > len(list) {
+		n = len(list)
+	}
+	if n < 0 {
+		n = 0
+	}
+	res := make([]*datastore.PodInfo, 0, n)
+	for i := 0; i < n; i++ {
 		res = append(res, list[i].pod)
 	}
 

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -76,7 +77,7 @@ def _make_redis_client(pipeline: _FakePipeline, keys_result=None, get_results=No
     conn = _FakeRedisConn(pipeline, get_results=get_results)
     client = MagicMock()
     client.get_connection = AsyncMock(return_value=conn)
-    client.keys = AsyncMock(return_value=keys_result or [])
+    client.scan_keys = AsyncMock(return_value=keys_result or [])
     return client
 
 
@@ -175,9 +176,9 @@ async def test_all_blocks_cleared_clears_pod_from_matrix():
         keys_result=matrix_keys + mapping_keys,
     )
 
-    # `keys()` is called twice (matrix, then mapping). Stub it to return each
+    # `scan_keys()` is called twice (matrix, then mapping). Stub it to return each
     # set in order.
-    redis_client.keys = AsyncMock(side_effect=[matrix_keys, mapping_keys])
+    redis_client.scan_keys = AsyncMock(side_effect=[matrix_keys, mapping_keys])
 
     manager = SGLangKVCacheRedisManager(redis_client=redis_client)
     handler = SGLangKVCacheEventHandler(redis_manager=manager)
@@ -210,3 +211,89 @@ def test_sglang_and_vllm_managers_use_distinct_namespaces():
         VLLMKVCacheRedisManager.MAPPING_KEY_PREFIX
         != SGLangKVCacheRedisManager.MAPPING_KEY_PREFIX
     )
+
+
+class _FakeScanClient:
+    """Serves SCAN batches and records the cursors it was called with."""
+
+    def __init__(self, batches):
+        self._batches = list(batches)
+        self.cursors = []
+
+    async def scan(self, cursor=0, match=None, count=None):
+        self.cursors.append(cursor)
+        return self._batches.pop(0)
+
+
+def _make_scanning_redis_client(batches):
+    from kthena.runtime.redis_client import RedisClient
+
+    client = RedisClient()
+    client._client = _FakeScanClient(batches)
+    client._connected = True
+    return client
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_walks_cursor_until_exhausted():
+    """A single SCAN round only covers part of the keyspace, so it must be followed."""
+    client = _make_scanning_redis_client(
+        [(7, ["matrix:kv:block:qwen@1"]), (0, ["matrix:kv:block:qwen@2"])]
+    )
+
+    keys = await client.scan_keys("matrix:kv:block:qwen@*")
+
+    assert keys == ["matrix:kv:block:qwen@1", "matrix:kv:block:qwen@2"]
+    assert client._client.cursors == [0, 7]
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_dedupes_repeated_keys():
+    """SCAN may report the same key in more than one round."""
+    client = _make_scanning_redis_client(
+        [(3, ["matrix:kv:block:qwen@1"]), (0, ["matrix:kv:block:qwen@1"])]
+    )
+
+    assert await client.scan_keys("matrix:kv:block:qwen@*") == ["matrix:kv:block:qwen@1"]
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_returns_empty_on_redis_error():
+    """Matches the previous keys() behaviour so callers need no new error handling."""
+    from redis.exceptions import RedisError
+
+    client = _make_scanning_redis_client([])
+
+    async def failing_scan(cursor=0, match=None, count=None):
+        raise RedisError("boom")
+
+    client._client.scan = failing_scan
+
+    assert await client.scan_keys("matrix:kv:block:qwen@*") == []
+
+
+@pytest.mark.asyncio
+async def test_scan_keys_handles_empty_round_before_cursor_returns_to_zero():
+    """SCAN may return nothing for a round while the cursor is still non-zero."""
+    client = _make_scanning_redis_client([(9, []), (0, ["matrix:kv:block:qwen@1"])])
+
+    assert await client.scan_keys("matrix:kv:block:qwen@*") == [
+        "matrix:kv:block:qwen@1"
+    ]
+    assert client._client.cursors == [0, 9]
+
+
+def test_standardized_hash_keeps_token_ids_out_of_info_logs(caplog):
+    """Token ids detokenize back to prompt text, so INFO must never carry them."""
+    with caplog.at_level(logging.INFO, logger="kthena.runtime.kv_cache_manager"):
+        compute_standardized_hash([101, 202, 303])
+    assert caplog.records == []
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="kthena.runtime.kv_cache_manager"):
+        compute_standardized_hash([101, 202, 303])
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "tokens=3" in message
+    assert "token_ids" not in message
+    assert "101" not in message

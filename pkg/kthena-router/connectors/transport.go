@@ -19,11 +19,13 @@ package connectors
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
@@ -31,8 +33,52 @@ import (
 	"k8s.io/klog/v2"
 )
 
-func prefillerProxy(_ *gin.Context, req *http.Request) error {
-	resp, err := http.DefaultTransport.RoundTrip(req)
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnClose) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
+}
+
+// upstreamRoundTripper returns the per-ModelServer transport stashed on the
+// gin context, falling back to the shared upstreamTransport when none is set.
+func upstreamRoundTripper(c *gin.Context) http.RoundTripper {
+	if v, ok := c.Get(common.UpstreamTransportKey); ok {
+		if rt, ok := v.(*http.Transport); ok && rt != nil {
+			return rt
+		}
+	}
+	return upstreamTransport
+}
+
+func roundTrip(req *http.Request, timeout time.Duration, rt http.RoundTripper) (*http.Response, error) {
+	// Stop the timeout after response headers so long-running streams can finish.
+	cancel := context.CancelFunc(func() {})
+	if timeout > 0 {
+		var ctx context.Context
+		ctx, cancel = context.WithCancel(req.Context())
+		timer := time.AfterFunc(timeout, cancel)
+		defer timer.Stop()
+		req = req.WithContext(ctx)
+	}
+
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if timeout > 0 {
+		resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+	}
+	return resp, nil
+}
+
+func prefillerProxy(req *http.Request, timeout time.Duration, rt http.RoundTripper) error {
+	resp, err := roundTrip(req, timeout, rt)
 	if err != nil {
 		return fmt.Errorf("prefill request failed: %w", err)
 	}
@@ -46,8 +92,8 @@ func prefillerProxy(_ *gin.Context, req *http.Request) error {
 	return nil
 }
 
-func decoderProxy(c *gin.Context, req *http.Request) (int, error) {
-	resp, err := http.DefaultTransport.RoundTrip(req)
+func decoderProxy(c *gin.Context, req *http.Request, timeout time.Duration, rt http.RoundTripper) (int, error) {
+	resp, err := roundTrip(req, timeout, rt)
 	if err != nil {
 		return 0, fmt.Errorf("decode request failed: %w", err)
 	}
@@ -117,7 +163,7 @@ func buildPrefillRequest(req *http.Request, modelRequest map[string]interface{})
 }
 
 func BuildDecodeRequest(c *gin.Context, req *http.Request, modelRequest map[string]interface{}) *http.Request {
-	modelRequest = addTokenUsage(c, modelRequest)
+	modelRequest = AddTokenUsage(c, modelRequest)
 	body, err := json.Marshal(modelRequest)
 	if err != nil {
 		return nil
@@ -131,9 +177,9 @@ func BuildDecodeRequest(c *gin.Context, req *http.Request, modelRequest map[stri
 	return reqCopy
 }
 
-// addTokenUsage adds token usage to the request body if it is not already present
+// AddTokenUsage adds token usage to the request body if it is not already present
 // should be used for decode requests or non PD disaggregated mode
-func addTokenUsage(c *gin.Context, reqBody map[string]interface{}) map[string]interface{} {
+func AddTokenUsage(c *gin.Context, reqBody map[string]interface{}) map[string]interface{} {
 	// Check if streaming is enabled
 	if isStreamingRequest(reqBody) {
 		if !isTokenUsageEnabled(reqBody) {

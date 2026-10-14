@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
+	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 )
@@ -87,6 +88,10 @@ type Server struct {
 	EnableGatewayAPIInferenceExtension bool
 	// DebugPort 调试服务器端口 (>0 时启动 localhost debug server,提供 pprof + config_dump)
 	DebugPort int
+	// MetricsPort 指标服务器端口 (>0 时启动 metrics server)
+	MetricsPort int
+	// ExposeMetricsOnRouterPort 是否在 router 端口暴露指标
+	ExposeMetricsOnRouterPort bool
 	// KubeAPIQPS K8s API 客户端的 QPS 限速 (0 = 使用 client-go 默认值 5)
 	KubeAPIQPS float32
 	// KubeAPIBurst K8s API 客户端的 Burst 突发上限 (0 = 使用 client-go 默认值 10)
@@ -106,8 +111,10 @@ type Server struct {
 //   - enableGatewayAPI: 是否启用 Gateway API 控制器
 //   - enableGatewayAPIInferenceExtension: 是否启用 InferencePool 控制器
 //   - debugPort: 调试端口 (0 = 不启动)
+//   - metricsPort: 指标端口 (0 = 不启动)
+//   - exposeMetricsOnRouterPort: 是否在 router 端口暴露指标
 //   - kubeAPIQPS/Burst: K8s API 客户端限速参数
-func NewServer(port string, enableTLS bool, cert, key string, enableGatewayAPI bool, enableGatewayAPIInferenceExtension bool, debugPort int, kubeAPIQPS float32, kubeAPIBurst int) *Server {
+func NewServer(port string, enableTLS bool, cert, key string, enableGatewayAPI bool, enableGatewayAPIInferenceExtension bool, debugPort, metricsPort int, exposeMetricsOnRouterPort bool, kubeAPIQPS float32, kubeAPIBurst int) *Server {
 	return &Server{
 		store:                              nil, // 在 Run() 中创建
 		EnableTLS:                          enableTLS,
@@ -117,6 +124,8 @@ func NewServer(port string, enableTLS bool, cert, key string, enableGatewayAPI b
 		EnableGatewayAPI:                   enableGatewayAPI,
 		EnableGatewayAPIInferenceExtension: enableGatewayAPIInferenceExtension,
 		DebugPort:                          debugPort,
+		MetricsPort:                        metricsPort,
+		ExposeMetricsOnRouterPort:          exposeMetricsOnRouterPort,
 		KubeAPIQPS:                         kubeAPIQPS,
 		KubeAPIBurst:                       kubeAPIBurst,
 		drainTimeout:                       parseDrainTimeout(), // 从环境变量解析,立即确定
@@ -167,17 +176,20 @@ func (s *Server) Run(ctx context.Context) {
 	store := datastore.New(storeOpts...)
 	s.store = store
 
+	// Per-ModelServer 上游传输注册表,在 router (热路径查找) 和 ModelServer controller (生命周期写入) 之间共享
+	transportRegistry := common.NewTransportRegistry()
+
 	// ===== 第 3 步: 创建 Router (必须在 Controller 之前!) =====
 	// 原因: NewRouter() 内部会向 DataStore 注册回调函数
 	//   - ModelRoute 回调: 限流配置变更 → 更新令牌桶
 	//   - Pod 变更回调: 更新分词器 (tokenizer)
 	// 如果先启动 Controller,回调还未注册,第一批事件会丢失
-	r := NewRouter(store)
+	r := NewRouter(store, transportRegistry)
 
 	// ===== 第 4 步: 启动所有 Controller =====
 	// startControllers() 创建 K8s 客户端 + Informer + Controller 工作循环
 	// 返回聚合控制器,后续通过 HasSynced() 判断缓存是否就绪
-	s.controllers = startControllers(store, ctx.Done(), s.EnableGatewayAPI, s.Port, s.EnableGatewayAPIInferenceExtension, s.KubeAPIQPS, s.KubeAPIBurst)
+	s.controllers = startControllers(store, ctx.Done(), s.EnableGatewayAPI, s.Port, s.EnableGatewayAPIInferenceExtension, s.KubeAPIQPS, s.KubeAPIBurst, transportRegistry)
 
 	// ===== 第 5 步: 等待所有 Informer 缓存同步完成 =====
 	// 必须等待!否则后续 Schedule/Proxy 可能找不到 Pod/ModelServer,导致 404 错误

@@ -50,10 +50,11 @@ know that this has succeeded?
 
 Support for role-based rolling updates:
 
-- Support Partition. Partitioning is still supported at the serving group level. However, even in role-based rolling updates, partition ensures that some servingGroups remain unchanged.
+- Support Partition at both levels. The ModelServing partition protects the first N existing ServingGroups in ordinal order, while each Role's inline partition protects the first N existing Role replicas in ordinal order within a ServingGroup.
 - Support ControllerRevision history for Roles. Maybe servingGroup ControllerRevision is enough.
 - Support MaxUnavailable
-- Perform a rolling update step by step in descending order of Role IDs.
+- Support MaxSurge by temporarily increasing each updating Role's expected replica count. Normal Role replica synchronization owns expansion and contraction; no replica is classified as surge by ordinal.
+- Perform a rolling update step by step, prioritizing unavailable outdated Roles and using descending Role ordinal within the same status class.
 
 #### Non-Goals
 
@@ -62,7 +63,6 @@ What is out of scope for this proposal? Listing non-goals helps to focus discuss
 and make progress.
 -->
 
-- Support MaxSurge
 - Rollback is not supported at this stage. Support is planned for future implementation.
 
 ### Proposal

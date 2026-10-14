@@ -75,7 +75,13 @@ This creates a `redis-config` ConfigMap, `redis-secret` Secret, and a `redis-ser
 
 ### Step 2: Deploy vLLM pods with the Kthena Runtime sidecar
 
-**Option A: Using ModelBooster (recommended)**
+For new deployments, use the ModelServing example in Option B below and configure `ModelServer` and `ModelRoute` for routing.
+
+**Option A: Using ModelBooster (deprecated)**
+
+:::warning Deprecated example
+ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5. This example is retained for existing users; see the [deprecation details](./model-deployment.md#modelbooster-deprecation).
+:::
 
 When using ModelBooster, the runtime sidecar is automatically injected with the correct Redis environment variables. No extra configuration is needed:
 
@@ -110,7 +116,7 @@ spec:
             nvidia.com/gpu: "1"
 ```
 
-**Option B: Using ModelServing**
+**Option B: Using ModelServing (recommended)**
 
 A complete ModelServing example with KV cache awareness is provided at [gpu-kvcache-aware.yaml](../assets/examples/model-serving/gpu-kvcache-aware.yaml). This example deploys a vLLM server with the Kthena Runtime sidecar pre-configured for Redis-based KV cache coordination.
 
@@ -295,10 +301,12 @@ data:
 
 **Plugin arguments:**
 
-| Parameter          | Default | Description                                                                      |
-| ------------------ | ------- | -------------------------------------------------------------------------------- |
-| `blockSizeToHash`  | 16      | Number of tokens per block. Must match the vLLM block size for optimal matching. |
-| `maxBlocksToMatch` | 128     | Maximum number of blocks to process per request. Limits Redis queries.           |
+| Parameter             | Default | Description                                                                      |
+| --------------------- | ------- | -------------------------------------------------------------------------------- |
+| `blockSizeToHash`     | 16      | Number of tokens per block. Must match the vLLM block size for optimal matching. |
+| `maxBlocksToMatch`    | 128     | Maximum number of blocks to process per request. Limits Redis queries.           |
+| `vllmTokenizerPort`   | 8000    | Port used to fetch the tokenizer from vLLM pods.                                 |
+| `sglangTokenizerPort` | 30000   | Port used to fetch the tokenizer from SGLang pods.                               |
 
 **Helm values:**
 
@@ -334,8 +342,8 @@ kubectl logs <vllm-pod> -c runtime -n <namespace> | grep -iE "redis|zmq|kv"
 
 Expected messages:
 - `Redis client initialized successfully`
-- `vLLM ZMQ subscriber initialized successfully`
-- `Event handlers registered successfully`
+- `vLLM ZMQ subscriber initialized successfully` (or `SGLang ZMQ subscriber initialized successfully`)
+- `vLLM KV-cache event handler registered` (or `SGLang KV-cache event handler registered`)
 
 ### 3. Inspect Redis Keys
 
@@ -363,8 +371,8 @@ The output shows pod identifiers (e.g., `pod-name.namespace`) as field names and
 The router exposes scheduler plugin metrics at the `/metrics` endpoint. You can check for score plugin activity:
 
 ```bash
-kubectl port-forward svc/kthena-router 8080:8080 -n <namespace>
-curl -s http://localhost:8080/metrics | grep -i kvcache
+kubectl port-forward svc/kthena-router-metrics 9090:9090 -n <namespace>
+curl -s http://localhost:9090/metrics | grep -i kvcache
 ```
 
 ### 5. Send Test Requests

@@ -12,7 +12,7 @@ Before installing Kthena, ensure you have the following:
 
 ### Required Prerequisites
 
-- **Kubernetes cluster** (version 1.20 or later)
+- **Kubernetes cluster** (version 1.28 or later)
 - **kubectl** configured to access your cluster
 - **Helm** (version 3.0 or later)
 - Cluster admin permissions
@@ -30,7 +30,7 @@ Kthena Helm charts are published to the GitHub Container Registry (GHCR).
 1. **Install Kthena directly from GHCR:**
 
    ```bash
-   helm install kthena oci://ghcr.io/volcano-sh/charts/kthena --version v0.2.0 --namespace kthena-system --create-namespace
+   helm install kthena oci://ghcr.io/volcano-sh/charts/kthena --version v1.0.0 --namespace kthena-system --create-namespace
    ```
 
 ### Method 2: Manual Installation with GitHub Release Manifests
@@ -73,6 +73,53 @@ You can also download the Helm chart package from [GitHub releases](https://gith
 
 ## Configuration Options
 
+### Component-Scoped Installation
+
+Kthena is modular: the **workload** controllers and the **networking** router are separate Helm subcharts with separate CRD groups, and neither depends on the other at runtime. Install only what you need — a component-scoped install brings in just that component's CRDs, RBAC, and webhooks.
+
+| Subchart     | Component                                                  | CRDs installed                                       |
+| :----------- | :--------------------------------------------------------- | :--------------------------------------------------- |
+| `workload`   | `kthena-controller-manager` (model lifecycle, autoscaling) | `ModelServing`, `ModelBooster`, `AutoscalingPolicy`  |
+| `networking` | `kthena-router` (inference traffic routing)                | `ModelRoute`, `ModelServer`, `ExternalModelProvider` |
+
+**Workload controllers only** — manage model workloads with Kthena while keeping your existing gateway for traffic:
+
+```bash
+helm install kthena oci://ghcr.io/volcano-sh/charts/kthena \
+  --namespace kthena-system --create-namespace \
+  --set networking.enabled=false
+```
+
+**Router only** — use Kthena Router as a standalone, model-aware LLM gateway in front of pods managed by Deployments, StatefulSets, another operator, or external providers:
+
+```bash
+helm install kthena oci://ghcr.io/volcano-sh/charts/kthena \
+  --namespace kthena-system --create-namespace \
+  --set workload.enabled=false
+```
+
+:::note
+The deprecated `ModelBooster` API requires **both** subcharts. It remains available in v1.1, with removal no earlier than v1.5. For new deployments, use `ModelServing`, `ModelServer`, and `ModelRoute` directly; with a component-scoped install, use that component's CRDs. See the [deprecation details](../user-guide/model-deployment.md#modelbooster-deprecation).
+:::
+
+You can enable the other component later with `helm upgrade --set <subchart>.enabled=true`. Note that Helm does not install files under a chart's `crds/` directory during an upgrade, so apply the newly enabled component's CRDs yourself first:
+
+```bash
+# 1. Fetch and unpack the chart. Replace <chart-version> with the chart version
+#    you have installed — `helm list -n kthena-system` shows it.
+helm pull oci://ghcr.io/volcano-sh/charts/kthena --version <chart-version> --untar
+
+# 2. Apply the CRDs of the subchart you are enabling: use `networking` for the
+#    router, or `workload` for the controllers.
+kubectl apply --server-side -f kthena/charts/<subchart>/crds/
+
+# 3. Enable the subchart. This example turns on the router; use
+#    `--set workload.enabled=true` to turn on the controllers instead.
+helm upgrade kthena oci://ghcr.io/volcano-sh/charts/kthena \
+  --namespace kthena-system --reuse-values \
+  --set networking.enabled=true
+```
+
 ### Helm Values
 
 You can customize the installation by providing values:
@@ -88,7 +135,9 @@ helm install kthena oci://ghcr.io/volcano-sh/charts/kthena \
 ### Common Configuration Parameters
 
 | Parameter                             | Description                                                    | Default |
-|:--------------------------------------|:---------------------------------------------------------------|:--------|
+| :------------------------------------ | :------------------------------------------------------------- | :------ |
+| `workload.enabled`                    | Install the workload controllers and their CRDs                | `true`  |
+| `networking.enabled`                  | Install the Kthena Router and its CRDs                         | `true`  |
 | `workload.controllerManager.replicas` | Number of controller manager replicas                          | `1`     |
 | `networking.kthenaRouter.replicas`    | Number of router replicas                                      | `1`     |
 | `networking.kthenaRouter.tls.enabled` | Enable TLS for the router                                      | `false` |
@@ -97,6 +146,22 @@ helm install kthena oci://ghcr.io/volcano-sh/charts/kthena \
 ### Full Values Reference
 
 For a complete list of all configurable Helm values, see the [Helm Chart Values Reference](../reference/helm-chart-values.md).
+
+## Upgrade CRDs before Helm
+
+Helm installs CRDs from a chart during the first installation, but `helm upgrade` does not update them. Apply the CRDs from the target Kthena version before upgrading the release:
+
+```bash
+helm show crds oci://ghcr.io/volcano-sh/charts/kthena \
+  --version vX.Y.Z \
+  | kubectl apply --server-side -f -
+
+helm upgrade kthena oci://ghcr.io/volcano-sh/charts/kthena \
+  --version vX.Y.Z \
+  --namespace kthena-system
+```
+
+This order is required for releases that add a CRD, including the release that introduces `ExternalModelProvider`. If the Router starts before that CRD exists, its informer cannot finish its initial sync and the Router does not begin serving requests.
 
 ## Verification
 

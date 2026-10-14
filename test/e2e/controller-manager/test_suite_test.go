@@ -68,8 +68,20 @@ func TestMain(m *testing.M) {
 		_ = framework.UninstallKthena(config.Namespace)
 		os.Exit(1)
 	}
+	kthenaClient, err := clientset.NewForConfig(kubeConfig)
+	if err != nil {
+		fmt.Printf("Failed to create Kthena client: %v\n", err)
+		_ = framework.UninstallKthena(config.Namespace)
+		os.Exit(1)
+	}
 
 	if err := utils.CreateTestNamespace(kubeClient, testNamespace); err != nil {
+		_ = framework.UninstallKthena(config.Namespace)
+		os.Exit(1)
+	}
+	if err := waitForWebhookReadyE(context.Background(), kthenaClient, testNamespace); err != nil {
+		fmt.Printf("Controller-manager webhook did not become ready: %v\n", err)
+		_ = utils.DeleteTestNamespaceAndWait(kubeClient, testNamespace, 2*time.Minute)
 		_ = framework.UninstallKthena(config.Namespace)
 		os.Exit(1)
 	}
@@ -106,14 +118,44 @@ func setupControllerManagerE2ETest(t *testing.T) (context.Context, *clientset.Cl
 	return ctx, kthenaClient, kubeClient
 }
 
+// waitForPodsGone waits until no Pods matching labelSelector remain in the shared test namespace.
+// The controller-manager E2E suite runs all tests sequentially against one shared namespace, so
+// labelSelector must scope the wait to the resource under cleanup (e.g. a specific ModelServing or
+// ModelBooster instance) rather than the namespace as a whole - an unscoped wait could be satisfied
+// by, or block on, pods belonging to an unrelated test.
+func waitForPodsGone(t *testing.T, ctx context.Context, kubeClient *kubernetes.Clientset, labelSelector string, timeout time.Duration) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
+		if err != nil {
+			t.Logf("waitForPodsGone: failed to list pods (selector=%q): %v", labelSelector, err)
+			return false
+		}
+		if len(pods.Items) == 0 {
+			return true
+		}
+		remaining := make([]string, 0, len(pods.Items))
+		for _, pod := range pods.Items {
+			remaining = append(remaining, fmt.Sprintf("%s(phase=%s,deleting=%t)", pod.Name, pod.Status.Phase, pod.DeletionTimestamp != nil))
+		}
+		t.Logf("waitForPodsGone: %d pod(s) still present (selector=%q): %v", len(pods.Items), labelSelector, remaining)
+		return false
+	}, timeout, 5*time.Second, "pods matching selector %q were not cleaned up within %s", labelSelector, timeout)
+}
+
 func waitForWebhookReady(t *testing.T, ctx context.Context, kthenaClient *clientset.Clientset, namespace string) {
 	t.Helper()
 	t.Log("Waiting for webhook server to accept requests")
+	require.NoError(t, waitForWebhookReadyE(ctx, kthenaClient, namespace), "Webhook did not become ready in time")
+}
 
+func waitForWebhookReadyE(ctx context.Context, kthenaClient *clientset.Clientset, namespace string) error {
 	waitCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
 	defer cancel()
 
-	err := wait.PollUntilContextCancel(waitCtx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
+	return wait.PollUntilContextCancel(waitCtx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
 		probe := createValidModelBoosterForWebhookTest()
 		probe.Namespace = namespace
 		probe.Name = "webhook-ready-probe-" + utils.RandomString(5)
@@ -123,8 +165,8 @@ func waitForWebhookReady(t *testing.T, ctx context.Context, kthenaClient *client
 		_, err := kthenaClient.WorkloadV1alpha1().ModelBoosters(namespace).Create(createCtx, probe, metav1.CreateOptions{DryRun: []string{"All"}})
 		if err != nil {
 			errStr := err.Error()
-			if strings.Contains(errStr, "connect: connection refused") || errors.Is(err, context.DeadlineExceeded) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) {
-				t.Logf("Webhook not ready yet (connection refused or timeout), retrying: %v", err)
+			if strings.Contains(errStr, "failed calling webhook") || strings.Contains(errStr, "connect: connection refused") ||
+				errors.Is(err, context.DeadlineExceeded) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) {
 				return false, nil
 			}
 			return false, err
@@ -132,5 +174,4 @@ func waitForWebhookReady(t *testing.T, ctx context.Context, kthenaClient *client
 
 		return true, nil
 	})
-	require.NoError(t, err, "Webhook did not become ready in time")
 }

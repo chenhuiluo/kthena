@@ -63,6 +63,8 @@ type Context struct {
 
 	// ModelServerName: 当前请求命中的 ModelServer, 用于查询该 ModelServer 下的 Pod
 	ModelServerName types.NamespacedName
+	// UpstreamModel: 上游模型名 (外部模型提供者场景用)
+	UpstreamModel string
 	// PDGroup: PD 分组配置, !=nil 表示走 PD 分离分支 (decode/prefill 分开调度)
 	PDGroup *aiv1alpha1.PDGroup
 

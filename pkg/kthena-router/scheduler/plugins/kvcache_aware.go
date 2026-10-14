@@ -66,7 +66,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -75,6 +74,7 @@ import (
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/framework"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/plugins/tokenization"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
@@ -102,6 +102,7 @@ const (
 
 	// defaultSGLangTokenizerPort is the upstream-default port for sglang
 	defaultSGLangTokenizerPort = 30000
+	maxTokenizerPort           = 65535
 
 	// kvCacheFieldFreshDuration matches the runtime mapping key expiry
 	kvCacheFieldFreshDuration = 24 * time.Hour
@@ -175,22 +176,16 @@ func NewKVCacheAware(pluginArg runtime.RawExtension) *KVCacheAware {
 		maxBlocksToMatch = defaultMaxBlocksToMatch
 	}
 
-	vllmPort := args.VLLMTokenizerPort
-	if vllmPort <= 0 {
-		vllmPort = defaultVLLMTokenizerPort
-	}
-	sglangPort := args.SGLangTokenizerPort
-	if sglangPort <= 0 {
-		sglangPort = defaultSGLangTokenizerPort
-	}
+	vllmPort := normalizeTokenizerPort(tokenization.EngineVLLM, args.VLLMTokenizerPort, defaultVLLMTokenizerPort)
+	sglangPort := normalizeTokenizerPort(tokenization.EngineSGLang, args.SGLangTokenizerPort, defaultSGLangTokenizerPort)
 
 	klog.Infof("KVCacheAware: config blockSizeToHash=%d, maxBlocksToMatch=%d, vllmTokenizerPort=%d, sglangTokenizerPort=%d",
 		blockSizeToHash, maxBlocksToMatch, vllmPort, sglangPort)
 
 	managerConfig := tokenization.TokenizerManagerConfig{
-		EndpointTemplates: map[string]string{
-			tokenization.EngineVLLM:   fmt.Sprintf("http://%%s:%d", vllmPort),
-			tokenization.EngineSGLang: fmt.Sprintf("http://%%s:%d", sglangPort),
+		EndpointPorts: map[string]int{
+			tokenization.EngineVLLM:   vllmPort,
+			tokenization.EngineSGLang: sglangPort,
 		},
 	}
 	manager := tokenization.NewTokenizerManager(managerConfig)
@@ -212,6 +207,16 @@ func NewKVCacheAware(pluginArg runtime.RawExtension) *KVCacheAware {
 	}
 	plugin.startGC()
 	return plugin
+}
+
+func normalizeTokenizerPort(engine string, configuredPort, defaultPort int) int {
+	if configuredPort >= 1 && configuredPort <= maxTokenizerPort {
+		return configuredPort
+	}
+	if configuredPort != 0 {
+		klog.Warningf("KVCacheAware: invalid %s tokenizer port %d, using default %d", engine, configuredPort, defaultPort)
+	}
+	return defaultPort
 }
 
 func (t *KVCacheAware) Name() string {
@@ -255,12 +260,14 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 		return nil
 	}
 
-	podNames := make([]string, 0, len(pods))
-	for _, p := range pods {
-		podNames = append(podNames, p.GetPodNamespacedName().Name)
+	if klog.V(4).Enabled() {
+		podNames := make([]string, 0, len(pods))
+		for _, p := range pods {
+			podNames = append(podNames, p.GetPodNamespacedName().Name)
+		}
+		klog.Infof("KVCacheAware.Score: called for model=%q, pods=%v, promptTextLen=%d, messagesLen=%d",
+			ctx.Model, podNames, len(ctx.Prompt.Text), len(ctx.Prompt.Messages))
 	}
-	klog.V(4).Infof("KVCacheAware.Score: called for model=%q, pods=%v, promptTextLen=%d, messagesLen=%d",
-		ctx.Model, podNames, len(ctx.Prompt.Text), len(ctx.Prompt.Messages))
 
 	if (ctx.Prompt.Text == "" && len(ctx.Prompt.Messages) == 0) || ctx.Model == "" {
 		klog.V(4).Infof("KVCacheAware.Score: early return — empty prompt or model (model=%q, textLen=%d, messagesLen=%d)",
@@ -303,7 +310,7 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 	// ===== 阶段 3: Redis pipeline 查询 — 查每个块哈希被哪些 Pod 缓存过 =====
 	// blockToPods: map[blockHash]→[]podName, 即"哪些 Pod 的 KV cache 里有这个 token 块"
 	redisStart := time.Now()
-	blockToPods, err := t.queryRedisForBlocks(blockHashes, ctx.Model)
+	blockToPods, err := t.queryRedisForBlocks(blockHashes, ctx.Model, ownerStartTimes(pods))
 	redisDuration := time.Since(redisStart)
 	if err != nil {
 		if ctx.MetricsRecorder != nil {
@@ -322,7 +329,7 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 	// ===== 阶段 4: 候选 Pod 过滤 — Redis 返回的 Pod 可能已不在本次候选列表, 只保留当前候选 Pod =====
 	candidateNames := make(map[string]struct{}, len(pods))
 	for _, p := range pods {
-		candidateNames[p.GetPodNamespacedName().Name] = struct{}{}
+		candidateNames[podCacheOwnerIdentifier(p)] = struct{}{}
 	}
 	// 对每个 block 的 pod 列表做交集过滤: 只保留仍是本次候选的 Pod
 	for hash, podNames := range blockToPods {
@@ -345,8 +352,7 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 	}
 	scoreResults := make(map[*datastore.PodInfo]int, len(podScores))
 	for _, pod := range pods {
-		podName := pod.GetPodNamespacedName()
-		podScoreKey := fmt.Sprintf("%s.%s", podName.Name, podName.Namespace)
+		podScoreKey := podCacheOwnerIdentifier(pod)
 		if score, exists := podScores[podScoreKey]; exists {
 			scoreResults[pod] = score
 		}
@@ -358,12 +364,13 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 
 // queryRedisForBlocks 查询哪些 Pod 缓存了给定的 token 块哈希。
 // 用 Redis pipeline 批量 HKeys(每个块哈希一个 key), 一次网络往返查全部块,
-// 避免逐块查询的 N 次 RTT。返回 map[blockHash]→[]podName。
+// 避免逐块查询的 N 次 RTT。返回 map[blockHash]→[]podName (pod.namespace owner 标识)。
 //
 // Redis 数据结构: key="matrix:kv:block:{model}@{hash}", 是个 hash,
 //   field = "pod-name.namespace", value = 时间戳(Pod 最后缓存该块的 Unix 时间)。
 // HKeys 只取 field 名(即 Pod 列表), 不取 value(时间戳由 GC 用)。
-func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName string) (map[uint64][]string, error) {
+// ownerStartedAt 携带每个候选 Pod 的容器启动时间,用于丢弃重启前的过期所有权。
+func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName string, ownerStartedAt map[string]int64) (map[uint64][]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -377,15 +384,16 @@ func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName strin
 	klog.V(2).Infof("KVCacheAware.queryRedis: querying %d block hashes for model=%q", len(blockHashes), modelName)
 
 	pipe := t.redisClient.Pipeline()
-	cmds := make([]*redis.StringSliceCmd, len(blockHashes))
+	cmds := make([]*redis.MapStringStringCmd, len(blockHashes))
 	keys := make([]string, len(blockHashes))
 
-	// Build pipeline commands for batch Redis query
+	// Build pipeline commands for batch Redis query. Values are read alongside the owners so
+	// ownership predating a restart can be dropped.
 	for i, hash := range blockHashes {
 		block := KVCacheAwareBlock{ModelName: modelName, ChunkHash: hash}
 		key := block.String(t.keyPrefix)
 		keys[i] = key
-		cmds[i] = pipe.HKeys(ctx, key)
+		cmds[i] = pipe.HGetAll(ctx, key)
 	}
 
 	if len(keys) > 0 {
@@ -400,8 +408,12 @@ func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName strin
 
 	// Process results and extract pod names
 	for i, cmd := range cmds {
-		pods, err := cmd.Result()
-		if err != nil || len(pods) == 0 {
+		entries, err := cmd.Result()
+		if err != nil || len(entries) == 0 {
+			continue
+		}
+		pods := freshOwners(entries, ownerStartedAt)
+		if len(pods) == 0 {
 			continue
 		}
 
@@ -412,6 +424,13 @@ func (t *KVCacheAware) queryRedisForBlocks(blockHashes []uint64, modelName strin
 
 	klog.V(4).Infof("KVCacheAware.queryRedis: total blocks with hits: %d/%d", len(blockToPods), len(blockHashes))
 	return blockToPods, nil
+}
+
+// podCacheOwnerIdentifier 返回 pod 的缓存 owner 标识 (pod-name.namespace 格式),
+// 与 Runtime 写入 Redis 的 owner 格式一致。用全名+namespace 区分跨 namespace 同名 Pod。
+func podCacheOwnerIdentifier(pod *datastore.PodInfo) string {
+	podName := pod.GetPodNamespacedName()
+	return fmt.Sprintf("%s.%s", podName.Name, podName.Namespace)
 }
 
 // startGC 启动后台 GC goroutine (Redis client 为 nil 则跳过)。
@@ -487,13 +506,57 @@ func (t *KVCacheAware) deleteStaleFields(staleFields map[string][]string) {
 	}
 }
 
-// extractPodNameFromIdentifier 从 "pod-name.namespace" 格式取 pod-name 部分。
-// Redis field 存的是 "pod-name.namespace", 匹配候选 Pod 时只需 pod-name。
-func extractPodNameFromIdentifier(podIdentifier string) string {
-	if idx := strings.IndexByte(podIdentifier, '.'); idx >= 0 {
-		return podIdentifier[:idx]
+// podLastContainerStartUnix 返回 Pod 容器最后启动的 Unix 时间,无运行中容器则返回 0。
+// 不用 readiness (探针失败也会翻转 readiness,但缓存仍在,不应据此丢弃)。
+func podLastContainerStartUnix(pod *corev1.Pod) int64 {
+	if pod == nil {
+		return 0
 	}
-	return podIdentifier
+	var newest int64
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Running == nil {
+			continue
+		}
+		if started := cs.State.Running.StartedAt.Unix(); started > newest {
+			newest = started
+		}
+	}
+	return newest
+}
+
+// ownerStartTimes 把每个候选 Pod 的缓存 owner 标识映射到其容器启动时间。
+// 用完整的 name.namespace 格式作 key,跨 namespace 同名 Pod 也能区分。
+func ownerStartTimes(pods []*datastore.PodInfo) map[string]int64 {
+	owners := make(map[string]int64, len(pods))
+	for _, p := range pods {
+		if started := podLastContainerStartUnix(p.GetPod()); started > 0 {
+			owners[podCacheOwnerIdentifier(p)] = started
+		}
+	}
+	return owners
+}
+
+// freshOwners 丢弃在 owning Pod 容器启动前写入的所有权 (重启前的旧缓存)。
+// 不在 ownerStartedAt 中的 owner 保留;Score 阶段再按标识过滤非候选。
+func freshOwners(entries map[string]string, ownerStartedAt map[string]int64) []string {
+	owners := make([]string, 0, len(entries))
+	for owner, writtenAt := range entries {
+		startedAt, tracked := ownerStartedAt[owner]
+		if tracked {
+			written, err := strconv.ParseInt(writtenAt, 10, 64)
+			// An unparsable timestamp is kept: gcStaleFields skips it too, and a future
+			// higher-precision format would otherwise drop every owner at once.
+			// Both sides are second-truncated, so a same-second write is dropped: it may have
+			// preceded the restart, and keeping it would route to a cache that is gone.
+			if err == nil && written <= startedAt {
+				klog.V(4).Infof("KVCacheAware.queryRedis: dropping ownership by %s written at %d, containers started at %d",
+					owner, written, startedAt)
+				continue
+			}
+		}
+		owners = append(owners, owner)
+	}
+	return owners
 }
 
 // calculatePodScores 做前缀连续匹配并打分, 返回每个 Pod 的分数 + 最长匹配块数(供命中率指标)。
@@ -506,56 +569,51 @@ func extractPodNameFromIdentifier(podIdentifier string) string {
 //
 // 即"Pod 连续命中从第 0 块开始的前缀块数占比" — 命中第 k 块保证前 k 块都命中(KV cache 前缀特性)。
 func (t *KVCacheAware) calculatePodScores(blockHashes []uint64, blockToPods map[uint64][]string) (map[string]int, int) {
-	podScores := make(map[string]int)
-
 	if len(blockHashes) == 0 {
 		klog.V(4).Infof("KVCacheAware.calculateScores: no block hashes to process")
-		return podScores, 0
+		return map[string]int{}, 0
 	}
 
 	firstBlockPods, exists := blockToPods[blockHashes[0]]
 	if !exists || len(firstBlockPods) == 0 {
 		klog.V(4).Infof("KVCacheAware.calculateScores: first block hash=%d has no cached pods — all scores 0", blockHashes[0])
-		return podScores, 0
+		return map[string]int{}, 0
 	}
+
+	// only pods holding the first block can ever score, so this is the final size.
+	podScores := make(map[string]int, len(firstBlockPods))
 
 	klog.V(4).Infof("KVCacheAware.calculateScores: first block matched pods=%v, starting prefix matching across %d blocks",
 		firstBlockPods, len(blockHashes))
 
-	activePods := make(map[string]bool, len(firstBlockPods))
 	for _, podName := range firstBlockPods {
-		activePods[podName] = true
 		podScores[podName] = 1
 	}
 
+	// A pod is still matching at block i exactly when its score is i, so podScores
+	// doubles as the active set and no per-block intersection map is needed.
 	lastMatchedBlock := 0
 	for i := 1; i < len(blockHashes); i++ {
-		if len(activePods) == 0 {
-			klog.V(4).Infof("KVCacheAware.calculateScores: no active pods left at block %d", i)
-			break
-		}
-
 		blockPods, exists := blockToPods[blockHashes[i]]
 		if !exists || len(blockPods) == 0 {
 			klog.V(4).Infof("KVCacheAware.calculateScores: block[%d] hash=%d has no cached pods, stopping", i, blockHashes[i])
 			break
 		}
 
-		nextActivePods := make(map[string]bool)
+		stillActive := 0
 		for _, podName := range blockPods {
-			if activePods[podName] {
-				nextActivePods[podName] = true
+			if podScores[podName] == i {
 				podScores[podName]++
+				stillActive++
 			}
 		}
 
-		if len(nextActivePods) == 0 {
+		if stillActive == 0 {
 			klog.V(4).Infof("KVCacheAware.calculateScores: no pod survived intersection at block %d", i)
 			break
 		}
 
 		lastMatchedBlock = i
-		activePods = nextActivePods
 	}
 
 	totalBlocks := len(blockHashes)

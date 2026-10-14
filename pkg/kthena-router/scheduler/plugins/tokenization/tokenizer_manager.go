@@ -21,27 +21,36 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"net"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/hashicorp/go-retryablehttp"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
 	"k8s.io/klog/v2"
 )
 
-// Remote tokenization is always attempted when an engine template exists
+const maxEndpointPort = 65535
+
+// Remote tokenization is always attempted when an engine port exists.
 type TokenizerManagerConfig struct {
-	EndpointTemplates map[string]string
+	EndpointPorts map[string]int
 }
 
 type TokenizerManager struct {
 	config TokenizerManagerConfig
+	// client owns the connection pool shared by the short-lived tokenizer
+	// wrappers created for individual scheduling requests.
+	client *retryablehttp.Client
 }
 
 func NewTokenizerManager(config TokenizerManagerConfig) *TokenizerManager {
 	return &TokenizerManager{
 		config: config,
+		client: newRetryableHTTPClient(),
 	}
 }
 
@@ -78,12 +87,12 @@ func (m *TokenizerManager) createTokenizerFromPods(model string, pods []*datasto
 			unsupportedEngines[podInfo.GetEngine()] = struct{}{}
 			continue
 		}
-		template, ok := m.config.EndpointTemplates[engine]
-		if !ok || template == "" {
-			klog.Warningf("TokenizerManager: no endpoint template for engine %q, skipping pod %s", engine, pod.Name)
+		port, ok := m.config.EndpointPorts[engine]
+		if !ok || port < 1 || port > maxEndpointPort {
+			klog.Warningf("TokenizerManager: no valid endpoint port for engine %q, skipping pod %s", engine, pod.Name)
 			continue
 		}
-		endpoint := fmt.Sprintf(template, pod.Status.PodIP)
+		endpoint := buildTokenizerEndpoint(pod.Status.PodIP, port)
 
 		config := RemoteTokenizerConfig{
 			Engine:             engine,
@@ -93,7 +102,8 @@ func (m *TokenizerManager) createTokenizerFromPods(model string, pods []*datasto
 			ReturnTokenStrings: false,
 		}
 
-		tok, err := NewRemoteTokenizer(config)
+		client := newHTTPClient(endpoint, m.client)
+		tok, err := newRemoteTokenizer(config, client, false)
 		if err != nil {
 			klog.Warningf("Failed to create %s tokenizer for model %s at %s: %v", engine, model, endpoint, err)
 			continue
@@ -110,6 +120,10 @@ func (m *TokenizerManager) createTokenizerFromPods(model string, pods []*datasto
 	}
 	klog.Warningf("Failed to create tokenizer for model %s after trying %d pods", model, len(pods))
 	return nil
+}
+
+func buildTokenizerEndpoint(podIP string, port int) string {
+	return "http://" + net.JoinHostPort(podIP, strconv.Itoa(port))
 }
 
 func normalizeEngine(engine string) (string, error) {

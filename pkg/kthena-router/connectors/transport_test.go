@@ -18,11 +18,13 @@ package connectors
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -557,7 +559,7 @@ func TestPrefillerProxy(t *testing.T) {
 			require.NoError(t, err)
 			testReq.Header.Set("Content-Type", "application/json")
 
-			err = prefillerProxy(c, testReq)
+			err = prefillerProxy(testReq, 0, upstreamTransport)
 
 			if tt.expectError {
 				assert.Error(t, err)
@@ -569,6 +571,28 @@ func TestPrefillerProxy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPrefillerProxyHonorsTimeout(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer func() {
+		close(release)
+		server.Close()
+	}()
+
+	requestCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+
+	start := time.Now()
+	err = prefillerProxy(req, 100*time.Millisecond, upstreamTransport)
+
+	assert.Error(t, err)
+	assert.Less(t, time.Since(start), time.Second)
 }
 
 func TestDecoderProxy(t *testing.T) {
@@ -643,7 +667,7 @@ func TestDecoderProxy(t *testing.T) {
 			require.NoError(t, err)
 			testReq.Header.Set("Content-Type", "application/json")
 
-			_, err = decoderProxy(c, testReq)
+			_, err = decoderProxy(c, testReq, 0, upstreamTransport)
 
 			if tt.expectError {
 				assert.Error(t, err)
@@ -655,4 +679,25 @@ func TestDecoderProxy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDecoderProxyTimeoutDoesNotTruncateStream(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		time.Sleep(200 * time.Millisecond)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	w := CreateTestResponseRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req, err := http.NewRequest(http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+
+	_, err = decoderProxy(c, req, 50*time.Millisecond, upstreamTransport)
+
+	assert.NoError(t, err)
+	assert.Contains(t, w.Body.String(), "data: [DONE]")
 }

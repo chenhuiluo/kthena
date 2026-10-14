@@ -1,6 +1,6 @@
 # Runtime
 
-Kthena Runtime is a lightweight sidecar service designed to standardize Prometheus metrics from inference engines, provides LoRA adapter download/load/unload capabilities, supports model downloading, and publishes KV cache events to Redis for the `kvcache-aware` router plugin.
+Kthena Runtime is a lightweight sidecar service designed to standardize Prometheus metrics from inference engines, provide LoRA adapter download/load/unload capabilities, support model downloading, and publish KV cache events to Redis for the `kvcache-aware` router plugin.
 
 ## Overview
 
@@ -15,7 +15,11 @@ Notes:
 
 ## Installation
 
-- Runtime does not support separate installation.  it will be automatically deployed alongside the inference container as a sidecar when you are using `ModelBooster` to deploy llm.
+:::note ModelBooster examples
+ModelBooster is deprecated in v1.1; use ModelServing, ModelServer, and ModelRoute. Removal is no earlier than v1.5. The ModelBooster examples on this page are retained for existing users. For new deployments, configure the runtime sidecar in your ModelServing Pod template as shown below. The runtime itself is not deprecated; see the [deployment guidance](./model-deployment.md#modelbooster-deprecation).
+:::
+
+- Runtime does not support separate installation. It will be automatically deployed alongside the inference container as a sidecar when you are using `ModelBooster` to deploy an LLM.
 - When deploying via the ModelBooster CR (one-stop deployment), no additional configuration is needed; ModelServing will automatically enable the runtime feature.
 - For standalone deployment using ModelServing YAML, you can add the following configuration to start Runtime as sidecar container:
 
@@ -106,7 +110,7 @@ spec:
     workers:
       - type: server
         image: openeuler/vllm-ascend:latest
-        replicase: 1
+        replicas: 1
         pods: 1
         resources:
           limits:
@@ -167,7 +171,7 @@ spec:
     workers:
       - type: server
         image: openeuler/vllm-ascend:latest
-        replicase: 1
+        replicas: 1
         pods: 1
 ```
 
@@ -187,4 +191,3 @@ Notes:
    - S3/OBS:
      - `ACCESS_KEY`, `SECRET_KEY`: access credentials (recommended to store in a Secret and load via `envFrom.secretRef.name`)
      - `ENDPOINT`: object storage service endpoint (e.g., `https://s3.us-east-1.amazonaws.com` or `https://obs.test.com`)
-

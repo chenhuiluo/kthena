@@ -38,23 +38,10 @@ import (
 	informersv1alpha1 "github.com/volcano-sh/kthena/client-go/informers/externalversions"
 	listerv1alpha1 "github.com/volcano-sh/kthena/client-go/listers/networking/v1alpha1"
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 )
-
-// ResourceType represents the type of Kubernetes resource
-type ResourceType string
-
-const (
-	ResourceTypeModelServer ResourceType = "ModelServer"
-	ResourceTypePod         ResourceType = "Pod"
-)
-
-// QueueItem represents an item in the work queue
-type QueueItem struct {
-	ResourceType ResourceType
-	Key          string
-}
 
 type ModelServerController struct {
 	modelServerLister listerv1alpha1.ModelServerLister
@@ -70,12 +57,17 @@ type ModelServerController struct {
 	workqueue   workqueue.TypedRateLimitingInterface[QueueItem]
 	initialSync *atomic.Bool
 	store       datastore.Store
+
+	// transportRegistry holds per-ModelServer upstream transports driven by
+	// this controller's single worker, so writes are serialized.
+	transportRegistry *common.TransportRegistry
 }
 
 func NewModelServerController(
 	kthenaInformerFactory informersv1alpha1.SharedInformerFactory,
 	kubeInformerFactory informers.SharedInformerFactory,
 	store datastore.Store,
+	transportRegistry *common.TransportRegistry,
 ) (*ModelServerController, error) {
 	modelServerInformer := kthenaInformerFactory.Networking().V1alpha1().ModelServers()
 	podInformer := kubeInformerFactory.Core().V1().Pods()
@@ -88,6 +80,7 @@ func NewModelServerController(
 		workqueue:         workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[QueueItem]()),
 		initialSync:       &atomic.Bool{},
 		store:             store,
+		transportRegistry: transportRegistry,
 	}
 
 	var err error
@@ -190,7 +183,9 @@ func (c *ModelServerController) syncModelServerHandler(key string) error {
 
 	ms, err := c.modelServerLister.ModelServers(namespace).Get(name)
 	if errors.IsNotFound(err) {
-		_ = c.store.DeleteModelServer(types.NamespacedName{Namespace: namespace, Name: name})
+		msName := types.NamespacedName{Namespace: namespace, Name: name}
+		_ = c.store.DeleteModelServer(msName)
+		c.transportRegistry.Delete(msName)
 		return nil
 	}
 	if err != nil {
@@ -216,43 +211,37 @@ func (c *ModelServerController) syncModelServerHandler(key string) error {
 
 	_ = c.store.AddOrUpdateModelServer(ms, pods)
 
-	// Get already bound pods to avoid unnecessary updates
-	existingPods, err := c.store.GetPodsByModelServer(utils.GetNamespaceName(ms))
-	if err != nil {
-		klog.V(4).Infof("failed to get existing pods for ModelServer %s/%s: %v", ms.Namespace, ms.Name, err)
+	// Refresh the per-ModelServer upstream transport to match the current
+	// connectionPool config. Update is a no-op when the config is unchanged.
+	var cp *aiv1alpha1.ConnectionPool
+	if ms.Spec.TrafficPolicy != nil {
+		cp = ms.Spec.TrafficPolicy.ConnectionPool
 	}
+	c.transportRegistry.Update(utils.GetNamespaceName(ms), cp)
 
-	// Build a set of existing pod names that are already bound to the model server
-	existingPodNames := sets.New[types.NamespacedName]()
-	for _, podInfo := range existingPods {
-		pod := podInfo.GetPod()
-		if pod == nil {
-			continue
-		}
-		if !podInfo.HasModelServer(utils.GetNamespaceName(ms)) {
-			// If the pod is not bound to the model server, establish the binding
-			if err := c.store.AppendModelServerToPod(pod, []*aiv1alpha1.ModelServer{ms}); err != nil {
-				klog.Warningf("failed to append modelserver %s/%s to pod %s/%s: %v", ms.Namespace, ms.Name, pod.Namespace, pod.Name, err)
-				continue
-			}
-		}
-		existingPodNames.Insert(utils.GetNamespaceName(pod))
-	}
-
-	// Add new pods that are not yet bound to the store
+	// Bind every ready pod selected by this ModelServer. Pods that already have
+	// an entry in the store get the binding appended so their runtime metrics and
+	// bindings to other ModelServers are preserved; brand-new pods are created
+	// with the binding. We check each pod against the store directly instead of
+	// re-reading GetPodsByModelServer, which would only echo back the pod set that
+	// AddOrUpdateModelServer just wrote and cannot distinguish existing pods from
+	// new ones.
+	msName := utils.GetNamespaceName(ms)
 	for _, pod := range podList {
 		if !isPodReady(pod) {
 			continue
 		}
 
 		podName := utils.GetNamespaceName(pod)
-		// Skip pods that are already properly bound
-		if existingPodNames.Contains(podName) {
+		if c.store.GetPodInfo(podName) != nil {
+			if err := c.store.AppendModelServerToPod(pod, []*aiv1alpha1.ModelServer{ms}); err != nil {
+				klog.Warningf("failed to append modelserver %s to pod %s: %v", msName, podName, err)
+			}
 			continue
 		}
 
 		if err := c.store.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}); err != nil {
-			klog.Warningf("failed to add new pod %s/%s to data store: %v", pod.Namespace, pod.Name, err)
+			klog.Warningf("failed to add new pod %s to data store: %v", podName, err)
 		}
 	}
 
@@ -312,7 +301,7 @@ func (c *ModelServerController) addOrUpdatePod(pod *corev1.Pod) error {
 func (c *ModelServerController) enqueueModelServer(obj interface{}) {
 	var key string
 	var err error
-	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
+	if key, err = cache.DeletionHandlingMetaNamespaceKeyFunc(obj); err != nil {
 		utilruntime.HandleError(err)
 		return
 	}
@@ -325,7 +314,7 @@ func (c *ModelServerController) enqueueModelServer(obj interface{}) {
 func (c *ModelServerController) enqueuePod(obj interface{}) {
 	var key string
 	var err error
-	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
+	if key, err = cache.DeletionHandlingMetaNamespaceKeyFunc(obj); err != nil {
 		utilruntime.HandleError(err)
 		return
 	}

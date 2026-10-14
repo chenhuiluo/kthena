@@ -29,7 +29,6 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	inferencev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -38,8 +37,10 @@ import (
 
 	clientset "github.com/volcano-sh/kthena/client-go/clientset/versioned"
 	kthenaInformers "github.com/volcano-sh/kthena/client-go/informers/externalversions"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/controller"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
+	"github.com/volcano-sh/kthena/pkg/kube"
 )
 
 // Controller 抽象接口,唯一方法 HasSynced() 用于判断所有控制器是否已完成初始缓存同步
@@ -65,13 +66,14 @@ var _ Controller = &aggregatedController{}
 //   - enableGatewayAPIInferenceExtension: 是否启用 InferencePool 控制器 (需先启用 Gateway API)
 //   - kubeAPIQPS:    K8s API 客户端 QPS 限速 (>0 时覆盖默认值 5)
 //   - kubeAPIBurst:  K8s API 客户端 Burst 突发上限 (>0 时覆盖默认值 10)
+//   - transportRegistry: 传输层注册表,用于 per-ModelServer 连接池配置
 //
 // 返回值: Controller (聚合控制器),调用方通过 HasSynced() 等待缓存就绪
-func startControllers(store datastore.Store, stop <-chan struct{}, enableGatewayAPI bool, defaultPort string, enableGatewayAPIInferenceExtension bool, kubeAPIQPS float32, kubeAPIBurst int) Controller {
+func startControllers(store datastore.Store, stop <-chan struct{}, enableGatewayAPI bool, defaultPort string, enableGatewayAPIInferenceExtension bool, kubeAPIQPS float32, kubeAPIBurst int, transportRegistry *common.TransportRegistry) Controller {
 	// ===== 第 1 步: 构建 K8s REST 客户端配置 =====
-	// BuildConfigFromFlags 使用 in-cluster 配置 (空字符串表示使用 Pod 内的 ServiceAccount)
+	// kube.BuildConfig 使用 in-cluster 配置 (空字符串表示使用 Pod 内的 ServiceAccount)
 	// 如果不在集群内运行,会返回错误并 Fatal 退出
-	cfg, err := clientcmd.BuildConfigFromFlags("", "")
+	cfg, err := kube.BuildConfig("", "")
 	if err != nil {
 		klog.Fatalf("Error building kubeconfig: %s", err.Error())
 	}
@@ -105,6 +107,7 @@ func startControllers(store datastore.Store, stop <-chan struct{}, enableGateway
 	// kubeInformerFactory: watch 核心资源 (Pod, Namespace)
 	// kthenaInformerFactory: watch Kthena CRD (ModelRoute, ModelServer)
 	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+	externalProviderSecretInformerFactory := controller.NewExternalModelProviderSecretInformerFactory(kubeClient)
 	kthenaInformerFactory := kthenaInformers.NewSharedInformerFactory(kthenaClient, 0)
 
 	// ===== 第 4 步: 创建必须控制器 (始终启动) =====
@@ -114,9 +117,15 @@ func startControllers(store datastore.Store, stop <-chan struct{}, enableGateway
 	if err != nil {
 		klog.Fatalf("Error creating model route controller: %s", err.Error())
 	}
+	// ExternalModelProviderController: watch ExternalModelProvider CRD + Secret,处理外部模型提供者路由
+	externalModelProviderController, err := controller.NewExternalModelProviderController(kthenaClient, kthenaInformerFactory, externalProviderSecretInformerFactory, store)
+	if err != nil {
+		klog.Fatalf("Error creating external model provider controller: %s", err.Error())
+	}
 	// ModelServerController: watch ModelServer CRD + Pod 资源
 	// 将 ModelServer CR 的 Spec (模型名、端口、PDGroup 等) 和对应 Pod 列表写入 DataStore
-	modelServerController, err := controller.NewModelServerController(kthenaInformerFactory, kubeInformerFactory, store)
+	// transportRegistry 用于 per-ModelServer 连接池配置
+	modelServerController, err := controller.NewModelServerController(kthenaInformerFactory, kubeInformerFactory, store, transportRegistry)
 	if err != nil {
 		klog.Fatalf("Error creating model server controller: %s", err.Error())
 	}
@@ -127,6 +136,7 @@ func startControllers(store datastore.Store, stop <-chan struct{}, enableGateway
 	// ModelRoute + ModelServer + Pod = 必须同步的三类核心资源
 	cacheSyncs := []cache.InformerSynced{
 		kthenaInformerFactory.Networking().V1alpha1().ModelRoutes().Informer().HasSynced,
+		kthenaInformerFactory.Networking().V1alpha1().ExternalModelProviders().Informer().HasSynced,
 		kthenaInformerFactory.Networking().V1alpha1().ModelServers().Informer().HasSynced,
 		kubeInformerFactory.Core().V1().Pods().Informer().HasSynced,
 	}
@@ -219,6 +229,7 @@ func startControllers(store datastore.Store, stop <-chan struct{}, enableGateway
 	// Start() 会启动底层 reflector,开始对 API Server 做 List + Watch
 	// 所有注册的 Informer 共享 watch 连接
 	kubeInformerFactory.Start(stop)
+	externalProviderSecretInformerFactory.Start(stop)
 	kthenaInformerFactory.Start(stop)
 
 	// ===== 第 8 步: 等待所有 Informer 缓存同步完成 =====
@@ -231,13 +242,18 @@ func startControllers(store datastore.Store, stop <-chan struct{}, enableGateway
 
 	// ===== 第 9 步: 启动控制器工作循环 =====
 	// 将所有已创建的控制器收集到 controllers 列表中
-	controllers := []Controller{modelRouteController, modelServerController}
+	controllers := []Controller{modelRouteController, externalModelProviderController, modelServerController}
 
 	// 每个 controller.Run(stop) 内部启动 worker goroutine 持续消费 Informer 事件
 	// 用独立 goroutine 启动,避免互相阻塞
 	go func() {
 		if err := modelRouteController.Run(stop); err != nil {
 			klog.Fatalf("Error running model route controller: %s", err.Error())
+		}
+	}()
+	go func() {
+		if err := externalModelProviderController.Run(stop); err != nil {
+			klog.Fatalf("Error running external model provider controller: %s", err.Error())
 		}
 	}()
 	go func() {

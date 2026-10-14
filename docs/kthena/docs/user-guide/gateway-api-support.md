@@ -79,7 +79,7 @@ When deploying Kthena Router, enable Gateway API support by setting the `--enabl
 # Configure during Helm installation
 helm install kthena \
   --set networking.kthenaRouter.gatewayAPI.enabled=true \
-  --version v0.2.0 \
+  --version v1.0.0 \
   oci://ghcr.io/volcano-sh/charts/kthena
 ```
 
