@@ -28,19 +28,27 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// =============================================================================
+// webhook 证书 Secret 存取 + webhook config CA 更新
+// =============================================================================
+// EnsureCertificate: Secret 不存在 → 生成证书并创建 Secret; 已存在 → 复用。
+//   返回 CA bundle 供更新 Validating/MutatingWebhookConfiguration 的 caBundle。
+// LoadCertBundleFromSecret: 从 Secret 读证书包(供 cmd/main.go 优先从 Secret 加载)。
+// UpdateValidatingWebhookCABundle / UpdateMutatingWebhookCABundle: 把 CA 写入 webhook config。
+// Secret 三 key: tls.crt(服务端证书)/tls.key(私钥)/ca.crt(CA, 供 webhook config)。
+// =============================================================================
+
 const (
-	// TLSCertKey is the key for the TLS certificate in the secret
+	// TLSCertKey Secret 中 TLS 证书的 key
 	TLSCertKey = "tls.crt"
-	// TLSKeyKey is the key for the TLS private key in the secret
+	// TLSKeyKey Secret 中 TLS 私钥的 key
 	TLSKeyKey = "tls.key"
-	// CAKey is the key for the CA certificate in the secret
+	// CAKey Secret 中 CA 证书的 key(供 webhook config caBundle)
 	CAKey = "ca.crt"
 )
 
-// EnsureCertificate ensures that a certificate exists for the webhook server.
-// If the secret doesn't exist, it generates a new certificate and creates the secret.
-// If the secret already exists, it returns without error (reusing existing certificate).
-// Returns the CA bundle bytes that can be used to update webhook configurations.
+// EnsureCertificate 确保 webhook 证书存在: Secret 不存在则生成并创建, 已存在则复用。
+// 返回 CA bundle 字节(用于更新 webhook configuration)。
 func EnsureCertificate(ctx context.Context, kubeClient kubernetes.Interface, namespace, secretName string, dnsNames []string) ([]byte, error) {
 	if len(dnsNames) == 0 {
 		return nil, fmt.Errorf("dnsNames cannot be empty")
@@ -107,7 +115,8 @@ func EnsureCertificate(ctx context.Context, kubeClient kubernetes.Interface, nam
 	return certBundle.CAPEM, nil
 }
 
-// UpdateValidatingWebhookCABundle updates the ValidatingWebhookConfiguration with the provided CA bundle
+// UpdateValidatingWebhookCABundle 把 CA bundle 更新到 ValidatingWebhookConfiguration
+// (apiserver 用此 CA 校验 webhook server 的服务端证书)。
 func UpdateValidatingWebhookCABundle(ctx context.Context, kubeClient kubernetes.Interface, webhookName string, caBundle []byte) error {
 	// Get the ValidatingWebhookConfiguration
 	webhook, err := kubeClient.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, webhookName, metav1.GetOptions{})
@@ -144,7 +153,7 @@ func UpdateValidatingWebhookCABundle(ctx context.Context, kubeClient kubernetes.
 	return nil
 }
 
-// UpdateMutatingWebhookCABundle updates the MutatingWebhookConfiguration with the provided CA bundle
+// UpdateMutatingWebhookCABundle 把 CA bundle 更新到 MutatingWebhookConfiguration。
 func UpdateMutatingWebhookCABundle(ctx context.Context, kubeClient kubernetes.Interface, webhookName string, caBundle []byte) error {
 	// Get the MutatingWebhookConfiguration
 	webhook, err := kubeClient.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, webhookName, metav1.GetOptions{})
@@ -181,7 +190,8 @@ func UpdateMutatingWebhookCABundle(ctx context.Context, kubeClient kubernetes.In
 	return nil
 }
 
-// LoadCertBundleFromSecret tries to read key cert bundle from a Kubernetes Secret.
+// LoadCertBundleFromSecret 从 Secret 读证书包(tls.crt/tls.key/ca.crt)。
+// 供 cmd/main.go 的"三级优先级"第一级: 优先从 Secret 加载已有证书, 避免重复生成。
 func LoadCertBundleFromSecret(ctx context.Context, kubeClient kubernetes.Interface, namespace, secretName string) (*CertBundle, error) {
 	s, err := kubeClient.CoreV1().Secrets(namespace).Get(ctx, secretName, metav1.GetOptions{})
 	if err != nil {

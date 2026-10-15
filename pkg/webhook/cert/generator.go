@@ -30,24 +30,32 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// =============================================================================
+// webhook 自签证书生成 — 给 webhook server 生成 TLS 证书
+// =============================================================================
+// 控制面启动时若没有现成证书, 调本包自签一张(RSA 2048, 10 年有效):
+//   生成 CA → 用 CA 签服务端证书(SAN 含 dnsNames, 即 <service>.<ns>.svc 等)。
+// 生成后由 secret.go 写入 Secret, 并把 CA bundle 更新到 Validating/MutatingWebhookConfiguration。
+// =============================================================================
+
 const (
-	// RSAKeySize is the size of the RSA key for certificate generation
+	// RSAKeySize 证书 RSA 密钥位数
 	RSAKeySize = 2048
-	// CertValidityYears is the number of years the certificate is valid
+	// CertValidityYears 证书有效年数
 	CertValidityYears = 10
 )
 
-// CertBundle contains the certificate, key, and CA certificate
+// CertBundle 证书包: 服务端证书 + 私钥 + CA 证书(均 PEM 编码)
 type CertBundle struct {
-	// CertPEM is the PEM-encoded certificate
+	// CertPEM PEM 编码的服务端证书
 	CertPEM []byte
-	// KeyPEM is the PEM-encoded private key
+	// KeyPEM PEM 编码的私钥
 	KeyPEM []byte
-	// CAPEM is the PEM-encoded CA certificate
+	// CAPEM PEM 编码的 CA 证书(需写入 webhook config 的 caBundle)
 	CAPEM []byte
 }
 
-// GenerateSelfSignedCertificate generates a self-signed certificate for webhook server
+// GenerateSelfSignedCertificate 为 webhook server 生成自签证书: 生成 CA → 用 CA 签服务端证书(SAN=dnsNames)。
 func GenerateSelfSignedCertificate(dnsNames []string) (*CertBundle, error) {
 	if len(dnsNames) == 0 {
 		return nil, fmt.Errorf("dnsNames cannot be empty")

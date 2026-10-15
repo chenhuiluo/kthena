@@ -39,6 +39,23 @@ import (
 	volcanoClientSet "volcano.sh/apis/pkg/client/clientset/versioned"
 )
 
+// =============================================================================
+// 控制面组装入口 — 创建并启动 ModelServing/ModelBooster/LWS/Autoscaler 控制器
+// =============================================================================
+//
+// 【职责】cmd/kthena-controller-manager/main.go 调本包 SetupController, 由它:
+//   1. 建 kubeClient/kthenaClient/volcanoClient/apiextClient 四个客户端
+//   2. 按 cc.Controllers 配置创建对应控制器实例(modelserving/modelbooster/autoscaler)
+//   3. LWS 控制器随 ModelServing 一起初始化(CRD 不存在则跳过, 返回 nil)
+//   4. startControllers: goroutine 启动各控制器 + debug server(可选)
+//   5. 若开启 leader election, 只有当选 leader 才 startControllers(保证多副本只一个干活)
+//
+// 【为什么 ModelServing 和 LWS 绑在一起】LWS 是 ModelServing 的旁路入口(转 LWS→ModelServing),
+//   逻辑上从属 ModelServing 控制器, 故随它一起初始化与启动。
+//
+// 【三个控制器名常量】modelserving / modelbooster / autoscaler, 供 --controllers flag 过滤。
+// =============================================================================
+
 const (
 	defaultLeaseDuration = 15 * time.Second
 	defaultRenewDeadline = 10 * time.Second
@@ -46,11 +63,18 @@ const (
 	leaderElectionId     = "kthena.controller-manager"
 	leaseName            = "lease.kthena.controller-manager"
 
+	// 三个控制器名, 供 --controllers flag 启用/禁用
 	ModelServingController = "modelserving"
 	ModelBoosterController = "modelbooster"
 	AutoscalerController   = "autoscaler"
 )
 
+// SetupController 控制面组装主入口: 建客户端 → 按配置创建控制器 → 启动。
+// 流程:
+//   1. BuildConfig + 设 QPS/Burst, 建 kubeClient/kthenaClient/volcanoClient/apiextClient
+//   2. 遍历 cc.Controllers, 创建启用的控制器实例(msc/mc/ac), LWS 随 ModelServing 初始化
+//   3. startControllers 闭包: goroutine 启动各控制器 + debug server(只绑 localhost, 安全)
+//   4. leader election 开则当选 leader 才 startControllers; 否则直接启动
 func SetupController(ctx context.Context, cc Config) {
 	config, err := kube.BuildConfig(cc.MasterURL, cc.Kubeconfig)
 	if err != nil {
@@ -101,6 +125,9 @@ func SetupController(ctx context.Context, cc Config) {
 		}
 	}
 
+	// startControllers 启动闭包: goroutine 启动各控制器 + debug server(可选)。
+	// why 用闭包而非直接执行: 配合 leader election — 只有当选 leader 才调用本闭包启动控制器,
+	//   保证多副本部署时只有一个实例真正跑控制器逻辑, 其余待命。
 	startControllers := func(ctx context.Context) {
 		if mc != nil {
 			go mc.Run(ctx, cc.Workers)
@@ -171,7 +198,8 @@ func SetupController(ctx context.Context, cc Config) {
 	<-ctx.Done()
 }
 
-// initLeaderElector inits a leader elector for leader election
+// initLeaderElector 初始化 leader elector(lease lock, 默认 15s lease/10s renew/2s retry)。
+// why leader election: 多副本部署时只有一个当选 leader 跑控制器, 避免多实例同时调谐冲突。
 func initLeaderElector(kubeClient kubernetes.Interface, startedLeading func(ctx context.Context)) (*leaderelection.LeaderElector, error) {
 	resourceLock, err := newResourceLock(kubeClient)
 	if err != nil {
@@ -197,7 +225,8 @@ func initLeaderElector(kubeClient kubernetes.Interface, startedLeading func(ctx 
 	return leaderElector, nil
 }
 
-// newResourceLock returns a lease lock which is used to elect leader
+// newResourceLock 返回 lease lock(用 coordination.k8s.io Lease 资源做选主)。
+// leader id = hostname + 随机 UUID, 保证多副本唯一。
 func newResourceLock(client kubernetes.Interface) (*resourcelock.LeaseLock, error) {
 	namespace, err := utils.GetInClusterNameSpace()
 	if err != nil {

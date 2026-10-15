@@ -41,6 +41,30 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// =============================================================================
+// kthena-controller-manager — kthena 控制面统一启动入口
+// =============================================================================
+//
+// 【职责】一个进程同时跑三个控制器 + 一个 webhook server:
+//   控制器: ModelServing(推理编排) / ModelBooster(一键部署,已废弃) / Autoscaler(弹性伸缩)
+//   webhook: 校验+变更(ModelServing/ModelBooster/AutoscalingPolicy) 统一一个 mux, 8443 端口
+//   实际组装逻辑在 pkg/controller.SetupController。
+//
+// 【关键 flag】
+//   --controllers: 启用哪些控制器(默认 * 全开; 可 -modelserving 禁用某项)
+//   --enable-webhook: 是否启 webhook(默认 true)
+//   --leader-elect: 多副本选主(默认 false)
+//   --workers: 每 controller worker 数(默认 5)
+//   --debug-port: debug 端口(datastore cache dump), 0 禁用
+//
+// 【webhook 证书】三级优先级: Secret → 已有文件 → 自动生成自签证书(写回 Secret 并更新 webhook config CA)。
+//   生成后 waitForCertsReady 等文件就位再启 TLS server。
+//
+// 【启动顺序】main: 解析 flag → 起 webhook goroutine → controller.SetupController(阻塞)。
+//   信号处理: SIGINT/SIGTERM → cancel ctx → 优雅退出。
+// =============================================================================
+
+// webhookConfig webhook server 配置
 type webhookConfig struct {
 	tlsCertFile    string
 	tlsPrivateKey  string
@@ -52,6 +76,7 @@ type webhookConfig struct {
 	kubeAPIBurst   int
 }
 
+// main 进程入口: 解析 flag → 起 webhook goroutine → SetupController 阻塞运行。
 func main() {
 	var enableWebhook bool
 	var wc webhookConfig
@@ -117,7 +142,8 @@ func main() {
 const validatingWebhookName = "kthena-controller-manager-validating-webhook"
 const mutatingWebhookName = "kthena-controller-manager-mutating-webhook"
 
-// ensureWebhookCertificate generates a certificate into the secret and returns the CA bundle.
+// ensureWebhookCertificate 自动生成自签证书写入 Secret, 返回 CA bundle。
+// DNS 名含 <service>.<ns>.svc 和 .svc.cluster.local 两种(集群内访问)。
 func ensureWebhookCertificate(ctx context.Context, kubeClient kubernetes.Interface, wc webhookConfig) ([]byte, error) {
 	namespace := getNamespace()
 	dnsNames := []string{
@@ -128,6 +154,18 @@ func ensureWebhookCertificate(ctx context.Context, kubeClient kubernetes.Interfa
 	return webhookcert.EnsureCertificate(ctx, kubeClient, namespace, wc.certSecretName, dnsNames)
 }
 
+// setupWebhook 启动统一的 webhook server(校验+变更, 一个 mux 多路由):
+//
+// 流程:
+//   1. InClusterConfig + 设 QPS/Burst, 建 kubeClient
+//   2. CA bundle 三级优先级: Secret → 已有证书文件 → 自动生成(写回 Secret + 更新 webhook config CA)
+//   3. 注册路由: /validate-workload-...-modelserving(ModelServing 校验)
+//      /validate/modelbooster + /mutate/modelbooster(ModelBooster 校验/变更)
+//      /validate/autoscalingpolicy + /mutate/autoscalingpolicy(AutoscalingPolicy 校验/变更)
+//      /healthz(健康检查)
+//   4. waitForCertsReady 等证书文件就位 → ListenAndServeTLS 启动 → 等 ctx 退出优雅关闭
+//
+// why 统一一个 mux: 三个 CRD 的 webhook 共用一个进程+端口, 减少部署复杂度。
 func setupWebhook(ctx context.Context, wc webhookConfig) error {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
@@ -231,7 +269,7 @@ func setupWebhook(ctx context.Context, wc webhookConfig) error {
 	return nil
 }
 
-// getNamespace returns the current pod namespace or "default".
+// getNamespace 返回当前 Pod namespace(读 POD_NAMESPACE env), 无则 "default"
 func getNamespace() string {
 	ns := os.Getenv("POD_NAMESPACE")
 	if ns == "" {
@@ -240,7 +278,7 @@ func getNamespace() string {
 	return ns
 }
 
-// fileExists returns true if the file exists.
+// fileExists 文件是否存在
 func fileExists(path string) bool {
 	if path == "" {
 		return false
@@ -249,6 +287,8 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+// waitForCertsReady 等待 TLS 证书/密钥文件就位(最多 30s, 500ms 轮询)。
+// why 等: 证书可能由 K8s 挂载, 异步就绪, 直接启会失败。
 func waitForCertsReady(keyFile, CertFile string) bool {
 	waitTimeout := 30 * time.Second
 	waitInterval := 500 * time.Millisecond
@@ -265,6 +305,8 @@ func waitForCertsReady(keyFile, CertFile string) bool {
 	}
 }
 
+// parseControllers 把 --controllers flag 解析成"启用控制器"集合。
+// 默认三个全开(modelserving/modelbooster/autoscaler); 若解析后一个没启用则回退默认(全开)。
 func parseControllers(controllers []string) map[string]bool {
 	// defaultControllers defines all available controllers as enabled
 	defaultControllers := map[string]bool{
@@ -299,9 +341,11 @@ func parseControllers(controllers []string) map[string]bool {
 	return enableControllers
 }
 
-// isControllerEnabled check if a specified controller enabled or not.
-// If the input controllers starts with a "+name" or "name", it is considered as an explicit inclusion.
-// Otherwise, it is considered as an explicit exclusion.
+// isControllerEnabled 判断某控制器是否启用。规则:
+//   - +name 或 name: 显式启用
+//   - -name: 显式禁用
+//   - *: 通配启用全部(默认)
+//   - 无显式包含/排除: 默认 true(全开)
 func isControllerEnabled(name string, controllers []string) bool {
 	// Because controllers are enabled by default, the default return value is true.
 	hasStar := false

@@ -16,14 +16,15 @@ limitations under the License.
 
 package controller
 
+// Config 控制面启动配置(由 cmd main.go 从 flag 解析填充, 传给 SetupController)。
 type Config struct {
-	EnableLeaderElection         bool
-	Workers                      int
-	Kubeconfig                   string
-	MasterURL                    string
-	Controllers                  map[string]bool
-	KubeAPIQPS                   float32
-	KubeAPIBurst                 int
-	DebugPort                    int
-	AutoscalingSyncPeriodSeconds int
+	EnableLeaderElection         bool          // 是否开启 leader election(多副本只一个干活)
+	Workers                      int          // 每个 controller 的 worker 数(并发调谐数, 默认 5)
+	Kubeconfig                   string          // kubeconfig 文件路径(集群外调试用)
+	MasterURL                    string          // API server 地址(覆盖 kubeconfig 里的)
+	Controllers                  map[string]bool // 启用的控制器集合(modelserving/modelbooster/autoscaler)
+	KubeAPIQPS                   float32         // K8s API 限速 QPS, 0 用默认
+	KubeAPIBurst                 int             // K8s API burst, 0 用默认
+	DebugPort                    int             // debug 端口(导 datastore cache dump), 0 禁用
+	AutoscalingSyncPeriodSeconds int             // autoscaler 调谐间隔秒, 0 用默认(15)
 }
