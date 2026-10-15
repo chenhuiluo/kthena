@@ -22,12 +22,25 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// AutoscalingPolicySpec defines the desired state of AutoscalingPolicy.
+// =============================================================================
+// AutoscalingPolicy CRD 类型 — 推理工作负载弹性伸缩策略
+// =============================================================================
 //
-// At most one of HomogeneousTarget, HeterogeneousTarget, or DisaggregatedTarget
-// may be set. When the spec is used standalone (as an AutoscalingPolicy custom
-// resource), exactly one target must be set; this is enforced by the
-// autoscalingpolicy validating webhook rather than a CEL rule.
+// 【定位】声明 ModelServing 的弹性伸缩策略(目标追踪/恐慌稳态/指标源等), 由 autoscaler
+//   控制器消费(非本 ModelServing 控制器)。与 ModelServing 编排解耦, 属弹性伸缩维度。
+//
+// 【三种 target】最多设一个: HomogeneousTarget(同构)/HeterogeneousTarget(异构)/DisaggregatedTarget(PD 分离)。
+//   独立 CR 用时必须恰好一个(校验 webhook 强制); 作为内嵌 spec 用时可不设(继承父资源)。
+//
+// 【与 ModelServing 的关系】AutoscalingPolicy 经 label selector 关联 ModelServing,
+//   autoscaler 据此对 spec.replicas(ServingGroup 数)或 roles[*].replicas(Role 级, PD 保持比例)做伸缩。
+//   PD 自动扩缩走 Role 级, 不改 ServingGroup 数(见架构文档 §1.1)。
+// =============================================================================
+
+// AutoscalingPolicySpec 定义 AutoscalingPolicy 的期望状态。
+//
+// HomogeneousTarget/HeterogeneousTarget/DisaggregatedTarget 最多设一个。
+// 独立 CR 用时必须恰好一个(由 autoscalingpolicy 校验 webhook 强制, 非 CEL 规则)。
 type AutoscalingPolicySpec struct {
 	// TolerancePercent defines the percentage of deviation tolerated before scaling actions are triggered.
 	// current_replicas represents the current number of instances, while target_replicas represents the expected number of instances calculated from monitoring metrics.

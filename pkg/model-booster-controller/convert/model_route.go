@@ -24,6 +24,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// =============================================================================
+// convert ModelRoute 渲染 — 构造 ModelRoute(模型名到 ModelServer 的路由映射)
+// =============================================================================
+// routeName=model.Name, 单条 "default" rule, 单 TargetModel=GetBackendResourceName(model-backend)。
+// ModelRoute 的 5 级路由匹配详见 Router 文档 §4.4。
+// =============================================================================
+
+// BuildModelRoute 从 ModelBooster 构造 ModelRoute(routeName=model.Name, 单 default rule)
 func BuildModelRoute(model *workload.ModelBooster) *networking.ModelRoute {
 	routeName := model.Name
 	rules := getRules(model)

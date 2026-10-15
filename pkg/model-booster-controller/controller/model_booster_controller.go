@@ -48,16 +48,36 @@ import (
 	"github.com/volcano-sh/kthena/pkg/model-booster-controller/utils"
 )
 
+// =============================================================================
+// ModelBooster 控制器 — 一键部署: 把 ModelBooster CR 转成 ModelServing+ModelServer+ModelRoute
+// =============================================================================
+//
+// 【职责】watch ModelBooster CR, reconcile 时依次:
+//   1. 建初始/处理中 condition
+//   2. createOrUpdateModelServing(convert.BuildModelServing)
+//   3. createOrUpdateModelServer(convert.BuildModelServer)
+//   4. createOrUpdateModelRoute(convert.BuildModelRoute)
+//   5. isModelServingActive(等恰好 1 个 ModelServing 且全部 Available)
+//   6. setModelActiveCondition(就绪)
+//   任一步失败置 Failed condition 并返回。
+//
+// 【已废弃】ModelBooster v1.1 起废弃, ≥v1.5 移除。新部署直接用 ModelServing 等。
+//
+// 【LoRA 增量比对】loraUpdateCache 按 generation 缓存旧 model, 仅 model 变了才比对 LoRA 适配器增量。
+// =============================================================================
+
 const (
+	// ConfigMapName: model-booster-controller 读默认镜像的 ConfigMap 名
 	ConfigMapName = "model-booster-controller-config"
 )
 
+// ModelBoosterController ModelBooster 调谐控制器(一键部署)
 type ModelBoosterController struct {
-	// Client for k8s. Use it to call K8S API
+	// kubeClient K8s 客户端
 	kubeClient kubernetes.Interface
-	// client for custom resource
+	// client kthena CRD 客户端
 	client clientset.Interface
-	// httpClient for HTTP requests to LoRA adapter APIs
+	// httpClient LoRA 适配器 API 的 HTTP 客户端(5min 超时, 连接池)
 	httpClient *http.Client
 
 	syncHandler          func(ctx context.Context, miKey string) error
@@ -73,7 +93,7 @@ type ModelBoosterController struct {
 	podsInformer         cache.SharedIndexInformer
 	kubeInformerFactory  informers.SharedInformerFactory
 	workQueue            workqueue.TypedRateLimitingInterface[any]
-	// loraUpdateCache stores the previous model version for LoRA adapter comparison
+	// loraUpdateCache 缓存上一代 model(按 generation), 用于 LoRA 适配器增量比对
 	loraUpdateCacheMu sync.Mutex
 	loraUpdateCache   map[string]*workload.ModelBooster
 }
@@ -188,6 +208,9 @@ func (mc *ModelBoosterController) deleteModelBooster(obj any) {
 
 // reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
+// reconcile 一键部署主流程: ModelBooster → ModelServing+ModelServer+ModelRoute。
+// 依次: setInitCondition → setProcessing → createOrUpdateModelServing → ModelServer → ModelRoute
+//   → isModelServingActive(等 ModelServing 全部 Available) → setActiveCondition。任一步失败置 Failed。
 func (mc *ModelBoosterController) reconcile(ctx context.Context, namespaceAndName string) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(namespaceAndName)
 	if err != nil {

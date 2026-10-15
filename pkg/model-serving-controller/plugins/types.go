@@ -24,7 +24,19 @@ import (
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 )
 
-// HookRequest carries the context for plugin hook invocations.
+// =============================================================================
+// 插件接口 — ModelServing 在 Pod 生命周期关键点的扩展钩子
+// =============================================================================
+//
+// 【钩子时机】
+//   OnPodCreate: Pod 创建前(可原地改 req.Pod, 如注入 label/annotation/env)
+//   OnPodReady:  Pod 就绪后(观察态, 一般不改)
+// 插件由 ModelServing.Spec.Plugins 声明, 经 manager.NewChain 构建, 按 Scope 过滤执行。
+//
+// 【已有插件】lws-standard-labels(LWS 兼容, 注标准标签)、demo(示例)。
+// =============================================================================
+
+// HookRequest 插件钩子调用的上下文: 当前 ModelServing/ServingGroup/Role/Pod 信息
 type HookRequest struct {
 	ModelServing *workloadv1alpha1.ModelServing
 	ServingGroup string
@@ -34,11 +46,11 @@ type HookRequest struct {
 	Pod          *corev1.Pod
 }
 
-// Plugin defines the lifecycle hooks a plugin may implement.
+// Plugin 定义插件可实现的 Pod 生命周期钩子。
 type Plugin interface {
 	Name() string
-	// OnPodCreate is invoked before the controller creates the Pod. Mutations are applied in-place to req.Pod.
+	// OnPodCreate 在控制器创建 Pod 前调用, 可原地改 req.Pod
 	OnPodCreate(ctx context.Context, req *HookRequest) error
-	// OnPodReady is invoked when the controller observes the Pod running and ready.
+	// OnPodReady 在控制器观测到 Pod RunningAndReady 后调用
 	OnPodReady(ctx context.Context, req *HookRequest) error
 }

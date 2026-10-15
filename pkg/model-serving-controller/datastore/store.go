@@ -28,14 +28,36 @@ import (
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
 )
 
-// Store is an interface for storing and retrieving data
+// =============================================================================
+// 内存 datastore — 控制器的"观测状态"镜像, 不进 etcd
+// =============================================================================
+//
+// 【职责】在控制器进程内存里镜像 ServingGroup/Role 的运行态(状态/revision/运行 Pod),
+//   供 Reconcile 比对"期望态(spec) vs 观测态(store)"驱动扩缩容。
+//
+// 【为什么用内存而非 etcd】ServingGroup/Role 不是 K8s 资源(无 CRD, 见架构文档 §1.3),
+//   它们的运行态无需持久化 — 控制器重启时从 Pod 的 label(group-name/role/role-id)反向重建即可,
+//   Pod 是唯一可信源(进 etcd 且带全 label)。故 store 只需内存镜像, 重启即失。
+//
+// 【数据结构】两层 map:
+//   store.servingGroup: modelServing 名 → (组名 → *ServingGroup)
+//   ServingGroup.roles: roleName → (roleID → *Role)  如 prefill → prefill-0 → *Role
+//
+// 【与 spec 层的区别】API 层 workloadv1alpha1.ServingGroup/Role 是用户 spec(模板);
+//   本文件 datastore.ServingGroup/Role 是运行态(观测)。同名不同包, 别混。
+//
+// 【并发安全】store 用 sync.RWMutex 保护; 接口 Store 供测试注入 mock。
+// =============================================================================
+
+// Store 是存取 ServingGroup/Role 运行态的接口(供测试注入 mock)。
 type Store interface {
-	// GetServingGroupByModelServing returns the sorted serving groups
+	// GetServingGroupByModelServing 返回某 ModelServing 的所有 ServingGroup(按 ordinal 升序)
 	GetServingGroupByModelServing(modelServingName types.NamespacedName) ([]ServingGroup, error)
 	GetServingGroupRevision(modelServingName types.NamespacedName, groupName string) (string, bool)
 	GetRunningPodNumByServingGroup(modelServingName types.NamespacedName, groupName string) (int, error)
 	GetServingGroupStatus(modelServingName types.NamespacedName, groupName string) ServingGroupStatus
 	GetRoleList(modelServingName types.NamespacedName, groupName, roleName string) ([]Role, error)
+	// GetRolesByGroup 返回某组所有 Role: roleName → (roleID → *Role)
 	GetRolesByGroup(modelServingName types.NamespacedName, groupName string) (map[string]map[string]*Role, error)
 	GetRoleStatus(modelServingName types.NamespacedName, groupName, roleName, roleID string) RoleStatus
 	UpdateRoleStatus(modelServingName types.NamespacedName, groupName, roleName, roleID string, status RoleStatus) error
@@ -45,38 +67,41 @@ type Store interface {
 	AddServingGroup(modelServingName types.NamespacedName, idx int, revision string)
 	AddRole(modelServingName types.NamespacedName, groupName, roleName, roleID, revision, roleTemplateHash string)
 	AddRunningPodToServingGroup(modelServingName types.NamespacedName, groupName, pod, revision, roleTemplateHash, roleName, roleID string)
-	// AddServingGroupAndRole adds servingGroup and role if not exist
+	// AddServingGroupAndRole 不存在则加 servingGroup 和 role(首次同步用)
 	AddServingGroupAndRole(modelServingName types.NamespacedName, servingGroupName, revision, roleTemplateHash, roleName, roleID string)
 	DeleteRunningPodFromServingGroup(modelServingName types.NamespacedName, groupName string, pod string)
 	UpdateServingGroupStatus(modelServingName types.NamespacedName, groupName string, Status ServingGroupStatus) error
 	UpdateServingGroupRevision(modelServingName types.NamespacedName, groupName string, revision string) error
-	// DumpCache returns a JSON dump of the current store cache representation, which is useful for debugging and monitoring purposes. The structure of the JSON will be a map of modelServing names to their ServingGroups, and each ServingGroup will include its roles and running pods.
+	// DumpCache 返回 store 缓存的 JSON dump(调试/监控用, /debug/modelserving/cache 端点)
 	DumpCache() ([]byte, error)
 }
 
+// store 是 Store 的内存实现, 用 RWMutex 保护
 type store struct {
 	mutex sync.RWMutex
 
-	// ServingGroup is a map of modelServing names to their ServingGroups
-	// modelServing -> group name-> ServingGroup
+	// servingGroup: modelServing 名 → (组名 → *ServingGroup)
 	servingGroup map[types.NamespacedName]map[string]*ServingGroup
 }
 
+// ServingGroup 是内存里的 ServingGroup 运行态(与 API 层 workloadv1alpha1.ServingGroup 同名不同包)。
 type ServingGroup struct {
 	Name        string
-	runningPods map[string]struct{} // Map of pod names in this ServingGroup
+	runningPods map[string]struct{}   // 本组运行中的 pod 名集合
 	Revision    string
 	Status      ServingGroupStatus
-	roles       map[string]map[string]*Role // roleName -> roleID -> *Role, like prefill -> prefill-0 -> *Role
+	roles       map[string]map[string]*Role // roleName → roleID → *Role, 如 prefill → prefill-0 → *Role
 }
 
+// Role 是内存里的 Role 运行态。
 type Role struct {
 	Name             string
-	Revision         string // Revision of the ServingGroup
-	RoleTemplateHash string // Revision of the Role, used for RoleRollingUpdate strategy
+	Revision         string              // 继承所属 ServingGroup 的 Revision
+	RoleTemplateHash string              // Role 模板哈希, 供 RoleRollingUpdate 判定过时
 	Status           RoleStatus
 }
 
+// ServingGroupStatus ServingGroup 状态枚举(注意: 多一个 Scaling, Role 没有)
 type ServingGroupStatus string
 
 const (
@@ -87,6 +112,7 @@ const (
 	ServingGroupNotFound ServingGroupStatus = "NotFound"
 )
 
+// RoleStatus Role 状态枚举(注意: 无 RoleDraining — 无损升级的 drain 在 Router 侧, 不进控制面)
 type RoleStatus string
 
 const (

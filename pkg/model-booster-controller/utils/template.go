@@ -27,11 +27,24 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 )
 
+// =============================================================================
+// 模板渲染工具 — ${PLACEHOLDER} 占位符替换 + vLLM JSON→CLI 参数转换
+// =============================================================================
+// convert 加载内嵌 yaml 模板后, 用 ReplacePlaceholders 递归替换 ${KEY} 为实际值:
+//   - 整值 ${KEY} 用 deepCopyValue 整体替换
+//   - 子串 ${KEY} 用 ReplaceEmbeddedPlaceholders 替换
+//   - 非标量 JSON 序列化
+// ConvertVLLMArgsFromJson: worker.Config JSON → --cli 参数(键名 _→-、排序)。
+//
+// label key 常量: OwnerUIDKey(model-uid)用于 ModelServer 选中本 ModelBooster 派生的 Pod。
+// =============================================================================
+
 const (
 	ModelNameLabelKey   = workload.GroupName + "/model-name"
 	BackendNameLabelKey = workload.GroupName + "/backend-name"
 	ManageBy            = workload.GroupName + "/managed-by"
 	RevisionLabelKey    = workload.GroupName + "/revision"
+	// OwnerUIDKey model-uid label, ModelServer.WorkloadSelector.MatchLabels 据此选中本 ModelBooster 的 Pod
 	OwnerUIDKey         = workload.GroupName + "/model-uid"
 )
 

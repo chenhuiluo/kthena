@@ -1,24 +1,36 @@
+# =============================================================================
+# vLLM 单 Role 模板 — leader Role(ModelBooster vLLM 后端用, 非分离)
+# =============================================================================
+# 由 convert/model_serving.go buildVllmModelServing 经 loadModelServingTemplate 渲染。
+# ${PLACEHOLDER} 由 ReplacePlaceholders 替换。
+#
+# 结构: replicas=BACKEND_REPLICAS 个 ServingGroup, 每组单 leader Role:
+#   - topologySpreadConstraints: 按 hostname 打散, maxSkew=1(同主机最多差 1, 均匀分布)
+#   - gangPolicy.minRoleReplicas.leader: gang 门槛
+#   - leader Role: entry 跑 runtime+engine 两容器, worker 跑 Ray worker(多节点张量并行)
+#   - engine 有 preStop 排空探针: num_requests_running/waiting=0 才退出(无损下线)
+# =============================================================================
 apiVersion: workload.serving.volcano.sh/v1alpha1
 kind: ModelServing
 metadata: ${MODEL_SERVING_TEMPLATE_METADATA}
 spec:
-  schedulerName: ${SCHEDULER_NAME}
-  topologySpreadConstraints:
+  schedulerName: ${SCHEDULER_NAME}          # 调度器名(默认 volcano)
+  topologySpreadConstraints:               # 拓扑打散: 按 hostname 均匀分布, maxSkew=1
     - maxSkew: 1
       topologyKey: kubernetes.io/hostname
       whenUnsatisfiable: DoNotSchedule
       labelSelector:
         matchLabels:
           modelserving.volcano.sh/name: ${MODEL_NAME}
-  replicas: ${BACKEND_REPLICAS}
+  replicas: ${BACKEND_REPLICAS}            # ServingGroup 数
   template:
     restartGracePeriodSeconds: 60
     gangPolicy:
       minRoleReplicas:
-        leader: ${SERVER_REPLICAS}
+        leader: ${SERVER_REPLICAS}          # gang 门槛: leader 至少 N 个
     roles:
-      - name: leader
-        replicas: ${SERVER_REPLICAS}
+      - name: leader                         # 单 leader Role
+        replicas: ${SERVER_REPLICAS}        # leader 实例数
         entryTemplate:
           metadata: ${SERVER_ENTRY_TEMPLATE_METADATA}
           spec:

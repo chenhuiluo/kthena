@@ -1,18 +1,30 @@
+# =============================================================================
+# vLLM PD 分离模板 — prefill + decode 双 Role(ModelBooster vLLMDisaggregated 后端用)
+# =============================================================================
+# 由 convert/model_serving.go buildVllmDisaggregatedModelServing 经 loadModelServingTemplate 渲染。
+# ${PLACEHOLDER} 由 ReplacePlaceholders 替换为实际值(来自 ModelBooster spec)。
+#
+# 结构: replicas=BACKEND_REPLICAS 个 ServingGroup, 每组 prefill + decode 两 Role:
+#   - gangPolicy.minRoleReplicas {prefill,decode}: gang 门槛, 保证 P 和 D 各至少 1 个一起调度
+#   - 每 Role workerReplicas:0 → 每 Role 实例仅 1 个 entry pod(PD 典型: 单 pod 独立引擎, 靠 KV connector 传 KV)
+#   - runtime 容器: 跑 metrics/健康检查; vllm 容器: 跑推理引擎(含 kv-transfer-config)
+# 对应架构文档 §4.2 拓扑图与 §4.5 GangPolicy。
+# =============================================================================
 apiVersion: workload.serving.volcano.sh/v1alpha1
 kind: ModelServing
 metadata: ${MODEL_SERVING_TEMPLATE_METADATA}
 spec:
-  schedulerName: ${SCHEDULER_NAME}
-  replicas: ${BACKEND_REPLICAS}
+  schedulerName: ${SCHEDULER_NAME}          # 调度器名(默认 volcano, 决定建 PodGroup)
+  replicas: ${BACKEND_REPLICAS}            # ServingGroup 数(组数, 非 Pod 数)
   template:
     restartGracePeriodSeconds: 60
     gangPolicy:
-      minRoleReplicas:
+      minRoleReplicas:                      # gang 门槛: P 和 D 各至少 N 个才放行整组
         prefill: ${PREFILL_REPLICAS}
         decode: ${DECODE_REPLICAS}
     roles:
-      - name: prefill
-        replicas: ${PREFILL_REPLICAS}
+      - name: prefill                       # prefill Role(算 KV cache, KV 生产者)
+        replicas: ${PREFILL_REPLICAS}       # prefill 实例数
         entryTemplate:
           metadata: ${SERVER_ENTRY_TEMPLATE_METADATA}
           spec:

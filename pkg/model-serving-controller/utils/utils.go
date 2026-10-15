@@ -39,15 +39,33 @@ import (
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 )
 
+// =============================================================================
+// 共享工具 — 命名/ordinal、Pod 生成、label、预算解析、条件设置等
+// =============================================================================
+//
+// 【命名约定】两级建模通过命名串联, 所有命名可双向解析:
+//   ModelServing: my-model
+//     ├─ ServingGroup: my-model-0, my-model-1, ...       (miName-ordinal)
+//     │   └─ Role 实例: prefill-0, decode-0, ...           (roleName-ordinal)
+//     │       └─ Pod: my-model-0-prefill-0-0, ...-0-1, ... (group-roleID-podIndex)
+//   正则 (.*)-([0-9]+)$ 从 xxx-N 解析父名+ordinal。
+//
+// 【Pod 结构】一个 Role 实例 = 1 entry pod + WorkerReplicas worker pod。
+//   entry pod index 固定 0, worker 从 1 起。entry 打 EntryLabelKey=true,
+//   注入 ENTRY_ADDRESS/WORKER_INDEX/GROUP_SIZE 环境变量。
+// =============================================================================
+
 const (
+	// Entry: entry pod 的 label 值(EntryLabelKey=true)
 	Entry = "true"
 
-	// condition status of ModelServingStatus
+	// ModelServingStatus 的 condition message 常量
 	AllGroupsIsReady         = "All Serving groups are ready"
 	SomeGroupsAreProgressing = "Some groups is progressing"
 	SomeGroupsAreUpdated     = "Updated Groups are"
 )
 
+// GetNamespaceName 从 metav1.Object 取 namespace/name
 func GetNamespaceName(obj metav1.Object) types.NamespacedName {
 	return types.NamespacedName{
 		Namespace: obj.GetNamespace(),
@@ -55,12 +73,11 @@ func GetNamespaceName(obj metav1.Object) types.NamespacedName {
 	}
 }
 
-// ServingGroupRegex is a regular expression that extracts the parent modelServing and ordinal from the Name of an ServingGroup
+// servingGroupRegex 从 ServingGroup 名解析父 ModelServing 名 + ordinal 的正则: (.*)-([0-9]+)$
 var servingGroupRegex = regexp.MustCompile("(.*)-([0-9]+)$")
 
-// GetParentNameAndOrdinal gets the name of ServingGroup's parent modelServing and ServingGroup's ordinal as extracted from its Name.
-// For example, the Servinggroup name is vllm-sample-0, this function can be used to obtain the modelServing name corresponding to the ServingGroup,
-// which is vllm-sample and the serial number is 0.
+// GetParentNameAndOrdinal 从 ServingGroup 名解析父 ModelServing 名和 ordinal。
+// 例: "vllm-sample-0" → ("vllm-sample", 0)。无法解析返回 ("", -1)。
 func GetParentNameAndOrdinal(groupName string) (string, int) {
 	parent := ""
 	ordinal := -1
@@ -75,16 +92,19 @@ func GetParentNameAndOrdinal(groupName string) (string, int) {
 	return parent, ordinal
 }
 
+// GenerateServingGroupName 生成 ServingGroup 名: miName + "-" + idx。例: ("my-model",1) → "my-model-1"
 func GenerateServingGroupName(miName string, idx int) string {
 	return miName + "-" + strconv.Itoa(idx)
 }
 
+// GenerateRoleID 生成 Role 实例 ID: roleName + "-" + idx。例: ("prefill",0) → "prefill-0"
 func GenerateRoleID(roleName string, idx int) string {
 	return roleName + "-" + strconv.Itoa(idx)
 }
 
+// GenerateControllerRevisionName 生成 ControllerRevision 名(截断 msName 至 223 字符, 对齐 K8s controller history 前缀约束)
 func GenerateControllerRevisionName(msName, revision string) string {
-	// Match the prefix bound used by Kubernetes controller history.
+	// 对齐 Kubernetes controller history 的前缀约束
 	if len(msName) > 223 {
 		msName = msName[:223]
 	}
@@ -97,6 +117,8 @@ func GeneratePodName(groupName, roleName string, podIndex int) string {
 	return groupName + "-" + roleName + "-" + strconv.Itoa(podIndex)
 }
 
+// GenerateEntryPod 生成 entry pod: podIndex 固定 0, 打 EntryLabelKey=true,
+// 用 EntryTemplate, 注入 ENTRY_ADDRESS/WORKER_INDEX/GROUP_SIZE 环境变量, SchedulerName 取 ms 的。
 func GenerateEntryPod(role workloadv1alpha1.Role, ms *workloadv1alpha1.ModelServing, groupName, roleID, revision, roleTemplateHash string) *corev1.Pod {
 	entryPodName := GeneratePodName(groupName, roleID, 0)
 	entryPod := createBasePod(role, ms, entryPodName, groupName, roleID, revision, roleTemplateHash)
@@ -104,12 +126,13 @@ func GenerateEntryPod(role workloadv1alpha1.Role, ms *workloadv1alpha1.ModelServ
 	addPodLabelAndAnnotation(entryPod, role.EntryTemplate.Metadata)
 	entryPod.Spec = role.EntryTemplate.Spec
 	entryPod.Spec.SchedulerName = ms.Spec.SchedulerName
-	// Build environment variables into each container of all pod
+	// 给每个容器注入公共环境变量
 	envVars := createCommonEnvVars(role, entryPod, 0)
 	addPodEnvVars(entryPod, envVars...)
 	return entryPod
 }
 
+// GenerateWorkerPod 生成 worker pod: podIndex 从 1 起, 用 WorkerTemplate, 同样注入环境变量。
 func GenerateWorkerPod(role workloadv1alpha1.Role, ms *workloadv1alpha1.ModelServing, entryPod *corev1.Pod, groupName, roleID string, podIndex int, revision, roleTemplateHash string) *corev1.Pod {
 	if role.WorkerTemplate == nil {
 		klog.Errorf("WorkerTemplate is required when workerReplicas > 0 for role %s", role.Name)
@@ -126,6 +149,18 @@ func GenerateWorkerPod(role workloadv1alpha1.Role, ms *workloadv1alpha1.ModelSer
 	return workerPod
 }
 
+// createBasePod 构造 Pod 的基础骨架: 打 6 个关键 label + OwnerRef 指向 ModelServing。
+//
+// 【6 个 label】(都定义在 pkg/apis/workload/v1alpha1/labels.go):
+//   ModelServingNameLabelKey: ms.Name       — 哪个 ModelServing
+//   GroupNameLabelKey:        groupName     — 哪个 ServingGroup(PD 配对锚键, 见 §4.3)
+//   RoleLabelKey:             role.Name     — 哪个 Role(prefill/decode)
+//   RoleIDKey:                 roleID       — 哪个 Role 实例(prefill-0)
+//   RevisionLabelKey:          revision     — 哪个 revision
+//   RoleTemplateHashLabelKey:  roleTemplateHash — Role 模板哈希(供 RoleRollingUpdate 判定过时)
+//
+// 【OwnerRef】指向 ModelServing(不是 ServingGroup/Role — 它们不是 K8s 资源, 见 §1.3),
+//   故 GC 级联删除是 ModelServing → Pod 直接关联。
 func createBasePod(role workloadv1alpha1.Role, ms *workloadv1alpha1.ModelServing, name, groupName, roleID, revision, roleTemplateHash string) *corev1.Pod {
 	return &corev1.Pod{
 		TypeMeta: metav1.TypeMeta{
@@ -598,20 +633,25 @@ func RoleIDIndexFunc(obj interface{}) ([]string, error) {
 	return []string{compositeKey}, nil
 }
 
+// GetMaxUnavailable 解析 ModelServing 层 maxUnavailable(ServingGroupRollingUpdate 用), 默认 1。
+// 百分比时按 replicas 算, 向下取整(GetScaledValueFromIntOrPercent ... false)。
+//
+// why 向下取整: unavailable 是"允许损失多少可用副本", 向下少删一点, 宁可慢也不超额降容(见 §5.3)。
 func GetMaxUnavailable(ms *workloadv1alpha1.ModelServing) (int, error) {
-	maxUnavailable := intstr.FromInt(1) // Default value
+	maxUnavailable := intstr.FromInt(1) // 默认 1
 	replicas := int(*ms.Spec.Replicas)
 	if ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.RollingUpdateConfiguration != nil {
 		if ms.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxUnavailable != nil {
 			maxUnavailable = *ms.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxUnavailable
 		}
 	}
-	// Calculate maxUnavailable as absolute numbers
 	return intstr.GetScaledValueFromIntOrPercent(&maxUnavailable, replicas, false)
 }
 
-// GetMaxSurge resolves the ServingGroup surge budget against the latest
-// desired replica count. Percentage values are rounded up.
+// GetMaxSurge 解析 ModelServing 层 maxSurge, 默认 0。百分比时按 replicas 算, 向上取整(... true)。
+//
+// why 向上取整: surge 是"允许临时多建多少", 向上多建一点, 保证有足够新容量顶替(见 §5.3)。
+// 默认 0: 先删后建(替换式), 不要求额外资源余量即可滚动, 资源友好; surge 是 opt-in 奢侈。
 func GetMaxSurge(ms *workloadv1alpha1.ModelServing) (int, error) {
 	maxSurge := intstr.FromInt(0)
 	if ms.Spec.Replicas == nil {

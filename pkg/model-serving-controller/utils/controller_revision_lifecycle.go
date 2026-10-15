@@ -29,12 +29,26 @@ import (
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 )
 
-// RecordModelServingRevision applies the StatefulSet revision lifecycle to
-// canonical revision data. Equivalent data reuses its ControllerRevision;
-// only its numeric Revision may be advanced. Data is never modified.
+// =============================================================================
+// ControllerRevision 生命周期 — 类 StatefulSet 的模板版本管理
+// =============================================================================
 //
-// The returned collision count must be persisted in ModelServingStatus by the
-// caller when it differs from the current value.
+// 【为什么需要 ControllerRevision】ModelServing.Spec.Template 是可变的(用户随时改 spec),
+//   但 partition 保护的低 ordinal 副本恢复时必须用"它创建时那一代"的模板, 不能用最新 spec。
+//   ControllerRevision 持久化每代模板快照(进 etcd), 让 partition 恢复能取到正确的旧模板。
+//   仅靠 Generation(计数) 不行 — 它不含模板内容。Generation 只记"改了几次", 快照记"每次长啥样"。
+//
+// 【核心不变量】数据不可变(Data is never modified):
+//   - 等价数据复用既有 ControllerRevision, 只前进其 Revision 数字(不新建、不改 data)。
+//   - 哈希冲突(同名)时自增 collisionCount 作盐重算名字, 不改 data。这样历史快照绝对可靠。
+//
+// 【借鉴 StatefulSet】CurrentRevision/UpdateRevision/CollisionCount 三件套 +
+//   controllerRevisionLess 排序, 与 K8s controller history 一致。
+// =============================================================================
+
+// RecordModelServingRevision 把 StatefulSet 的 revision 生命周期套到规范化 revision data 上:
+// 等价数据复用其 ControllerRevision(只前进 Revision 数字), 数据本身不可变。
+// 返回的 collisionCount 不同于当前值时, 调用方须持久化到 ModelServingStatus。
 func RecordModelServingRevision(
 	ctx context.Context,
 	client kubernetes.Interface,

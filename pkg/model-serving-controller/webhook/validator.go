@@ -34,7 +34,24 @@ import (
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
 )
 
-// ModelServingValidator handles validation of ModelServing resources.
+// =============================================================================
+// ModelServing 校验准入 webhook — 拦截非法配置, 早失败
+// =============================================================================
+//
+// 【校验内容】
+//   - Role 数 1~4、名字唯一、长度 ≤12
+//   - RollingUpdateConfiguration: RoleRollingUpdate 时禁止设(只有 ServingGroupRollingUpdate 用)
+//   - 互斥规则: maxUnavailable 和 maxSurge 不能同时为 0(否则滚动死锁, 至少留一条路);
+//     仅当 replicas > partition 时校验(全保护=无滚动需求, 两个都 0 允许)
+//   - maxUnavailable 仅 MaxSurge>0 时才允许 0
+//   - partition/maxSurge/maxUnavailable 的 intstr 合法性
+//   - WorkerReplicas>0 须有 WorkerTemplate; entry/worker 模板合法性
+//
+// 【why 互斥规则】两个都 0 = 既不能删旧(无 surge 顶替)也不能建新(无 surge 余量),
+//   更新永远无法推进。规则不是禁止某一种, 而是"至少留一条路"(见 §5.3)。
+// =============================================================================
+
+// ModelServingValidator ModelServing 校验器
 type ModelServingValidator struct {
 }
 
@@ -147,7 +164,10 @@ func validateRoleNames(ms *workloadv1alpha1.ModelServing) field.ErrorList {
 }
 
 // validateRollingUpdateConfiguration validates the ServingGroup-level rolling
-// update configuration and rejects it for RoleRollingUpdate.
+// validateRollingUpdateConfiguration 校验 RollingUpdateConfiguration。
+// 关键: RoleRollingUpdate 时禁止设(只有 ServingGroupRollingUpdate 用 ModelServing 层配置)。
+// 互斥规则: replicas > partition 时, maxUnavailable 和 maxSurge 不能同时为 0(滚动死锁)。
+// why RoleRollingUpdate 禁止设: 它用每 Role 内联配置, 读 ModelServing 层单一值语义不匹配(见 §5.1)。
 func validateRollingUpdateConfiguration(ms *workloadv1alpha1.ModelServing) field.ErrorList {
 	var allErrs field.ErrorList
 	if ms.Spec.RolloutStrategy == nil || ms.Spec.RolloutStrategy.RollingUpdateConfiguration == nil {

@@ -39,22 +39,48 @@ import (
 	"k8s.io/apimachinery/pkg/util/yaml"
 )
 
+// =============================================================================
+// convert 模板渲染 — 把 ModelBooster 渲染成 ModelServing
+// =============================================================================
+//
+// 【职责】按 ModelBooster.Spec.Backend.Type 选模板, 渲染出 ModelServing CR。
+//
+// 【两个内嵌模板】(//go:embed templates/*):
+//   vllm.yaml       — 单 Role "leader", Ray 多节点, gangPolicy.minRoleReplicas.leader=SERVER_REPLICAS
+//   vllm-pd.yaml    — 双 Role "prefill"+"decode", workerReplicas:0, PD 分离
+//
+// ⚠️ 无 sglang.yaml: BuildModelServing 只 dispatch vLLM→buildVllmModelServing、
+//   vLLMDisaggregated→buildVllmDisaggregatedModelServing, 其他类型(SGLang/MindIE)直接报错。
+//   虽 CRD 枚举有这些值, 但 convert 未实现。
+//
+// 【渲染流程】loadModelServingTemplate: 读 embed 文件 → yaml.Unmarshal 成 JSON 树
+//   → ReplacePlaceholders(递归替换 ${KEY}) → json.Marshal → 还原成 ModelServing。
+//
+// 【命令构建】buildCommands: worker.Config JSON 经 ConvertVLLMArgsFromJson 转成 --cli 参数
+//   (键名 _→-、排序); Pods>1 时加 --distributed_executor_backend ray 并用 multi-node-serving.sh。
+// =============================================================================
+
 const (
 	CacheURIPrefixPVC              = "pvc://"
 	CacheURIPrefixHostPath         = "hostpath://"
 	URIPrefixSeparator             = "://"
+	// VllmTemplatePath 单 Role(leader)模板路径
 	VllmTemplatePath               = "templates/vllm.yaml"
+	// VllmDisaggregatedTemplatePath 双 Role(prefill+decode)PD 分离模板路径
 	VllmDisaggregatedTemplatePath  = "templates/vllm-pd.yaml"
 	VllmMultiNodeServingScriptPath = "examples/online_serving/multi-node-serving.sh"
 	modelRouteRuleName             = "default"
-	// /dev/shm is too small to support NCCL, we need a larger memory volume
+	// /dev/shm 太小不足以支持 NCCL, 需要更大的内存 volume
 	dshm = "dshm"
 )
 
+// 内嵌模板文件(vllm.yaml + vllm-pd.yaml)
+//
 //go:embed templates/*
 var templateFS embed.FS
 
-// BuildModelServing creates a ModelServing object based on the model's backend.
+// BuildModelServing 按 model 的 backend type 构造 ModelServing 对象。
+// vLLM → buildVllmModelServing, vLLMDisaggregated → buildVllmDisaggregatedModelServing, 其他报错。
 func BuildModelServing(model *workload.ModelBooster) (*workload.ModelServing, error) {
 	backend := &model.Spec.Backend
 	var serving *workload.ModelServing

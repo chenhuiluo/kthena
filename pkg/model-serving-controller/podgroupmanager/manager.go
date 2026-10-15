@@ -47,19 +47,53 @@ import (
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
 )
 
+// =============================================================================
+// PodGroup 管理器 — 用 Volcano 的 gang 调度保证整组原子上线
+// =============================================================================
+//
+// 【职责】为每个 ServingGroup 创建/更新/删除一个 volcano PodGroup, 把组内所有 Pod 汇成一个
+//   gang 调度单元: 组内 Pod 必须凑够 MinMember 才一起被调度, 否则都不跑(避免部分上线无法工作)。
+//
+// 【PodGroup 是 Volcano 概念】podgroups.scheduling.volcano.sh, volcano scheduler 的 gang 调度 CRD。
+//   kthena 借用它, 不自己造调度器。
+//
+// 【创建条件 shouldCreatePodGroup】只看两个, 与 GangPolicy 无关:
+//   ① 集群装了 PodGroup CRD(hasPodGroupCRD)
+//   ② ModelServing.Spec.SchedulerName == "volcano"(默认)
+//   最简单单 Role replicas=1 也会建 PodGroup(MinMember=1, 无约束);
+//   改成非 volcano 调度器则不建, Pod 回退普通 K8s 调度。
+//
+// 【MinMember 算法 calculateRequirements】
+//   无 GangPolicy: MinMember = Σ_roles (1+WorkerReplicas)×Replicas = 总 pod 数(无约束)
+//   有 GangPolicy {prefill:1,decode:1}: MinMember = Σ_roles podsPerRole×min(MinRoleReplicas,Replicas)
+//     → PD 场景保证 P 和 D 各至少 N 个一起调度
+//
+// 【subGroupPolicy】仅 PodGroup CRD 支持时启用(hasSubGroupPolicy):
+//   每 Role 一条 SubGroupPolicySpec, 各 Role 子组都满足最小数才放行整个 PodGroup。
+//   CRD 不支持时只有 MinMember 起作用, per-role gang 退化为整体 gang。
+//
+// 【Pod 关联 PodGroup】Pod 经 annotation scheduling.volcano.sh/kube-group-name=组名 绑到 PodGroup
+//   (非 OwnerRef 父子), 由 AnnotatePodWithPodGroup 注入。
+//
+// 【CRD 热感知】watch PodGroup CRD 的增删, hasPodGroupCRD 动态更新(装/卸 CRD 无需重启控制器)。
+// =============================================================================
+
 const (
-	// enqueueAfter is the time duration to wait to re-enqueue.
+	// enqueueAfter: 处理失败后重新入队的等待时长
 	enqueueAfter = 1 * time.Second
 
+	// podGroupCRDName: PodGroup CRD 的全名(volcano 的 gang 调度 CRD)
 	podGroupCRDName = "podgroups.scheduling.volcano.sh"
 	groupNameKey    = "GroupName"
 )
 
-// Manager manages PodGroups for gang scheduling
+// Manager 管理 PodGroup 的 gang 调度管理器(实现 model_serving_controller 的 PodGroupManager 接口)
 type Manager struct {
 	kubeClient                   kubernetes.Interface
 	volcanoClient                volcanoclient.Interface
+	// hasPodGroupCRD: 集群是否装了 PodGroup CRD(动态, watch CRD 变更更新); 决定是否建 PodGroup
 	hasPodGroupCRD               atomic.Bool
+	// hasSubGroupPolicy: PodGroup CRD 是否支持 subGroupPolicy 字段; 支持则启用 per-role gang
 	hasSubGroupPolicy            atomic.Bool
 	podGroupInformerInitCallback func(cache.SharedIndexInformer)
 
@@ -266,6 +300,14 @@ func (m *Manager) CreateOrUpdatePodGroup(ctx context.Context, ms *workloadv1alph
 
 // shouldCreatePodGroup checks if gang scheduling or networkTopology scheduling is enabled for the ModelServing.
 // These advanced scheduling features are only effective when used with the "volcano" scheduler.
+// shouldCreatePodGroup 判断是否为该 ModelServing 建 PodGroup, 只看两个条件(与 GangPolicy 无关):
+//   ① 集群装了 PodGroup CRD(hasPodGroupCRD)
+//   ② Spec.SchedulerName == "volcano"(默认)
+//
+// why 与 GangPolicy 无关: PodGroup 创建是调度基础设施(只要用 volcano 调度就要 gang 单元),
+//   GangPolicy 只收紧 MinMember(决定 gang 门槛多严), 不决定建不建。
+//   最简单单 Role replicas=1 也建 PodGroup(MinMember=1, 单 Pod 必然满足, 无约束)。
+//   改成非 volcano 调度器则不建, Pod 回退普通 K8s 调度。
 func (m *Manager) shouldCreatePodGroup(ms *workloadv1alpha1.ModelServing) bool {
 	// If PodGroup CRD is not present, gang scheduling is not supported.
 	if !m.hasPodGroupCRD.Load() {
@@ -286,7 +328,9 @@ func extractQueueName(ms *workloadv1alpha1.ModelServing) string {
 	return ms.Annotations[schedulingv1beta1.QueueNameAnnotationKey]
 }
 
-// createPodGroup creates a PodGroup for group-level gang scheduling
+// createPodGroup 为一个 ServingGroup 创建 PodGroup(group 级 gang 调度单元)。
+// 流程: calculateRequirements 算 MinMember/资源 → 构造 PodGroup(名=组名, label=group-name, 注解 kube-group, OwnerRef→ModelServing)
+//   → 继承 queue(ModelServing 注解) → 网络拓扑 → subGroupPolicy(若 CRD 支持) → Create。
 func (m *Manager) createPodGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, podGroupName string) error {
 	// Calculate total pods and resources for this ServingGroup
 	// minMember: total pods across all roles
@@ -346,7 +390,21 @@ func (m *Manager) buildOwnerReference(ms *workloadv1alpha1.ModelServing) []metav
 	}
 }
 
-// calculateRequirements calculates requirements for role-level gang scheduling
+// calculateRequirements 算 PodGroup 的 MinMember(及每 Role pod 数、聚合资源), 是 gang 门槛的核心:
+//
+// 流程: 对每个 Role:
+//   - podsPerRole = 1 + WorkerReplicas(entry + workers)
+//   - minRoleReplicas: 无 GangPolicy 时 = roleReplicas(全部); 有 GangPolicy 时 = min(MinRoleReplicas[role], roleReplicas)
+//   - minMember += podsPerRole × minRoleReplicas(只算最小满足数, 不是全部副本)
+//   - 聚合资源(× minRoleReplicas 份)
+//
+// 例: 无 GangPolicy + 单 Role(Replicas=2,WorkerReplicas=1) → MinMember = (1+1)×2 = 4(全部 4 pod, 无约束)
+//     有 {prefill:1,decode:1} + 2P2D(各 WorkerReplicas=0) → MinMember = 1×1 + 1×1 = 2(只需 1P+1D 凑齐即放行)
+//
+// why 用 min(MinRoleReplicas, Replicas): GangPolicy 是 gang 门槛"至少各 N 个", 不是"各起 N 个";
+//   实际副本数由 Role.Replicas 决定。min 保证门槛不超实际副本数。
+//
+// 返回: minMember(PodGroup.Spec.MinMember), minRoleMember(每 Role pod 数, 供 subGroupPolicy), minResources(聚合资源)
 func (m *Manager) calculateRequirements(ms *workloadv1alpha1.ModelServing) (int, map[string]int32, corev1.ResourceList) {
 	minMember := 0
 	minRoleMember := make(map[string]int32)
@@ -541,7 +599,11 @@ func calculateRequiredRoleNames(expectedReplicas int, existRoleList []datastore.
 	return existRoleList
 }
 
-// AnnotatePodWithPodGroup annotates a pod with the appropriate PodGroup information
+// AnnotatePodWithPodGroup 给 Pod 注解, 把它绑到本 ServingGroup 的 PodGroup(gang 单元)。
+// 注 scheduling.volcano.sh/kube-group=组名(让 volcano 知道这个 Pod 属于哪个 gang) + task spec。
+// why 用注解而非 OwnerRef: Pod 与 PodGroup 不是父子关系, 只是"归属于同一 gang";
+//   OwnerRef 都指向 ModelServing, gang 归属靠注解表达(见开篇图)。
+// shouldCreatePodGroup 为 false(非 volcano 调度)时跳过, Pod 不带 gang 注解。
 func (m *Manager) AnnotatePodWithPodGroup(pod *corev1.Pod, ms *workloadv1alpha1.ModelServing, groupName, taskName string) {
 	if !m.shouldCreatePodGroup(ms) {
 		return
@@ -630,6 +692,14 @@ func hasPodGroupChanged(current, updated *schedulingv1beta1.PodGroup) bool {
 		current.Spec.Queue != updated.Spec.Queue
 }
 
+// appendSubGroupPolicy 给 PodGroup 加 per-role subGroupPolicy(仅 PodGroup CRD 支持时调用)。
+// 每个 Role 生成一条 SubGroupPolicySpec:
+//   - LabelSelector: 按 ModelServingName + Role 名匹配
+//   - MatchLabelKeys: RoleIDKey(按 role-id 分子组)
+//   - SubGroupSize: podsPerRole(每实例 pod 数, 即一个子组多大)
+//   - MinSubGroups: min(MinRoleReplicas, Replicas)(至少几个子组满足才放行)
+// 效果: prefill 与 decode 各自作为独立子组, 两者都满足最小子组数后整个 PodGroup 才解冻。
+// why: 比 MinMember 更精细 — MinMember 只看总数, subGroupPolicy 保证每 Role 各自达标(PD 的 P 和 D 各自至少 N 个)。
 func appendSubGroupPolicy(ms *workloadv1alpha1.ModelServing, podGroup *schedulingv1beta1.PodGroup, minRoleMember map[string]int32) *schedulingv1beta1.PodGroup {
 	subGroupPolicy := make([]schedulingv1beta1.SubGroupPolicySpec, 0, len(minRoleMember))
 	for _, role := range ms.Spec.Template.Roles {

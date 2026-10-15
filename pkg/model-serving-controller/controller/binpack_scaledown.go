@@ -16,6 +16,24 @@ limitations under the License.
 
 package controller
 
+// =============================================================================
+// 装箱缩容评分 — 决定缩容时"先删谁"
+// =============================================================================
+//
+// 【为什么不是简单删最高 ordinal】推理副本有"热数据/会话价值"差异: 带 KV cache 热数据、
+// 会话亲和的副本删掉代价高。故引入"状态优先级 + pod deletionCost + ordinal index"三级评分,
+// 让应用层用 controller.kubernetes.io/pod-deletion-cost 注解干预删谁。
+//
+// 【评分优先级】值越小越先删:
+//   1. Status(主): Creating/Deleting/Scaling/NotFound=0(先删, 不健康), Running=1(后删)
+//      未知状态当 0(safety first, 先清理不确定的)
+//   2. DeletionCost(次): 低 cost 先删(用户给热副本设高 cost 保护它)
+//   3. Index(末): 同状态同 cost 时高 ordinal 先删(保留旧"高 ordinal 优先删"兜底)
+//
+// 【为何用 deletionCost】纯按 ordinal 删做不到"应用语义"干预 — PD 场景下用户想保留带了
+// KV cache 热数据的副本, 给它较高 deletionCost 让它最后才删。
+// =============================================================================
+
 import (
 	"fmt"
 	"strconv"
@@ -27,42 +45,42 @@ import (
 )
 
 const (
+	// PodDeletionCostAnnotation: Pod 删除代价注解 key, 复用 K8s 标准 controller.kubernetes.io/pod-deletion-cost
 	PodDeletionCostAnnotation = corev1.PodDeletionCost
 
-	// Status priority constants: lower number = higher deletion priority (delete first)
-	// Priority levels:
-	//   0: Highest deletion priority - unhealthy or terminating states
-	//   1: Lowest deletion priority - healthy running state
+	// 状态优先级常量: 数字越小 = 删除优先级越高(越先删)
+	//   0: 最高删除优先级 — 不健康或终止中的状态
+	//   1: 最低删除优先级 — 健康运行状态
 	//
-	// ServingGroup priorities:
+	// ServingGroup 优先级:
 	PriorityServingGroupCreating = 0
 	PriorityServingGroupDeleting = 0
 	PriorityServingGroupScaling  = 0
 	PriorityServingGroupNotFound = 0
 	PriorityServingGroupRunning  = 1
 
-	// Role priorities:
+	// Role 优先级:
 	PriorityRoleCreating = 0
 	PriorityRoleDeleting = 0
 	PriorityRoleNotFound = 0
 	PriorityRoleRunning  = 1
 )
 
-// ServingGroupWithScore stores serving group deletion priority information
-// Priority order: Status (primary) > Deletion cost (secondary) > Index (tertiary)
+// ServingGroupWithScore 存储 ServingGroup 缩容评分信息
+// 优先级顺序: Status(主) > DeletionCost(次) > Index(末)
 type ServingGroupWithScore struct {
 	Name         string
-	Priority     int // Status priority from getServingGroupStatusPriority()
-	DeletionCost int // Higher cost = more protected (lower deletion priority)
+	Priority     int // 状态优先级, 来自 getServingGroupStatusPriority()
+	DeletionCost int // 越高越受保护(删除优先级越低)
 	Index        int
 }
 
-// RoleWithScore stores role deletion priority information
-// Priority order: Status (primary) > Deletion cost (secondary) > Index (tertiary)
+// RoleWithScore 存储 Role 缩容评分信息
+// 优先级顺序: Status(主) > DeletionCost(次) > Index(末)
 type RoleWithScore struct {
 	Name         string
-	Priority     int // Status priority from getRoleStatusPriority()
-	DeletionCost int // Higher cost = more protected (lower deletion priority)
+	Priority     int // 状态优先级, 来自 getRoleStatusPriority()
+	DeletionCost int // 越高越受保护(删除优先级越低)
 	Index        int
 }
 

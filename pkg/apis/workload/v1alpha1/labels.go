@@ -17,19 +17,21 @@ limitations under the License.
 package v1alpha1
 
 const (
-	// ModelServingNameLabelKey is the pod label key for the model serving name.
+	// ModelServingNameLabelKey Pod 标签 key: 所属 ModelServing 名
 	ModelServingNameLabelKey = "modelserving.volcano.sh/name"
-	// GroupNameLabelKey is the pod label key for the group name.
+	// GroupNameLabelKey Pod 标签 key: 所属 ServingGroup 名(=ServingGroup 名)。
+	// why 关键: 这是 PD 配对锚键 — ModelServer.PDGroup.GroupKey 取此 label,
+	//   值=ServingGroup 名, 同组 prefill/decode 取相同值, 跨组不同, 调度边界=配对边界(见 §4.3)。
 	GroupNameLabelKey = "modelserving.volcano.sh/group-name"
-	// RoleLabelKey is the pod label key for the role.
+	// RoleLabelKey Pod 标签 key: 所属 Role 名(prefill/decode), PDGroup.PrefillLabels/DecodeLabels 据此匹配
 	RoleLabelKey = "modelserving.volcano.sh/role"
-	// RoleIDKey is the pod label key for the role serial number.
+	// RoleIDKey Pod 标签 key: Role 实例 ID(roleName-ordinal, 如 prefill-0)
 	RoleIDKey = "modelserving.volcano.sh/role-id"
-	// EntryLabelKey is the entry pod label key.
+	// EntryLabelKey entry pod 标签 key(值=true), 区分 entry 和 worker
 	EntryLabelKey = "modelserving.volcano.sh/entry"
 
-	// RevisionLabelKey is the revision label for the model serving.
+	// RevisionLabelKey Pod 标签 key: 所属 revision
 	RevisionLabelKey = "modelserving.volcano.sh/revision"
-	// RoleTemplateHashLabelKey is the revision label for the role, used for RoleRollingUpdate strategy.
+	// RoleTemplateHashLabelKey Pod 标签 key: Role 模板哈希, 供 RoleRollingUpdate 判定 Role 是否过时
 	RoleTemplateHashLabelKey = "modelserving.volcano.sh/role-template-hash"
 )

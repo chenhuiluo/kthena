@@ -23,11 +23,23 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// ModelBoosterSpec defines the desired state of ModelBooster.
+// =============================================================================
+// ModelBooster CRD 类型 — 用户态"一键部署"CRD(已废弃)
+// =============================================================================
 //
-// Deprecated: ModelBooster is deprecated as of Kthena v1.1.
-// Use ModelServing, ModelServer, and ModelRoute instead.
-// ModelBooster will be removed no earlier than Kthena v1.5.
+// 【定位】用户填后端类型+模型 URI+worker 配置, model-booster-controller 自动 convert 出
+//   ModelServing + ModelServer + ModelRoute 三个范式 CRD。是"简化用户输入"的上层封装。
+//
+// 【废弃】v1.1 起标记 deprecated, ≥v1.5 移除。新部署直接用 ModelServing/ModelServer/ModelRoute。
+//
+// 【ModelBackend.Type】枚举 vLLM/vLLMDisaggregated/SGLang/MindIE/MindIEDisaggregated;
+//   disaggregated 类型才会生成 PDGroup(PD 分离)。ModelWorker.Type 有 server/prefill/decode 等。
+// =============================================================================
+
+// ModelBoosterSpec 定义 ModelBooster 的期望状态。
+//
+// Deprecated: ModelBooster 自 Kthena v1.1 起废弃, 改用 ModelServing/ModelServer/ModelRoute。
+// ≥v1.5 移除。
 type ModelBoosterSpec struct {
 	// Name is the name of the model. ModelBooster CR name is restricted by kubernetes, for example, can't contain uppercase letters.
 	// So we use this field to specify the ModelBooster name.

@@ -29,6 +29,19 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// =============================================================================
+// convert ModelServer 渲染 — 构造 ModelServer(PD 配对锚键 + KV connector 解析)
+// =============================================================================
+//
+// 【职责】把 ModelBooster 转成 ModelServer CR, 关键是:
+//   ① WorkloadSelector.MatchLabels={OwnerUIDKey: model.UID} 选中本 ModelServing 的 Pod
+//   ② PDGroup=getPdGroup(声明 PD 配对锚键, 仅 disaggregated 后端生成)
+//   ③ KVConnector=GetKvConnectorSpec(从 prefill/decode worker 的 kv-transfer-config 解析, 强制两侧同 type)
+//
+// 【注意】controller 只"声明锚键"(PDGroup), 不执行配对。真正配对在 router 侧按 label 分桶(见 §4.1)。
+// =============================================================================
+
+// VLLMKvConnectorType vLLM connector 名 → kthena KVConnectorType 映射
 var VLLMKvConnectorType = map[string]networking.KVConnectorType{
 	"MooncakeConnector":   networking.ConnectorTypeMoonCake,
 	"MooncakeConnectorV1": networking.ConnectorTypeMoonCake,
@@ -36,21 +49,22 @@ var VLLMKvConnectorType = map[string]networking.KVConnectorType{
 	"LMCacheConnectorV1":  networking.ConnectorTypeLMCache,
 }
 
-// vLLM kv_role values. "kv_both" is accepted for either prefill or decode since some
-// connectors (e.g. NixlConnector) let a single worker act as both producer and consumer.
+// vLLM kv_role 值。kv_both 允许 prefill 或 decode 任一侧用(某些 connector 如 NixlConnector
+// 让单 worker 兼任 producer/consumer)。
 const (
 	kvRoleProducer = "kv_producer"
 	kvRoleConsumer = "kv_consumer"
 	kvRoleBoth     = "kv_both"
 )
 
-// kvRolesByWorkerType lists the kv_role values a worker of the given type may declare.
+// kvRolesByWorkerType 每 worker type 可声明的 kv_role:
+//   prefill 只能 kv_producer 或 kv_both; decode 只能 kv_consumer 或 kv_both。
 var kvRolesByWorkerType = map[workload.ModelWorkerType][]string{
 	workload.ModelWorkerTypePrefill: {kvRoleProducer, kvRoleBoth},
 	workload.ModelWorkerTypeDecode:  {kvRoleConsumer, kvRoleBoth},
 }
 
-// kvWorkerConnector is the parsed kv-transfer-config of a single prefill/decode worker.
+// kvWorkerConnector 单个 prefill/decode worker 的 kv-transfer-config 解析结果。
 type kvWorkerConnector struct {
 	connectorName string
 	connectorType networking.KVConnectorType
@@ -118,6 +132,16 @@ func BuildModelServer(model *workload.ModelBooster) ([]*networking.ModelServer, 
 	return modelServers, nil
 }
 
+// GetKvConnectorSpec 从 prefill/decode worker 的 kv-transfer-config 解析 KVConnectorSpec。
+// 导出供 webhook 复用同一套解析/校验规则。
+//
+// 三个强制校验(确保 P/D 两侧对齐, 否则 PD 无法协作):
+//   ① 至多 1 prefill + 1 decode worker(重复报错, 避免结果依赖 worker 顺序)
+//   ② 两侧同进同出: 任一侧有 kv-transfer-config 而另一侧没有 → 报错
+//   ③ 两侧 connector type 相同 → 最终只返回一个 type(整个 ModelServer 共用一个 connector)
+//   ④ kv_role 校验: prefill 只能 producer/both, decode 只能 consumer/both
+// 两侧都没配 kv-transfer-config 也合法(KV 传输可选, 返回 nil,nil)。
+//
 // GetKvConnectorSpec derives the KVConnectorSpec for a backend from its prefill/decode
 // workers' kv-transfer-config. It is exported so webhook validation can reuse the exact
 // same parsing/consistency rules instead of duplicating them.
@@ -270,6 +294,13 @@ func containsString(list []string, s string) bool {
 	return false
 }
 
+// getPdGroup 生成 PDGroup(仅 disaggregated 后端: vLLMDisaggregated/MindIEDisaggregated)。
+//   GroupKey = GroupNameLabelKey(group-name label), 值=ServingGroup 名
+//   PrefillLabels = {role: prefill}, DecodeLabels = {role: decode}
+//
+// why GroupKey=ServingGroup 名(group-name label): 调度边界与配对边界重合 —
+//   ServingGroup 既是 gang 调度单元(PodGroup 名=组名)又是 PD 配对单元(GroupKey 值=group-name=组名),
+//   天然同组配对、跨组不串。若用 ModelServing 名则所有副本混一桶失隔离; 若用 RoleIDKey 则 pre/decode 不同值无法对齐。
 func getPdGroup(backend workload.ModelBackend) *networking.PDGroup {
 	switch backend.Type {
 	case workload.ModelBackendTypeVLLMDisaggregated, workload.ModelBackendTypeMindIEDisaggregated:

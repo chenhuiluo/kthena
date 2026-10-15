@@ -22,22 +22,23 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// GroupName specifies the group name used to register the objects.
+// GroupName API 组名
 const GroupName = "workload.serving.volcano.sh"
 
-// GroupVersion specifies the group and the version used to register the objects.
+// GroupVersion API 组版本
 var GroupVersion = v1.GroupVersion{Group: GroupName, Version: "v1alpha1"}
 
-// SchemeGroupVersion is group version used to register these objects
+// SchemeGroupVersion 注册用的 group version
 // Deprecated: use GroupVersion instead.
 var SchemeGroupVersion = schema.GroupVersion{Group: GroupName, Version: "v1alpha1"}
 
-// Resource takes an unqualified resource and returns a Group qualified GroupResource
+// Resource 取 group 限定的 GroupResource
 func Resource(resource string) schema.GroupResource {
 	return SchemeGroupVersion.WithResource(resource).GroupResource()
 }
 
-// GroupVersionKind definitions
+// GroupVersionKind 定义 — 注意: 只有 ModelServing/ModelBooster/AutoscalingPolicy 三类有 Kind,
+// 没有 ServingGroupKind/RoleKind — 这是 ServingGroup/Role 不是独立 CRD 的硬证据(见 §1.3)。
 var (
 	ModelServingKind                = SchemeGroupVersion.WithKind("ModelServing")
 	ModelServingListKind            = SchemeGroupVersion.WithKind("ModelServingList")
@@ -56,13 +57,12 @@ var (
 )
 
 func init() {
-	// We only register manually written functions here. The registration of the
-	// generated functions takes place in the generated files. The separation
-	// makes the code compile even when the generated files are missing.
+	// 只注册手写函数; 生成函数的注册在生成文件里(分离让缺生成文件也能编译)
 	localSchemeBuilder.Register(addKnownTypes)
 }
 
-// Adds the list of known types to Scheme.
+// addKnownTypes 把已知类型加到 Scheme — 注意只注册 ModelServing/ModelBooster/AutoscalingPolicy,
+// 没有 ServingGroup/Role(它们是内嵌 struct, 不是独立 CR)。
 func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(SchemeGroupVersion,
 		&ModelServing{},

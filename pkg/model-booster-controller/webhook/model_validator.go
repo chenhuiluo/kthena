@@ -35,10 +35,21 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// =============================================================================
+// ModelBooster 校验准入 webhook — 拦截非法配置 + 废弃告警
+// =============================================================================
+//
+// 【校验内容】ModelBooster 字段合法性: backend type、model URI 协议、worker 配置、
+//   KV connector 规则(复用 convert.GetKvConnectorSpec 的校验)等。
+//
+// 【废弃告警】每次校验都带 deprecation warning(v1.1 起, ≥v1.5 移除), 提示用户迁移到 ModelServing。
+// =============================================================================
+
+// modelBoosterDeprecationWarning 废弃告警文案
 const modelBoosterDeprecationWarning = "ModelBooster is deprecated in v1.1; Use ModelServing, ModelServer, and ModelRoute. " +
 	"Removal is no earlier than v1.5."
 
-// ModelValidator handles validation of ModelBooster resources
+// ModelValidator ModelBooster 校验器
 type ModelValidator struct {
 }
 

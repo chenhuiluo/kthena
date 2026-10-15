@@ -16,6 +16,26 @@ limitations under the License.
 
 package v1alpha1
 
+// =============================================================================
+// ModelServing CRD 类型 — kthena 推理编排的顶层范式资源
+// =============================================================================
+//
+// 【层级定位】ModelServing 是唯一的顶层 CRD(进 etcd)。
+//   spec.replicas = N → 派生 N 个 ServingGroup(仅内存, 非 CR);
+//   spec.template 是一个 ServingGroup 内嵌模板(含 1~4 个 Role)。
+//   每个 ServingGroup 是一个自洽推理实例单元(PD 场景即一套配对共享 KV 的 P+D)。
+//
+// 【关键字段语义】
+//   Replicas: ServingGroup 数(组数, 非 Pod 数), N 越大=水平扩容越多份独立推理能力(HPA 伸缩轴)
+//   SchedulerName: 默认 volcano, 决定是否建 PodGroup(非 volcano 不建, Pod 回退普通调度)
+//   Template: ServingGroup 模板, 所有副本共用, 只差 ordinal 后缀
+//   RolloutStrategy: 滚动策略(ServingGroupRollingUpdate 默认 / RoleRollingUpdate)
+//   RecoveryPolicy: Pod 故障重建策略(ServingGroupRecreate/RoleRecreate/None)
+//
+// 【两级扩缩容】ServingGroup 级(改 Replicas, 横向加整组) vs Role 级(改 Role.Replicas, 组内调 P/D 副本)。
+// PD 自动扩缩走 Role 级(patch roles[*].replicas, 保持 P:D 比例)。
+// =============================================================================
+
 import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -23,50 +43,49 @@ import (
 )
 
 const (
-	// Environment injected to the worker pods.
+	// 注入 worker pod 的环境变量(entry pod 的地址, 供 Ray worker 连 entry)
 	EntryAddressEnv = "ENTRY_ADDRESS"
-	// WorkerIndexEnv is the environment variable for the worker index.
-	// The entry pod always has a worker index of 0, while the other worker pods has a unique index from 1 to GroupSize-1.
+	// WorkerIndexEnv worker 索引环境变量: entry pod 固定 0, worker 从 1 到 GroupSize-1
 	WorkerIndexEnv = "WORKER_INDEX"
-	// GroupSizeEnv is the environment variable for the group size.
+	// GroupSizeEnv 组大小环境变量: 1 entry + WorkerReplicas workers
 	GroupSizeEnv = "GROUP_SIZE"
 )
 
-// ModelServingSpec defines the specification of the ModelServing resource.
+// ModelServingSpec 定义 ModelServing 资源的期望状态。
 type ModelServingSpec struct {
-	// Number of ServingGroups. That is the number of instances that run serving tasks
-	// Default to 1.
+	// ServingGroup 的数量(推理实例组数, 非 Pod 数)。默认 1。
+	// why: 每个 ServingGroup 是自洽推理单元, N 个 = N 份独立推理能力(水平扩容)。
 	//
 	// +optional
 	// +kubebuilder:default=1
 	Replicas *int32 `json:"replicas,omitempty"`
 
-	// SchedulerName defines the name of the scheduler used by ModelServing
+	// SchedulerName 调度器名, 默认 volcano(走 Volcano gang 调度, 建 PodGroup)。
+	// 改成非 volcano 则不建 PodGroup, Pod 回退普通 K8s 调度。
 	//
 	// +optional
 	// +kubebuilder:default=volcano
 	SchedulerName string `json:"schedulerName,omitempty"`
 
-	// Plugins defines optional plugin chain to customize serving pods.
+	// Plugins 可选插件链, 自定义 serving pod(如注 LWS 标准标签)。
 	// +optional
 	Plugins []PluginSpec `json:"plugins,omitempty"`
 
-	// Template defines the template for ServingGroup
+	// Template ServingGroup 模板(内嵌 struct, 非独立 CR), 每个副本按此创建。
 	Template ServingGroup `json:"template"`
 
-	// RolloutStrategy defines the strategy that will be applied to update replicas
+	// RolloutStrategy 滚动更新策略(ServingGroupRollingUpdate 默认 / RoleRollingUpdate)。
 	// +optional
 	RolloutStrategy *RolloutStrategy `json:"rolloutStrategy,omitempty"`
 
-	// RecoveryPolicy defines the recovery policy for the failed Pod to be rebuilt
+	// RecoveryPolicy 故障 Pod 重建策略: ServingGroupRecreate(整组重建)/RoleRecreate(只删该 Role)/None(不重建)。
+	// PD 场景下 ServingGroupRecreate 保证配对一致(见 §5.6)。
 	// +kubebuilder:default=RoleRecreate
 	// +kubebuilder:validation:Enum={ServingGroupRecreate,RoleRecreate,None}
 	// +optional
 	RecoveryPolicy RecoveryPolicy `json:"recoveryPolicy,omitempty"`
 
-	// RevisionHistoryLimit is the maximum number of non-live revisions to retain.
-	// Revisions still referenced by the ModelServing or its workloads do not count
-	// toward this limit.
+	// RevisionHistoryLimit 保留的非当前 revision 数上限(仍被引用的不计)。
 	// +optional
 	// +kubebuilder:default=10
 	// +kubebuilder:validation:Minimum=0

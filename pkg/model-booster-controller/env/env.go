@@ -24,7 +24,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// Package env provides constants for environment variables used in the model controller.
+// =============================================================================
+// 环境变量常量 + 泛型取值辅助
+// =============================================================================
+// 定义 ModelBooster backend.Env 用的环境变量名(ENDPOINT/RUNTIME_PORT/HF_ENDPOINT 等),
+// GetEnvValueOrDefault 泛型函数从 backend.Env 取值或返回默认(支持 string/int/[]EnvVar 等类型)。
+// SkipEngineDependencyInstall: 跳过启动时 pip install engine connector 依赖。
+// =============================================================================
 const (
 	Endpoint           = "ENDPOINT"
 	RuntimePort        = "RUNTIME_PORT"
@@ -33,7 +39,7 @@ const (
 	HfEndpoint         = "HF_ENDPOINT"
 	MsToken            = "MS_TOKEN"
 	MsRevision         = "MS_REVISION"
-	// SkipEngineDependencyInstall disables startup-time pip install for engine connector dependencies.
+	// SkipEngineDependencyInstall 跳过启动时 pip install engine connector 依赖
 	SkipEngineDependencyInstall = "KTHENA_SKIP_ENGINE_DEPENDENCY_INSTALL"
 )
 

@@ -60,16 +60,57 @@ import (
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
 )
 
+// =============================================================================
+// ModelServing 控制器 — kthena 推理编排的控制面核心
+// =============================================================================
+//
+// 【职责】把一个 ModelServing CR 拆成"组 → 角色 → Pod"并维护其全生命周期:
+//   ModelServing(spec.replicas=N)
+//     → N 个 ServingGroup(<ms>-0..<ms>-N-1, 仅内存, 不进 etcd)
+//       → 每 group 若干 Role 实例(roleName-ordinal, 仅内存)
+//         → 每 Role 实例 1 entry + WorkerReplicas workers = Pod(进 etcd)
+//       → 每 group 1 个 volcano PodGroup(gang 调度单元, 进 etcd)
+//   真正进 etcd 的只有: ModelServing CR + Pod + Service + PodGroup + ControllerRevision。
+//
+// 【与 StatefulSet 的对应关系】
+//   StatefulSet                kthena ModelServing            说明
+//   ──────────────            ──────────────────────         ────
+//   replicas                   spec.replicas                  但此处是 ServingGroup 数, 非 Pod 数
+//   spec.template              spec.template(ServingGroup)    组内结构模板(含多个 Role)
+//   (无组内多角色)             spec.template.roles[]          一个 group 内 1~4 个 Role(如 prefill/decode)
+//   ControllerRevision         ControllerRevision             模板版本快照, 类 StatefulSet
+//   partition 滚动             partition 滚动                 保护低 ordinal 不被更新
+//   ordinal 身份                ordinal(可复用, 不保证连续)    见 forEachMissingOrdinal / 序号振荡(有意权衡)
+//   (单层)                     两套滚动策略                   ServingGroupRollingUpdate / RoleRollingUpdate
+//
+// 【syncModelServing 主循环 5 步】(自上而下逐层收敛)
+//   1. syncServingGroupReplicas — ServingGroup 层: 扩缩到 spec.replicas
+//   2. syncRoleReplicas         — Role 层: 组内 Role 副本/revision 同步(含 partition 保护)
+//   3. manageRollingUpdate      — 删过时组/Role 触发滚动更新(按策略分派)
+//   4. syncHeadlessServices     — Service 层: 为 entry↔worker 建 headless Service
+//   5. UpdateModelServingStatus — 回写 status(少数进 etcd 的写之一)
+//
+// 【两层资源, 非父子】每 ServingGroup 下"并存"两类兄弟资源(非二选一):
+//   ① 若干 Role 实例 → 各自派生 Pod
+//   ② 1 个 PodGroup → 把本 group 所有 Pod 汇成 gang(经 kube-group 注解, 非 OwnerRef 父子)
+//   PodGroup 创建只看 CRD 存在 + SchedulerName=volcano, 与 GangPolicy 无关。
+//
+// 【PD 配对边界】ServingGroup 既是 gang 调度单元(PodGroup 名=组名)又是 PD 配对单元
+//   (PDGroup.groupKey=group-name label=组名), 调度边界与配对边界重合, 同组配对跨组不串。
+// =============================================================================
+
 const (
-	// enqueueAfter is the time duration to wait to re-enqueue:
+	// enqueueAfter: 处理失败后重新入队的等待时长(1s), 起退避作用
 	enqueueAfter = 1 * time.Second
 
+	// GroupNameKey / RoleIDKey: informer 索引名, 分别按 group-name label / role-id label 建索引,
+	// 供 getPodsByIndex 等按组/角色快速查 Pod/Service。索引函数见 utils.GroupNameIndexFunc/RoleIDIndexFunc
 	GroupNameKey = "GroupName"
 	RoleIDKey    = "RoleID"
 )
 
-// PodGroupManager is the interface for managing PodGroups.
-// This interface allows for dependency injection in tests.
+// PodGroupManager 是 PodGroup 管理的抽象接口(供测试注入 mock)。
+// 实现见 podgroupmanager/manager.go。PodGroup 是 volcano 的 gang 调度 CRD, kthena 借它做整组原子调度。
 type PodGroupManager interface {
 	CreateOrUpdatePodGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, pgName string) (error, time.Duration)
 	DeletePodGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupName string) error
@@ -81,11 +122,14 @@ type PodGroupManager interface {
 	AnnotatePodWithPodGroup(pod *corev1.Pod, ms *workloadv1alpha1.ModelServing, groupName, taskName string)
 }
 
+// podGracePeriodKey 是 graceMap 的 key: 用 namespace/name + Pod UID 唯一标识一个处于故障宽限期的 Pod。
+// 加 UID 是因为 Pod 删除重建后同名但 UID 不同, 避免宽限期记录串味。
 type podGracePeriodKey struct {
 	types.NamespacedName
 	UID types.UID
 }
 
+// getPodGracePeriodKey 从 Pod 构造 graceMap 的 key
 func getPodGracePeriodKey(pod *corev1.Pod) podGracePeriodKey {
 	return podGracePeriodKey{
 		NamespacedName: utils.GetNamespaceName(pod),
@@ -93,10 +137,13 @@ func getPodGracePeriodKey(pod *corev1.Pod) podGracePeriodKey {
 	}
 }
 
+// ModelServingController 是 ModelServing 的调谐控制器(reconciler)。
+// 一个控制器实例管理集群内所有 ModelServing CR(经 informer watch + workqueue 调谐)。
 type ModelServingController struct {
 	kubeClientSet      kubernetes.Interface
 	modelServingClient clientset.Interface
 
+	// syncHandler: 实际的调谐函数(默认 syncModelServing), 抽出来是为测试可替换
 	syncHandler           func(ctx context.Context, msKey string) error
 	podGroupManager       PodGroupManager
 	podsLister            listerv1.PodLister
@@ -107,14 +154,35 @@ type ModelServingController struct {
 	modelServingsInformer cache.SharedIndexInformer
 
 	// nolint
-	workqueue       workqueue.RateLimitingInterface
-	store           datastore.Store
-	graceMap        sync.Map // key: podGracePeriodKey, value:time
-	initialSync     bool     // indicates whether the initial sync has been completed
+	// workqueue: 调谐队列, 存放待处理的 ModelServing key(namespace/name)
+	workqueue workqueue.RateLimitingInterface
+	// store: 内存 datastore, 镜像 ServingGroup/Role 运行态(不进 etcd), 是控制器的"观测状态"
+	store datastore.Store
+	// graceMap: Pod 故障宽限期记录(key=podGracePeriodKey, value=到期时间),
+	// 配合 RestartGracePeriodSeconds 实现"故障后等宽限期再删"
+	graceMap sync.Map
+	// initialSync: 首次全量同步是否完成的标志, 影响 status 计算等逻辑
+	initialSync bool
+	// pluginsRegistry: 插件注册表(ModelServing 支持在 Pod 创建/就绪时跑插件链)
 	pluginsRegistry *plugins.Registry
-	recorder        record.EventRecorder
+	// recorder: 事件记录器, 向 K8s 发 RoleCreating/RoleRunning 等事件
+	recorder record.EventRecorder
 }
 
+// NewModelServingController 构造并初始化 ModelServing 控制器。
+//
+// 流程:
+//   1. 建 GroupNameLabelKey selector — pods/services informer 只 watch 带 group-name label 的对象
+//      (只有 ModelServing 派生的 Pod/Service 才有此 label, 过滤掉无关对象, 减少 informer 压力)
+//   2. 注册 ModelServing 类型到 scheme(供事件记录用)
+//   3. 建 pods/services/modelServings 三组 informer
+//   4. 给 pods/services informer 加 GroupNameKey/RoleIDKey 两个索引 — 供 getPodsByIndex 按组/角色快速查
+//   5. 建 datastore(内存, 不进 etcd)、event recorder、controller 实例
+//   6. 注册 PodGroup 删除事件(只处理 OwnerRef 指向 ModelServing 的 PodGroup)
+//   7. 注册 ModelServing/Pod/Service 的增删改事件 → 入 workqueue 触发调谐
+//
+// why: pods/services informer 用 selector 过滤 + 加索引, 是因为集群里 Pod/Service 极多,
+//      只有带 group-name label 的才是本控制器管的; 索引让"按组查 Pod"从 O(N) 降到 O(1)。
 func NewModelServingController(kubeClientSet kubernetes.Interface, modelServingClient clientset.Interface, volcanoClient volcano.Interface, apiextClient apiextClientSet.Interface) (*ModelServingController, error) {
 	selector, err := labels.NewRequirement(workloadv1alpha1.GroupNameLabelKey, selection.Exists, nil)
 	if err != nil {
@@ -260,6 +328,7 @@ func NewModelServingController(kubeClientSet kubernetes.Interface, modelServingC
 	return c, nil
 }
 
+// addModelServing — ModelServing CR 新增事件入口: 直接入队等调谐
 func (c *ModelServingController) addModelServing(obj interface{}) {
 	ms, ok := obj.(*workloadv1alpha1.ModelServing)
 	if !ok {
@@ -270,6 +339,10 @@ func (c *ModelServingController) addModelServing(obj interface{}) {
 	c.enqueueModelServing(ms)
 }
 
+// updateModelServing — ModelServing CR 更新事件入口。
+// 仅 spec 变了才调谐(status 变了不调谐, 避免循环)。
+// 特殊处理: 移除 NetworkTopology 时清理 PodGroup(网络拓扑约束消失, 旧 PodGroup 无意义)。
+// why: GangPolicy.MinRoleReplicas 不可变(XValidation), 故无需检查它变化。
 func (c *ModelServingController) updateModelServing(old, cur interface{}) {
 	curms, ok := cur.(*workloadv1alpha1.ModelServing)
 	if !ok {
@@ -283,13 +356,13 @@ func (c *ModelServingController) updateModelServing(old, cur interface{}) {
 	}
 
 	if reflect.DeepEqual(oldms.Spec, curms.Spec) {
-		// If the spec has not changed, we do not need to reconcile.
+		// spec 未变, 无需调谐(避免 status 回写触发 update 又入队的循环)
 		klog.V(4).InfoS("Spec has not changed, skipping update", "modelServing", klog.KObj(curms))
 		return
 	}
 
-	// If network topology is removed, we need to clean up the PodGroups.
-	// Because minRoleReplicas is not allowed to be updated, so we do not need to check it here.
+	// 移除 NetworkTopology 时清理 PodGroup(网络拓扑约束消失, 旧 PodGroup 的 topology 约束已无意义)
+	// why: GangPolicy.MinRoleReplicas 不可变, 故无需检查它变化
 	if oldms.Spec.Template.NetworkTopology != nil && curms.Spec.Template.NetworkTopology == nil {
 		if curms.Spec.Template.GangPolicy == nil || len(curms.Spec.Template.GangPolicy.MinRoleReplicas) == 0 {
 			if err := c.podGroupManager.CleanupPodGroups(context.TODO(), curms); err != nil {
@@ -301,10 +374,13 @@ func (c *ModelServingController) updateModelServing(old, cur interface{}) {
 	c.enqueueModelServing(curms)
 }
 
+// deleteModelServing — ModelServing CR 删除事件入口: 从内存 store 移除记录。
+// ControllerRevision 经 OwnerRef 由 K8s GC 自动级联删除, 无需手动处理。
+// tombstone: informer 缓存未同步时的删除事件, 需从 tombstone.Obj 还原。
 func (c *ModelServingController) deleteModelServing(obj interface{}) {
 	ms, ok := obj.(*workloadv1alpha1.ModelServing)
 	if !ok {
-		// If the object is not a ModelServing, it might be a tombstone object.
+		// 对象非 ModelServing, 可能是 tombstone(informer 缓存未同步时的删除事件)
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
 			klog.Errorf("failed to parse ModelServing type when delete %#v", obj)
@@ -321,13 +397,19 @@ func (c *ModelServingController) deleteModelServing(obj interface{}) {
 		Namespace: ms.Namespace,
 		Name:      ms.Name,
 	})
-	// ControllerRevisions will be automatically deleted via OwnerReference when ModelServing is deleted
+	// ControllerRevision 经 OwnerRef 由 K8s 自动级联删除, 无需手动处理
 }
 
+// addPod — Pod 新增事件: 复用 updatePod(nil, obj)
 func (c *ModelServingController) addPod(obj interface{}) {
 	c.updatePod(nil, obj)
 }
 
+// updatePod — Pod 更新事件核心分发器, 按 Pod 状态分派到三条处理链:
+//   ① RunningAndReady → handleReadyPod(就绪: 跑插件链 OnPodReady → 置 RoleRunning)
+//   ② Failed/容器重启 → handleErrorPod(故障: 按 RecoveryPolicy + graceMap 处理)
+//   ③ default(未就绪) → 首次同步时补建 store 里的 ServingGroup/Role 记录
+// 正在删除的 Pod(DeletionTimestamp!=nil) 跳过, 交给 deletePod 处理。
 func (c *ModelServingController) updatePod(_, newObj interface{}) {
 	newPod, ok := newObj.(*corev1.Pod)
 	if !ok {
@@ -383,6 +465,8 @@ func (c *ModelServingController) updatePod(_, newObj interface{}) {
 	}
 }
 
+// deletePod — Pod 删除事件入口: 从 store 移除运行态, 按 RecoveryPolicy 回收(见 handleDeletedPod)。
+// 跳过 revision 不匹配的(旧 revision 的 Pod 被删不触发重建, 避免滚动更新时的误重建)。
 func (c *ModelServingController) deletePod(obj interface{}) {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
@@ -425,6 +509,7 @@ func (c *ModelServingController) deletePod(obj interface{}) {
 	}
 }
 
+// deleteService — Service 删除事件入口: 重新入队等调谐(让 syncHeadlessServices 补建)。
 func (c *ModelServingController) deleteService(obj interface{}) {
 	svc, ok := obj.(*corev1.Service)
 	if !ok {
@@ -461,6 +546,8 @@ func (c *ModelServingController) deleteService(obj interface{}) {
 	c.enqueueModelServing(ms)
 }
 
+// deletePodGroup — PodGroup 删除事件入口: 重新入队等调谐(让 syncServingGroupReplicas 重建 PodGroup)。
+// why: PodGroup 是 gang 调度单元, 删了会导致组内 Pod 无法被 volcano 调度, 必须重建。
 func (c *ModelServingController) deletePodGroup(obj interface{}) {
 	pg, ok := obj.(*schedulingv1beta1.PodGroup)
 	if !ok {
@@ -498,6 +585,7 @@ func (c *ModelServingController) deletePodGroup(obj interface{}) {
 	c.enqueueModelServing(ms)
 }
 
+// enqueueModelServing 把 ModelServing 转成 namespace/name key 入调谐队列
 func (c *ModelServingController) enqueueModelServing(ms *workloadv1alpha1.ModelServing) {
 	var key string
 	var err error
@@ -508,6 +596,7 @@ func (c *ModelServingController) enqueueModelServing(ms *workloadv1alpha1.ModelS
 	c.workqueue.Add(key)
 }
 
+// enqueueModelServingAfter 延迟 duration 后入队(用于失败退避)
 func (c *ModelServingController) enqueueModelServingAfter(ms *workloadv1alpha1.ModelServing, duration time.Duration) {
 	var key string
 	var err error
@@ -518,11 +607,13 @@ func (c *ModelServingController) enqueueModelServingAfter(ms *workloadv1alpha1.M
 	c.workqueue.AddAfter(key, duration)
 }
 
+// worker 是消费 workqueue 的循环, 每个并发 worker 跑一个
 func (c *ModelServingController) worker(ctx context.Context) {
 	for c.processNextWorkItem(ctx) {
 	}
 }
 
+// processNextWorkItem 从队列取一个 key 调谐, 失败则限速重试
 func (c *ModelServingController) processNextWorkItem(ctx context.Context) bool {
 	key, quit := c.workqueue.Get()
 	if quit {
@@ -542,6 +633,16 @@ func (c *ModelServingController) processNextWorkItem(ctx context.Context) bool {
 	return true
 }
 
+// syncModelServing 是 Reconcile 主循环 — 每次从 workqueue 取一个 ModelServing key 调谐。
+// 5 步顺序执行, 自上而下逐层收敛(组 → 组内成员 → 淘汰过时 → 补基础设施 → 汇报):
+//
+//   1. syncServingGroupReplicas — ServingGroup 层: 扩缩到 spec.replicas(组数)
+//   2. syncRoleReplicas         — Role 层: 组内 Role 副本/revision 同步(含 partition 保护)
+//   3. manageRollingUpdate      — 按策略删过时组/Role 触发滚动更新
+//   4. syncHeadlessServices     — 为 entry↔worker 建 headless Service
+//   5. UpdateModelServingStatus — 计算 conditions + 回写 status(少数进 etcd 的写)
+//
+// why 顺序: 先有组(1)才能在组内补成员(2); 成员补齐后才淘汰过时的(3); 基础设施按最终态补(4); 最后汇总(5)。
 func (c *ModelServingController) syncModelServing(ctx context.Context, key string) error {
 	klog.V(4).InfoS("Started syncing ModelServing", "key", key)
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
@@ -588,6 +689,9 @@ func (c *ModelServingController) syncModelServing(ctx context.Context, key strin
 	return nil
 }
 
+// Run 启动控制器: 启动 informers → 等缓存同步 → syncAll(首次全量) → 起 N 个 worker 消费队列。
+// syncAll 在 informer 缓存就绪后做一次全量 Pod/ModelServing 扫描, 把内存 store 填起来,
+// 否则首个事件到来时 store 是空的会导致误判。
 func (c *ModelServingController) Run(ctx context.Context, workers int) {
 	defer utilruntime.HandleCrash()
 	defer c.workqueue.ShutDown()
@@ -619,6 +723,8 @@ func (c *ModelServingController) Run(ctx context.Context, workers int) {
 	klog.Info("shut down modelServing controller")
 }
 
+// syncAll 首次全量同步: 遍历所有 Pod/ModelServing 走一遍 add 事件, 把内存 store 填起来,
+// 然后置 initialSync=true。why: 控制器重启后 store 是空的, 必须先从 informer 缓存重建观测状态。
 func (c *ModelServingController) syncAll() {
 	pods, err := c.podsLister.List(labels.Everything())
 	if err != nil {
@@ -640,6 +746,18 @@ func (c *ModelServingController) syncAll() {
 	c.initialSync = true
 }
 
+// syncServingGroupReplicas 把 ServingGroup 数量扩缩到顶层 spec.replicas(组数, 非 Pod 数)。
+// 作用在 ServingGroup 层(第 1 步)。
+//
+// 流程:
+//   1. 从内存 store 取该 ModelServing 的 ServingGroup 列表(按 ordinal 升序)
+//   2. 算 expectedCount: 默认=replicas; ServingGroupRollingUpdate 且 maxSurge>0 且
+//      partition 外有可更新过时组时 → expectedCount += maxSurge(临时 surge 容量)
+//   3. cur < expected → scaleUpServingGroups(forEachMissingOrdinal 补缺失 ordinal);
+//      cur > expected → scaleDownServingGroups(binpack 评分删多余的)
+//   4. 非 Deleting 的组重建/更新 PodGroup(role 变了 PodGroup 也要更新; 顺带恢复误删的 PodGroup)
+//
+// why 第4步在缩容后做: 缩容删的是 group, 已删的组无需更新 PodGroup, 只更新存活组。
 // syncServingGroupReplicas scales up or down whole ServingGroups to meet the top-level
 // `Spec.Replicas` count of the ModelServing resource.
 // Main processing steps:
@@ -699,6 +817,12 @@ func (c *ModelServingController) syncServingGroupReplicas(ctx context.Context, m
 	return nil
 }
 
+// hasUpdateableOutdatedServingGroup 判断是否需要 surge: partition 外是否存在 revision 过时的组。
+//
+// why: ordinal 不标识"是否 surge 容量" — binpack 缩容可能留下稀疏/高 ordinal 的普通副本
+//   (见序号振荡设计)。故不能靠 ordinal 判断谁是 surge, 必须看 partition(保护前 N 个) +
+//   revision(是否过时) 两个条件: 只有 partition 之外且 revision 落后的组才需要 surge 更新。
+//
 // hasUpdateableOutdatedServingGroup derives the temporary capacity requirement
 // from observed ServingGroups. Ordinals identify ServingGroups but do not
 // determine whether a group is surge capacity: binpack scale-down can leave
@@ -718,6 +842,15 @@ func hasUpdateableOutdatedServingGroup(
 	return false
 }
 
+// scaleUpServingGroups 用 forEachMissingOrdinal 填 [0, expectedCount) 中缺失的 ordinal, 逐个建 ServingGroup。
+// partition 保护的低 ordinal(< partition)用 CurrentRevision(旧模板), 其余用 newRevision(新模板)。
+//
+// why 用 CurrentRevision: partition 保护的是稳定副本, 恢复时必须用它创建时那一代的模板,
+//   而 spec.template 可变, 故从 ControllerRevision 快照取(见 §5.2 设计动机)。
+// why 惰性建 ControllerRevision: 只有要建引用 newRevision 的组时才需新快照,
+//   partition 内的组用现有 CurrentRevision 不需要新快照, 故 newRevisionCreated 懒创建。
+// why 用 forEachMissingOrdinal 而非 maxOrdinal+1: 见 forEachMissingOrdinal 注释(序号有界/填洞)。
+//
 // scaleUpServingGroups fills missing ordinals in [0, expectedCount).
 // Missing ordinals below partition use CurrentRevision; the rest use newRevision.
 func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupList []datastore.ServingGroup, expectedCount int, newRevision string) error {
@@ -839,6 +972,16 @@ func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *w
 	return nil
 }
 
+// syncRoleReplicas 作用在 Role 层(第 2 步): 对每个 ServingGroup 同步组内 Role 副本与 revision。
+//
+// 流程:
+//   1. 取 ServingGroup 列表, 跳过 Deleting 的组(删除完会重建, 无需扩容其 Role)
+//   2. partition 保护判定: index < partition 的组受保护, 用旧 revision
+//   3. 受保护组从 ControllerRevision 加载旧 role 模板(rolesToManage); 否则用 spec.template.roles
+//   4. 对每个 Role 调 manageRoleReplicasPerGroup 按 expectedCount 扩缩 Pod
+//
+// why partition 用旧 revision: 保证低 ordinal 稳定副本继续用旧模板, 直到被滚动到(见 §5.2)。
+//
 // syncRoleReplicas coordinates role replicas within each active ServingGroup,
 // deciding to use either the older revision if bound by the partition rules, or adopting
 // the new revision otherwise. It traverses every Role to align actual pods to expected status.
@@ -1282,6 +1425,14 @@ func (c *ModelServingController) getModelServingAndResourceDetails(resource meta
 	return ms, servingGroupName, roleName, roleID
 }
 
+// DeleteRole 删除一个 Role 实例: 置 RoleDeleting → DeleteCollection 删 Pod → 逐个删 Service → 资源清完移出 store。
+//
+// why 末尾移出 store 的时机: 等 Pod/Service 真删完(isRoleDeleted)才移, 防止资源未删完就移出 store
+//   导致无法重新入队调谐(资源悬挂)。
+//
+// PD fail-safe 链路: RoleRollingUpdate 删过时 Role 调本函数 → DeleteCollection 删 Pod → Pod 删除事件触发
+//   handleDeletedPod → 按 RecoveryPolicy 分派: ServingGroupRecreate 则整组重建(见 §5.6), 宁可整组重建
+//   也不让剩余 Role 失去配对伙伴。
 func (c *ModelServingController) DeleteRole(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName, roleName, roleID string) {
 	selector := labels.SelectorFromSet(map[string]string{
 		workloadv1alpha1.GroupNameLabelKey: groupName,
@@ -1360,6 +1511,20 @@ func (c *ModelServingController) DeleteRole(ctx context.Context, ms *workloadv1a
 	}
 }
 
+// manageRollingUpdate 作用在第 3 步: 按策略删过时组/Role 触发滚动更新。
+// 粒度由 rolloutStrategy.type 决定:
+//   - ServingGroupRollingUpdate: 整组删(用 ModelServing 层 maxUnavailable + partition)
+//   - RoleRollingUpdate: 按 Role 删(用每 Role 内联 maxUnavailable + partition)
+//
+// 流程:
+//   1. 取 ServingGroup 列表, partition 切片(partition 之外才可更新)
+//   2. 分成 notRunningOutdatedGroups(优先) 和 runningOutdatedGroups
+//   3. deleteOutdatedResourcesForRollingUpdate 按类型分派:
+//      ServingGroupRollingUpdate → deleteOutdatedServingGroups(高 ordinal 优先删, 有预算)
+//      RoleRollingUpdate         → deleteOutdatedRoles(每 Role 独立预算 calMaxScaleDown)
+//
+// why notRunning 优先: 不健康的组先清理, 避免删健康组降可用性(binpack 评分 safety first)。
+//
 // manageRollingUpdate updates outdated resources at the granularity selected by
 // rolloutStrategy.type. ServingGroupRollingUpdate uses only the ModelServing-level
 // maxUnavailable and partition. RoleRollingUpdate uses only each Role's
@@ -1468,6 +1633,12 @@ func (c *ModelServingController) deleteOutdatedResourcesForRollingUpdate(
 	return c.deleteOutdatedRoles(ctx, ms, allOutdatedGroups, revision)
 }
 
+// deleteOutdatedServingGroups 删过时 ServingGroup(ServingGroupRollingUpdate 路径)。
+// 从尾到头(最大 ordinal 优先)删, 至多删 maxScaleDown 个。
+//
+// why 从尾到头删高 ordinal: ① 保护低 ordinal 稳定(partition 保护的就是低 ordinal, 从高往低删不碰保护区);
+//   ② 低 ordinal 通常是老资格稳定副本, 高 ordinal 多是 surge 出来的临时容量, 优先回收更安全。
+//
 // deleteOutdatedServingGroups deletes outdated ServingGroups
 // for `ServingGroupRollingUpdate`.
 func (c *ModelServingController) deleteOutdatedServingGroups(
@@ -1532,11 +1703,24 @@ func (c *ModelServingController) updateServingGroupRevisionIfNoOutdatedRoles(ms 
 	klog.V(2).Infof("Updated ServingGroup %s revision to latest: %s", groupName, revision)
 }
 
+// roleToDelete 标记一个待删 Role 实例(roleName + roleID)
 type roleToDelete struct {
 	roleName string
 	roleID   string
 }
 
+// rolesToDeleteForRoleRollingUpdate 算某 ServingGroup 内 RoleRollingUpdate 要删哪些 Role 实例。
+//
+// 流程:
+//   1. 对 spec 里每个 Role: 取内存 store 的 roleList → outdatedRoles 找过时实例
+//   2. partition 保护: 前 partition 个 role 实例加入 protected, 从待删列表过滤掉
+//   3. calMaxScaleDown 算每 Role 独立预算 → selectOutdatedRolesToDelete 选至多 maxScaleDown 个
+//   4. 新 spec 里被删的 Role: 内存里有但新 spec 没有的, 直接全部标记删除
+//
+// why partition 保护低 ordinal: 维持配对基数, 不删稳定的低 ordinal 实例(见 §5.4)。
+// why hasOutdatedRoles 但 protected 里有过时的却不删: partition 优先级高于"过时",
+//   只有 hasOutdatedRoles=true 才让 updateServingGroupRevisionIfNoOutdatedRoles 不前进组 revision
+//   (组还停留在旧 revision, 等下次 partition 推进)。
 func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ms *workloadv1alpha1.ModelServing, sg datastore.ServingGroup) ([]roleToDelete, bool, error) {
 	roleSpecByName := make(map[string]workloadv1alpha1.Role, len(ms.Spec.Template.Roles))
 	for _, role := range ms.Spec.Template.Roles {
@@ -1662,6 +1846,7 @@ func (c *ModelServingController) outdatedRoles(ms *workloadv1alpha1.ModelServing
 	return outdatedRoles, newUnavailable
 }
 
+// selectOutdatedRolesToDelete 从过时 Role 列表里取至多 maxScaleDown 个标记删除(简单截断)
 func selectOutdatedRolesToDelete(roleName string, outdatedRoles []datastore.Role, maxScaleDown int) ([]roleToDelete, error) {
 	rolesToDelete := make([]roleToDelete, 0, len(outdatedRoles))
 	for _, role := range outdatedRoles {
@@ -1674,6 +1859,15 @@ func selectOutdatedRolesToDelete(roleName string, outdatedRoles []datastore.Role
 	return rolesToDelete, nil
 }
 
+// handleReadyPod 处理就绪 Pod: 跑插件链 OnPodReady → 加入 store 运行态 → 检查 Role/ServingGroup 就绪 → 置 Running。
+//
+// 流程:
+//   1. buildPluginChain 建插件链, 跑 OnPodReady 钩子(如 lws_labels 注标签)
+//   2. AddRunningPodToServingGroup 加入 store 运行态
+//   3. checkRoleReady: runningPods == 1 + WorkerReplicas 则 Role 就绪 → 置 RoleRunning + 发事件
+//   4. checkServingGroupReady: 所有 Role Running 则整组就绪 → 置 ServingGroupRunning
+//   5. roleBecameRunning 时立即重排队: RoleRollingUpdate 的 maxSurge 副本可能让 Role 提前就绪,
+//      立即调谐以消费新释放的删除预算(见下方注释)
 func (c *ModelServingController) handleReadyPod(ms *workloadv1alpha1.ModelServing, servingGroupName string, newPod *corev1.Pod) error {
 	chain, err := c.buildPluginChain(ms)
 	if err != nil {
@@ -1746,9 +1940,11 @@ func (c *ModelServingController) handleReadyPod(ms *workloadv1alpha1.ModelServin
 	return nil
 }
 
+// handleErrorPod 处理故障 Pod, 按 RecoveryPolicy + graceMap 决定动作:
+//   - None 策略 + 容器重启但未失败: 仅 markPodUnavailable, 让 kubelet 自己重启(不删 Pod)
+//   - 其他: 进 graceMap 宽限期, markPodUnavailable, 宽限期后由 handlePodAfterGraceTime 决定删不删
 func (c *ModelServingController) handleErrorPod(ms *workloadv1alpha1.ModelServing, servingGroupName string, errPod *corev1.Pod) error {
-	// None: leave a restarted, still-alive pod to the kubelet (do not delete it),
-	// but mark it unavailable. A terminal PodFailed pod falls through to deletion.
+	// None 策略: 容器重启但 Pod 未 Failed 时, 交给 kubelet 处理(不删), 仅标记不可用
 	if ms.Spec.RecoveryPolicy == workloadv1alpha1.NoneRestartPolicy && utils.ContainerRestarted(errPod) && !utils.IsPodFailed(errPod) {
 		if err := c.markPodUnavailable(ms, servingGroupName, errPod); err != nil {
 			klog.Warningf("mark pod %s unavailable: %v", errPod.Name, err)
@@ -1774,6 +1970,9 @@ func (c *ModelServingController) handleErrorPod(ms *workloadv1alpha1.ModelServin
 	return nil
 }
 
+// markPodUnavailable 把 Pod 移出 store 运行态, 把 Role/ServingGroup 从 Running 退回 Creating,
+// 使 AvailableReplicas 不再计入它。不删 Pod(只标记)。
+//
 // markPodUnavailable removes the pod from the running set and transitions its
 // role/serving group out of Running so AvailableReplicas stops counting it. It
 // does not delete the pod.
@@ -1807,6 +2006,11 @@ func (c *ModelServingController) markPodUnavailable(ms *workloadv1alpha1.ModelSe
 	return nil
 }
 
+// handlePodAfterGraceTime 宽限期到后决定删不删故障 Pod:
+//   - 有 RestartGracePeriodSeconds: 睡宽限期 → 重新查 Pod(UID 变了说明已重建, 跳过) → 仍未就绪则删
+//   - 无/0 宽限期: 立即删
+// 删除用 NewPreconditionDeleteOptions(errPod.UID) 防止删错(UID 不匹配则删失败)。
+// 删除后由 deletePod 事件按 RecoveryPolicy 重建(见 handleDeletedPod)。
 func (c *ModelServingController) handlePodAfterGraceTime(ms *workloadv1alpha1.ModelServing, errPod *corev1.Pod) {
 	if ms.Spec.Template.RestartGracePeriodSeconds != nil && *ms.Spec.Template.RestartGracePeriodSeconds > 0 {
 		// Wait for the grace period before making a decision
@@ -1851,6 +2055,10 @@ func (c *ModelServingController) handlePodAfterGraceTime(ms *workloadv1alpha1.Mo
 	}
 }
 
+// handleDeletedPod Pod 被删后按 RecoveryPolicy 决定重建策略:
+//   - ServingGroupRecreate: 整组 deleteServingGroup 重建(PD 场景保证配对一致, 见 §5.6)
+//   - RoleRecreate: 只删该 Role(组在 Deleting 则顺带整组删); Running 组退回 Creating
+//   - None: 仅 markPodUnavailable + 重排, 不重建
 func (c *ModelServingController) handleDeletedPod(ms *workloadv1alpha1.ModelServing, servingGroupName string, pod *corev1.Pod) error {
 	// pod is deleted due to failure or other reasons and needs to be rebuilt according to the RecoveryPolicy
 	switch ms.Spec.RecoveryPolicy {
@@ -1885,6 +2093,8 @@ func (c *ModelServingController) handleDeletedPod(ms *workloadv1alpha1.ModelServ
 	return nil
 }
 
+// checkServingGroupReady 判定整组就绪: 每个 Role 的 roleList 数 == Role.Replicas 且全部 RoleRunning。
+// 用 rolesForServingGroupReadiness 取 roles(策略相关, 见该函数)。
 func (c *ModelServingController) checkServingGroupReady(ms *workloadv1alpha1.ModelServing, servingGroupName string) (bool, error) {
 	klog.V(4).Infof("checkServingGroupReady: modelServing=%s/%s, servingGroup=%s", ms.Namespace, ms.Name, servingGroupName)
 	roles, err := c.rolesForServingGroupReadiness(ms, servingGroupName)
@@ -1913,6 +2123,8 @@ func (c *ModelServingController) checkServingGroupReady(ms *workloadv1alpha1.Mod
 	return true, nil
 }
 
+// checkRoleReady 判定单个 Role 实例就绪: runningPods == 1 + WorkerReplicas(全部 Pod RunningAndReady)。
+// 用 rolesForServingGroupReadiness 取该 Role 的 spec(partition 保护的组用旧 revision 的模板)。
 func (c *ModelServingController) checkRoleReady(ms *workloadv1alpha1.ModelServing, servingGroupName, roleName, roleID string) (bool, error) {
 	// Get all pods for this specific role
 	roleIDValue := fmt.Sprintf("%s/%s/%s/%s", ms.Namespace, servingGroupName, roleName, roleID)
@@ -1961,6 +2173,12 @@ func (c *ModelServingController) checkRoleReady(ms *workloadv1alpha1.ModelServin
 	return true, nil
 }
 
+// rolesForServingGroupReadiness 返回评估 ServingGroup 就绪该用的 Role 模板:
+//   - RoleRollingUpdate: 总用当前 spec(Role 独立更新)
+//   - ServingGroupRollingUpdate + partition 保护: 受保护组可能还跑旧 revision, 从 ControllerRevision 加载旧模板
+//
+// why: 受保护组副本数/Pod 布局可能与当前 spec 不同, 用旧模板评估才不会误判就绪。
+//
 // rolesForServingGroupReadiness returns the Role templates that should be used
 // to evaluate the readiness of a ServingGroup. RoleRollingUpdate always uses
 // the current templates because Roles are updated independently. During a
@@ -2240,6 +2458,18 @@ func (c *ModelServingController) getPodGroupsByIndex(indexName, indexValue strin
 }
 
 // UpdateModelServingStatus update replicas in modelServing status.
+// UpdateModelServingStatus 作用在第 5 步: 计算 conditions + 回写 ModelServing.Status(进 etcd)。
+//
+// 流程:
+//   1. 遍历各组算 available(Running 数)/updated(revision 匹配数)/progressing(非 Running/非 Deleting)
+//   2. SetConditionWithRolloutAndProgressState 设 Available/Progressing/UpdateInProgress 条件
+//   3. revision 提升遵循 StatefulSet 语义: 仅 rollout 完成(updated=available=replicas)才把
+//      UpdateRevision 提升为 CurrentRevision, 让 partition 保护的旧副本继续用旧模板直到被滚动到
+//   4. LabelSelector 锚定 ordinal-0 第一个 Role 的 entry pod(1:1 pod-per-group, 供 scale 子资源)
+//   5. UpdateStatus 回写(带 RetryOnConflict 防 etcd 版本冲突)
+//
+// why CurrentRevision 滞后提升: 若提前提升, partition 保护的旧副本恢复时会拿到新 revision 模板,
+//   违反 partition 语义(见 §5.2)。
 func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.ModelServing, revision string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		// Get latest modelserving from informer store
@@ -2460,6 +2690,11 @@ func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.M
 	})
 }
 
+// getPartition 从配置解析绝对 partition 值。未配置返回 (0,false,nil)。
+// 百分比时按 replicas 算(向上取整 GetScaledValueFromIntOrPercent ... true)。
+//
+// why 向上取整: partition 是"保护前 N 个", 向上取整多保护一点, 保守不误删稳定副本(见 §5.3)。
+//
 // getPartition resolves an absolute partition from the configuration selected
 // for the active rollout granularity.
 // Returns (0, false, nil) when partition is not configured.
@@ -2476,6 +2711,7 @@ func (c *ModelServingController) getPartition(partitionConfig *intstr.IntOrStrin
 	return partition, true, nil
 }
 
+// modelServingPartition 取 ModelServing 层的 partition(ServingGroupRollingUpdate 用)
 func modelServingPartition(ms *workloadv1alpha1.ModelServing) *intstr.IntOrString {
 	if ms.Spec.RolloutStrategy == nil || ms.Spec.RolloutStrategy.RollingUpdateConfiguration == nil {
 		return nil
@@ -2483,6 +2719,7 @@ func modelServingPartition(ms *workloadv1alpha1.ModelServing) *intstr.IntOrStrin
 	return ms.Spec.RolloutStrategy.RollingUpdateConfiguration.Partition
 }
 
+// rolePartition 取某 Role 内联的 partition(仅 RoleRollingUpdate 生效)
 func rolePartition(ms *workloadv1alpha1.ModelServing, role workloadv1alpha1.Role) *intstr.IntOrString {
 	if ms.Spec.RolloutStrategy == nil || ms.Spec.RolloutStrategy.Type != workloadv1alpha1.RoleRollingUpdate {
 		return nil
@@ -2490,6 +2727,7 @@ func rolePartition(ms *workloadv1alpha1.ModelServing, role workloadv1alpha1.Role
 	return role.Partition
 }
 
+// modelServingReplicas 取 spec.replicas(ServingGroup 数), nil 返回 0
 func modelServingReplicas(ms *workloadv1alpha1.ModelServing) int {
 	if ms.Spec.Replicas == nil {
 		return 0
@@ -2497,6 +2735,7 @@ func modelServingReplicas(ms *workloadv1alpha1.ModelServing) int {
 	return int(*ms.Spec.Replicas)
 }
 
+// roleReplicas 取某 Role 的 replicas(实例数), nil 返回 1(默认)
 func roleReplicas(role workloadv1alpha1.Role) int {
 	if role.Replicas == nil {
 		return 1
@@ -2504,10 +2743,19 @@ func roleReplicas(role workloadv1alpha1.Role) int {
 	return int(*role.Replicas)
 }
 
-// forEachMissingOrdinal visits at most limit missing ordinals in [0, expectedCount).
-// Memory usage depends on the observed ordinals rather than the user-provided
-// expectedCount, which may be as large as math.MaxInt32.
-// Invalid, out-of-range, duplicate, and unsorted existing ordinals are tolerated.
+// forEachMissingOrdinal 在 [0, expectedCount) 区间最多访问 limit 个"缺失的 ordinal", 对每个调 handler。
+// handler 返回 false 则提前终止。容忍越界/重复/乱序的已存在 ordinal。
+//
+// why 从 0 填缺失 ordinal 而非 maxOrdinal+1:
+//   ① partition 语义需 ordinal 有界确定: partition 保护 [0, partition), 若一直 maxOrdinal+1 则序号
+//     无限累加(缩扩循环 N 轮后 ordinal 可达任意大), partition="前 N 个"指不到稳定低 ordinal。
+//     复用 [0, expectedCount) 让 ordinal 始终有界, partition 才确定。
+//   ② 缩容留的"洞"必须填回: binpack 缩容可能删中间 ordinal 留洞(如 {0,2,4}), 扩容填回洞而非顶到 5,6。
+//   ③ 内存安全: expectedCount 可能是 MaxInt32(用户可乱填), 用 observed ordinals 建小 set,
+//     只在"缺失"处停, 避免 O(MaxInt32) 遍历。
+//
+// why 遍历依赖已观测 ordinal 而非 expectedCount: expectedCount 可能 MaxInt32, 不能直接 for 到它;
+//   用 existing map 记录已存在的, 只在缺失处访问, 最多 limit 个。
 func forEachMissingOrdinal(expectedCount int, existingOrdinals []int, limit int, handler func(int) bool) {
 	if expectedCount <= 0 || limit <= 0 {
 		return
@@ -2689,6 +2937,8 @@ func (c *ModelServingController) syncHeadlessServices(ctx context.Context, ms *w
 	return nil
 }
 
+// buildPluginChain 按 ms.Spec.Plugins 建插件链(无插件返回 nil)。
+// 插件链在 Pod 创建(OnPodCreate)和就绪(OnPodReady)时跑钩子。
 func (c *ModelServingController) buildPluginChain(ms *workloadv1alpha1.ModelServing) (*plugins.Chain, error) {
 	if ms == nil || len(ms.Spec.Plugins) == 0 {
 		return nil, nil
@@ -2699,6 +2949,8 @@ func (c *ModelServingController) buildPluginChain(ms *workloadv1alpha1.ModelServ
 	return plugins.NewChain(c.pluginsRegistry, ms.Spec.Plugins)
 }
 
+// CreatePodsForServingGroup 为一个 ServingGroup 创建所有 Role 实例的 Pod。
+// 对模板里每个 Role × Replicas 个实例, 逐个调 CreatePodsByRole + store.AddRole(置 RoleCreating) + 发事件。
 func (c *ModelServingController) CreatePodsForServingGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupIndex int, revision string, roles []workloadv1alpha1.Role) error {
 	servingGroupName := utils.GenerateServingGroupName(ms.Name, servingGroupIndex)
 	for _, role := range roles {
@@ -2719,6 +2971,10 @@ func (c *ModelServingController) CreatePodsForServingGroup(ctx context.Context, 
 	return nil
 }
 
+// CreatePodsByRole 为单个 Role 实例派生 Pod: 1 entry + WorkerReplicas workers。
+// 流程: 建 entry pod(GenerateEntryPod) → 注 PodGroup 注解(绑到本 group 的 gang) → createPod;
+//   再循环建 worker pod(GenerateWorkerPod)同样注解 + createPod。
+// 一个 Role 实例 = 1 entry + WorkerReplicas workers, 全是 Pod(不是 PodGroup)。
 func (c *ModelServingController) CreatePodsByRole(ctx context.Context, role workloadv1alpha1.Role, ms *workloadv1alpha1.ModelServing, roleIndex int, servingGroupOrdinal int, revision string, roleTemplateHash string) error {
 	servingGroupName := utils.GenerateServingGroupName(ms.Name, servingGroupOrdinal)
 	// TODO(hzxuzhonghu): build the plugin chain only once per ModelServing
@@ -2749,6 +3005,8 @@ func (c *ModelServingController) CreatePodsByRole(ctx context.Context, role work
 	return nil
 }
 
+// createPod 创建单个 Pod: 跑插件链 OnPodCreate 钩子 → kubeClient Create。
+// 已存在(IsAlreadyExists)则校验 label/revision 是否匹配, 不匹配说明是旧 revision 残留 Pod 则删后重建。
 func (c *ModelServingController) createPod(
 	ctx context.Context,
 	ms *workloadv1alpha1.ModelServing,
@@ -2812,6 +3070,9 @@ func (c *ModelServingController) createPod(
 	return nil
 }
 
+// deleteServingGroup 删除整个 ServingGroup: 置 Deleting → 删 PodGroup → DeleteCollection 删 Pod → 逐个删 Service → 资源清完移出 store。
+// why 先置 Deleting 再删: 避免删 Pod/Service 过程中触发不必要的 headless service 重建(syncHeadlessServices 跳过 Deleting 组)。
+// 失败时 defer 回滚 status, 重新入队后续删除。
 func (c *ModelServingController) deleteServingGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupName string) error {
 	status := c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName)
 	if status == datastore.ServingGroupNotFound {
@@ -2880,6 +3141,9 @@ func (c *ModelServingController) deleteServingGroup(ctx context.Context, ms *wor
 	return nil
 }
 
+// createOrUpdatePodGroupByServingGroup 为一个 ServingGroup 创建/更新 PodGroup(委托 podGroupManager)。
+// PodGroup 创建由 shouldCreatePodGroup 门控(CRD 存在 + SchedulerName=volcano, 见 manager.go)。
+// retryAfter>0 时延迟重试(PodGroup CRD 可能还没就绪)。
 func (c *ModelServingController) createOrUpdatePodGroupByServingGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupName string) error {
 	if err, retryAfter := c.podGroupManager.CreateOrUpdatePodGroup(ctx, ms, servingGroupName); err != nil {
 		if retryAfter > 0 {
@@ -3080,9 +3344,30 @@ func (c *ModelServingController) RegisterModelServingDebugEndpoints(mux *http.Se
 	mux.HandleFunc("/debug/modelserving/cache", c.handleModelServingDatastoreCacheDump)
 }
 
+// calMaxScaleDown 算 RoleRollingUpdate 下某 Role 一次最多能删几个过时实例(缩容预算)。
+//
+// 参数:
+//   - role: 当前 Role 的 spec(含内联 maxUnavailable)
+//   - outdatedRoles: 过时的 Role 实例集合
+//   - allReplicas: 该 Role 当前总实例数(所有 group 合计)
+//   - newUnavailable: 已经不可用的实例数(减预算用)
+//
+// 返回: 本次允许删除的最大数 maxScaleDown
+//
+// 流程:
+//   1. 取 Role 内联 maxUnavailable(未配置 → 可删全部过时, 无约束)
+//   2. minAvailable = expectedReplicas - maxUnavailable(至少保留多少可用)
+//   3. maxScaleDown = allReplicas - minAvailable - newUnavailable(扣除已不可用)
+//
+// why: RoleRollingUpdate 每 Role 独立预算, 故意不参考 ModelServing 层 maxUnavailable ——
+//   ① 语义不匹配: ModelServing 层 maxUnavailable 基数是 spec.replicas(组数),
+//     衡量"不可用组数"; 此处衡量"某 Role 不可用副本数", 基数是该 Role 的 replicas, 混用得无意义预算。
+//   ② PD 每 Role 独立精细控损: prefill/decode 可用性要求不同(如 prefill maxUnavailable:0/maxSurge:1,
+//     decode maxUnavailable:1), 读 ModelServing 层单一值无法分别设策略。
+//   ③ webhook 已禁止 RoleRollingUpdate 设 ModelServing 层 rollingUpdateConfiguration(validator.go)。
+//   ④ PD fail-safe: minAvailable≥1(当 maxUnavailable<replicas)保证不一次删空, 避免剩余 Role 失去配对伙伴。
 func calMaxScaleDown(role workloadv1alpha1.Role, outdatedRoles []datastore.Role, allReplicas, newUnavailable int) (int, error) {
-	// RoleRollingUpdate has an independent budget for each Role. The
-	// ModelServing-level maxUnavailable is intentionally not consulted here.
+	// RoleRollingUpdate 每 Role 独立预算, 故意不参考 ModelServing 层 maxUnavailable(见函数 why)
 	maxUnavailable, configured, err := utils.GetMaxUnavailableForRole(role)
 	if err != nil {
 		return 0, fmt.Errorf("failed to calculate maxUnavailable for role %s: %v", role.Name, err)

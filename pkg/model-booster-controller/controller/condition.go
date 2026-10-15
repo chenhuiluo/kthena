@@ -25,6 +25,8 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// ModelBooster 状态条件(condition)设置 — Initialized/Active/Failed 三态。
+// reason: ModelCreating(初始化中)/ModelProcessing(处理中)/ModelAvailable(就绪)/ModelAbnormal(失败)。
 const (
 	ModelInitsReason      = "ModelCreating"
 	ModelActiveReason     = "ModelAvailable"

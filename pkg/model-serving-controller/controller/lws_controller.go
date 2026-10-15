@@ -44,6 +44,23 @@ import (
 	msplugins "github.com/volcano-sh/kthena/pkg/model-serving-controller/plugins"
 )
 
+// =============================================================================
+// LeaderWorkerSet (LWS) 旁路控制器 — 兼容 LWS 生态的转换入口
+// =============================================================================
+//
+// 【职责】检测集群里的 LeaderWorkerSet CRD, watch LWS 对象, 把它转换成 ModelServing,
+//   回写 LWS status。用于兼容已有的 LWS 工作负载, 让它们不经改造就能用上 kthena 调度。
+//
+// 【转换关系】LWS.Spec.Replicas → ModelServing.Spec.Replicas(Defines the number of
+//   ServingGroups), 并自动注入 lws-standard-labels 插件(给 Pod 注 LWS 标准标签)。
+//
+// 【为什么是旁路】LWS 是独立的 K8s CRD(sigs.k8s.io/lws), 与 ModelServing 并行;
+//   本控制器把 LWS 当作"另一种用户入口", 转成 ModelServing 后由 ModelServingController 接管。
+//
+// 【可选启用】集群没装 LWS CRD 时 InitializeLWSController 返回 nil, 不启动。
+// =============================================================================
+
+// InitializeLWSController 初始化 LWS 控制器。先检测 LWS CRD 是否存在, 不存在返回 nil(不启用)。
 func InitializeLWSController(
 	cfg *rest.Config,
 	kubeClient kubernetes.Interface,
@@ -144,6 +161,7 @@ func NewLWSController(
 	return c, nil
 }
 
+// Run 启动 LWS 控制器: 启动 informers → 等缓存同步 → 起 N 个 worker 消费队列。
 func (c *LWSController) Run(ctx context.Context, workers int) error {
 	defer utilruntime.HandleCrash()
 	defer c.workqueue.ShutDown()
@@ -199,6 +217,9 @@ func (c *LWSController) processNextWorkItem(ctx context.Context) bool {
 	return true
 }
 
+// syncHandler LWS 调谐主逻辑: 把 LWS 同步成 ModelServing。
+// 流程: 取 LWS → 取同名 ModelServing(没有则 constructModelServing 后 Create;
+//   有则比对 spec 不一致则 Update) → 回写 LWS status。
 func (c *LWSController) syncHandler(ctx context.Context, key string) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
@@ -292,6 +313,12 @@ func (c *LWSController) handleObject(obj interface{}) {
 	}
 }
 
+// constructModelServing 把 LWS 转成 ModelServing:
+//   - LWS.Spec.Replicas → ModelServing.Spec.Replicas(ServingGroup 数)
+//   - LWS.LeaderWorkerTemplate.Size → workerReplicas(Size-1, leader 是 entry)
+//   - 单 Role "default": leader 模板作 entry, worker 模板作 worker
+//   - 注入 lws-standard-labels 插件(给 Pod 注 LWS 标准标签)
+//   - OwnerRef 指向 LWS(LWS 删除时级联删 ModelServing)
 func (c *LWSController) constructModelServing(lws *lwsv1.LeaderWorkerSet) *workloadv1alpha1.ModelServing {
 	replicas := int32(1)
 	if lws.Spec.Replicas != nil {
