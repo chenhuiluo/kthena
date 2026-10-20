@@ -672,6 +672,13 @@ func (c *ModelServingController) syncModelServing(ctx context.Context, key strin
 	}
 
 	// 3. Handle the rolling update process, deleting outdated ServingGroups/Roles to trigger updates.
+	// 【第三步 manageRollingUpdate — 唯一真正"专管滚动更新"的步骤, 且只删不建】
+	//   职责: 删掉 revision 过时的 ServingGroup/Role, 触发滚动更新。
+	//   why 它不建 pod: 它只负责"删旧"。删后下一轮 reconcile 第1步 syncServingGroupReplicas
+	//     发现组数 < spec.replicas(或第2步发现实例不够) → 建新 revision 的新组/新实例。
+	//     即"先删旧(本步) → 再建新(下一轮第1/2步)"的滚动循环, 本步是删除触发器。
+	//   partition 门控: 只删保护区 [0, partition) 之外的过时组; partition ≥ 总组数时全保护, 无可删直接退出。
+	//   非滚动场景(初次创建/纯扩缩容): 没有过时组, 本步空跑。
 	if err := c.manageRollingUpdate(ctx, ms, revision); err != nil {
 		return fmt.Errorf("failed to handle rollingUpdate: %v", err)
 	}
@@ -1530,6 +1537,18 @@ func (c *ModelServingController) DeleteRole(ctx context.Context, ms *workloadv1a
 // maxUnavailable and partition. RoleRollingUpdate uses only each Role's
 // maxUnavailable, partition and ServingGroup's partition.
 //
+// manageRollingUpdate 滚动更新的"删除触发器": 只删过时(revision 不匹配)的 ServingGroup/Role,
+// 删后由下一轮 reconcile 的第1/2步(syncServingGroupReplicas/syncRoleReplicas)建新 revision 资源补上。
+//
+// 【职责边界 — 只删不建】本步不创建任何 pod。它删过时资源 → 下一轮发现"数量不够" → 建。
+//   故五步里真正"专管滚动更新"的只有本步; 前两步 sync*Replicas 是通用副本数同步引擎
+//   (扩缩容是本职, 滚动靠"删后下一轮建新"间接完成), 第4/5步建 Service/回写 status 不碰 pod。
+//
+// 【partition — 保护前 N 个不更新】partition = spec.rolloutStrategy.rollingUpdateConfiguration.partition
+//   (仅 ServingGroupRollingUpdate 有; 默认 0; 支持百分比向上取整)。保护 [0, partition) 的低 ordinal 组:
+//   只删保护区之外的过时组(servingGroupList[partition:]), 保证稳定副本不被滚。典型: 金丝雀全保护(partition=总组数)
+//   先观察, 确认后调小 partition 逐批滚。
+//
 // Main processing steps:
 //  1. Identify the boundary for the currently active rollout partition.
 //  2. Filter outdated groups (mismatched revision) that are allowed to be updated.
@@ -1542,14 +1561,16 @@ func (c *ModelServingController) manageRollingUpdate(ctx context.Context, ms *wo
 	}
 
 	partition, _, _ := c.getPartition(modelServingPartition(ms), modelServingReplicas(ms))
-	// Separate outdated groups into two categories: not-running and running
-	// We prioritize updating not-running outdated groups first
-	var notRunningOutdatedGroups []datastore.ServingGroup
-	var runningOutdatedGroups []datastore.ServingGroup
+	// partition ≥ 实际组数 = 所有现存组都在保护区 [0, partition) 内, 保护区外(servingGroupList[partition:]) 为空。
+	// 没有任何组可删 → 滚动无从发生, 直接退出避免空处理(金丝雀全保护阶段每次到这步都空退出)。
 	if partition >= len(servingGroupList) {
 		// All servingGroups are protected by partition, so we should not update any group. Return directly.
 		return nil
 	}
+	// Separate outdated groups into two categories: not-running and running
+	// We prioritize updating not-running outdated groups first
+	var notRunningOutdatedGroups []datastore.ServingGroup
+	var runningOutdatedGroups []datastore.ServingGroup
 	groupsAfterPartition := servingGroupList[partition:]
 
 	newServingGroupUnavailableCount := 0
