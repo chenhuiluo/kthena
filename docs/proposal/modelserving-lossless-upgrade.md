@@ -16,15 +16,16 @@ creation-date: 2026-10-20
 ### Summary
 
 This proposal adds a drain step to `ModelServing` rolling updates so that an old
-Pod is deleted only after its in-flight inference requests finish (or a timeout
-fallback fires), instead of being SIGKILLed immediately by `DeleteCollection`.
-The goal is zero-downtime, zero-interruption upgrades: the service keeps serving
-throughout the update and in-flight requests are never killed mid-generation.
+Pod is deleted only after its in-flight inference requests finish generating
+(or a timeout fallback fires), instead of being SIGKILLed immediately by
+`DeleteCollection`. The goal is zero-downtime, zero-interruption upgrades: the
+service keeps serving throughout the update and in-flight requests are never
+killed mid-generation.
 
-The drain is a cooperative handshake between `model-serving-controller` and
-`kthena-router` over two Pod annotations, with no Redis and no new CRD field.
+The drain is a two-phase annotation exchange between `model-serving-controller`
+and `kthena-router` over two Pod annotations, with no Redis and no new CRD field.
 Drain granularity follows the existing rollout strategy (ServingGroup or Role
-instance), so the mechanism is naturally group-aware — including for PD
+instance), so the mechanism is group-aware — including for PD
 disaggregated workloads, which are addressed in a dedicated section below.
 
 ### Motivation
@@ -80,7 +81,7 @@ A user updates the model image of a `ModelServing`. During the update, clients
 keep calling the model. Without drain, a Pod serving a long streaming request is
 killed mid-response; the client sees a broken connection. With drain, the old
 Pod stops receiving new requests, finishes its in-flight streaming response, and
-is then removed — the client never notices the update.
+is then removed — the client sees no interruption.
 
 ##### Story 2 — scale-down
 
@@ -255,7 +256,7 @@ A prefill request stays in the prefill engine's running set for its **entire
 lifetime** — computing KV **and** pushing KV to the paired decode Pod — and only
 leaves the running set once the push is done. Therefore:
 
-> **prefill engine `RequestRunningNum == 0`  ⟺  every KV that prefill was responsible for has been delivered to its paired decode Pod.**
+> **prefill engine `RequestRunningNum == 0` iff every KV that prefill was responsible for has been delivered to its paired decode Pod.**
 
 When the controller is allowed to delete a prefill Pod (the `traffic-drained`
 annotation is present), the KV for every request that touched that prefill has
