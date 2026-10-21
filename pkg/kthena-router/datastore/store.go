@@ -702,6 +702,28 @@ func (s *store) markPodDrainedIfZero(ctx context.Context, pod *PodInfo) {
 	if pod.GetRequestRunningNum() != 0 || pod.GetRequestWaitingNum() != 0 {
 		return
 	}
+
+	// PD: a prefill Pod is safe to delete only when every paired decode Pod that
+	// is ALSO draining has reached zero. Decode is the request chain's last stage,
+	// so a draining decode at zero means its KV has been delivered/pulled and the
+	// prefill is no longer needed. A non-draining decode is skipped (still serving
+	// new requests). See the PD Disaggregation section of the proposal.
+	if decodePodNames := s.getDecodePodsForPrefillPod(pod); len(decodePodNames) > 0 {
+		for _, decodePodName := range decodePodNames {
+			dpValue, ok := s.pods.Load(decodePodName)
+			if !ok {
+				continue // paired decode already deleted
+			}
+			decodePod := dpValue.(*PodInfo)
+			if !decodePod.IsDraining() {
+				continue // not draining: still serving new requests
+			}
+			if decodePod.GetRequestRunningNum() != 0 || decodePod.GetRequestWaitingNum() != 0 {
+				return // paired draining decode still has in-flight
+			}
+		}
+	}
+
 	patch, err := json.Marshal(map[string]interface{}{
 		"metadata": map[string]interface{}{
 			"annotations": map[string]string{
@@ -1233,6 +1255,33 @@ func (s *store) GetPrefillPodsForDecodeGroup(modelServerName types.NamespacedNam
 	}
 
 	return prefillPods, nil
+}
+
+// getDecodePodsForPrefillPod returns the decode pods paired with the given
+// prefill pod, across every modelServer the pod belongs to (a pod may belong to
+// several). Results are deduplicated. Returns nil if the pod is not a prefill
+// pod in any modelServer, so calling on a decode or non-PD pod is safe.
+func (s *store) getDecodePodsForPrefillPod(pod *PodInfo) []types.NamespacedName {
+	modelServers := pod.GetModelServers()
+	if modelServers == nil || modelServers.Len() == 0 {
+		return nil
+	}
+	seen := sets.New[types.NamespacedName]()
+	var result []types.NamespacedName
+	for msName := range modelServers {
+		value, ok := s.modelServer.Load(msName)
+		if !ok {
+			continue
+		}
+		ms := value.(*modelServer)
+		for _, dp := range ms.getDecodePodsForPrefillPod(pod) {
+			if !seen.Has(dp) {
+				seen.Insert(dp)
+				result = append(result, dp)
+			}
+		}
+	}
+	return result
 }
 
 func (s *store) AddOrUpdatePod(pod *corev1.Pod, modelServers []*aiv1alpha1.ModelServer) error {
