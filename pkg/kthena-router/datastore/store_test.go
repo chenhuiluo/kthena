@@ -3195,3 +3195,215 @@ func TestMarkPodDrainedIfZeroNoKubeClient(t *testing.T) {
 	// Should not panic and should do nothing.
 	assert.NotPanics(t, func() { s.markPodDrainedIfZero(context.Background(), pi) })
 }
+
+// pdTestModelServer builds a PD-disaggregated ModelServer (prefill+decode
+// roles distinguished by labels, grouped by a group-key label) and registers it
+// with the store. Helper for the PD drain tests below.
+func pdTestModelServer(t *testing.T, s *store) *aiv1alpha1.ModelServer {
+	t.Helper()
+	ms := &aiv1alpha1.ModelServer{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "ms-pd"},
+		Spec: aiv1alpha1.ModelServerSpec{WorkloadSelector: &aiv1alpha1.WorkloadSelector{
+			MatchLabels: map[string]string{"app": "ms-pd"},
+			PDGroup: &aiv1alpha1.PDGroup{
+				GroupKey:      "pd-group",
+				PrefillLabels: map[string]string{"role": "prefill"},
+				DecodeLabels:  map[string]string{"role": "decode"},
+			},
+		}},
+	}
+	assert.NoError(t, s.AddOrUpdateModelServer(ms, sets.New[types.NamespacedName]()))
+	return ms
+}
+
+// pdTestPod builds a PD pod with the given role and group value, creates it in
+// the fake clientset, registers it with the store (which categorizes it into the
+// PDGroup), and returns its PodInfo.
+func pdTestPod(t *testing.T, s *store, ms *aiv1alpha1.ModelServer, name, role string) *PodInfo {
+	t.Helper()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: name,
+		Labels: map[string]string{"app": "ms-pd", "role": role, "pd-group": "g1"},
+	}}
+	_, err := kubeClientOf(s).CoreV1().Pods("ns").Create(context.TODO(), pod, metav1.CreateOptions{})
+	assert.NoError(t, err)
+	assert.NoError(t, s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}))
+	return s.GetPodInfo(types.NamespacedName{Namespace: "ns", Name: name})
+}
+
+// kubeClientOf extracts the fake kubeClient from a store built with
+// WithKubeClient. It is set by the test that constructed the store.
+func kubeClientOf(s *store) *kubefake.Clientset {
+	return s.kubeClient.(*kubefake.Clientset)
+}
+
+// setMetrics sets the running/waiting metrics on a PodInfo directly.
+func setMetrics(pi *PodInfo, running, waiting float64) {
+	pi.mutex.Lock()
+	defer pi.mutex.Unlock()
+	pi.RequestRunningNum = running
+	pi.RequestWaitingNum = waiting
+}
+
+// countDrainPatches counts patch actions on the fake clientset.
+func countDrainPatches(s *store) int {
+	n := 0
+	for _, a := range kubeClientOf(s).Actions() {
+		if a.GetVerb() == "patch" {
+			n++
+		}
+	}
+	return n
+}
+
+// TestMarkPodDrainedIfZero_PDPrefill_WaitsForDrainingDecode: under
+// ServingGroupRollingUpdate the whole group drains, so a prefill Pod must wait
+// for its paired (also-draining) decode Pod to reach zero in-flight.
+func TestMarkPodDrainedIfZero_PDPrefill_WaitsForDrainingDecode(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
+	s := New(WithKubeClient(kubeClient)).(*store)
+	ms := pdTestModelServer(t, s)
+	prefill := pdTestPod(t, s, ms, "prefill-0", "prefill")
+	decode := pdTestPod(t, s, ms, "decode-0", "decode")
+
+	s.SetPodDraining(types.NamespacedName{Namespace: "ns", Name: "prefill-0"}, true)
+	s.SetPodDraining(types.NamespacedName{Namespace: "ns", Name: "decode-0"}, true)
+	setMetrics(prefill, 0, 0)
+
+	// Decode still has in-flight: prefill must NOT be drained.
+	setMetrics(decode, 1, 0)
+	s.markPodDrainedIfZero(context.Background(), prefill)
+	assert.Equal(t, 0, countDrainPatches(s), "prefill drained while paired decode busy")
+
+	// Decode reaches zero: prefill is now drained.
+	setMetrics(decode, 0, 0)
+	s.markPodDrainedIfZero(context.Background(), prefill)
+	assert.Equal(t, 1, countDrainPatches(s), "prefill not drained after paired decode zero")
+}
+
+// TestMarkPodDrainedIfZero_PDPrefill_DecodeNotDraining_DrainsOnOwnMetrics: under
+// RoleRollingUpdate only the prefill role drains; the paired decode keeps
+// serving new requests and never reaches zero, so it is skipped and the prefill
+// drains on its own metrics.
+func TestMarkPodDrainedIfZero_PDPrefill_DecodeNotDraining_DrainsOnOwnMetrics(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
+	s := New(WithKubeClient(kubeClient)).(*store)
+	ms := pdTestModelServer(t, s)
+	prefill := pdTestPod(t, s, ms, "prefill-0", "prefill")
+	decode := pdTestPod(t, s, ms, "decode-0", "decode")
+
+	s.SetPodDraining(types.NamespacedName{Namespace: "ns", Name: "prefill-0"}, true)
+	// decode NOT marked draining (still serving)
+	setMetrics(prefill, 0, 0)
+	setMetrics(decode, 3, 0)
+
+	s.markPodDrainedIfZero(context.Background(), prefill)
+	assert.Equal(t, 1, countDrainPatches(s), "prefill should drain on own metrics when decode not draining")
+}
+
+// TestMarkPodDrainedIfZero_PDDecode_OriginalLogic: a decode Pod is the last stage
+// of the request chain; it drains on its own metrics (no paired-decode check).
+func TestMarkPodDrainedIfZero_PDDecode_OriginalLogic(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
+	s := New(WithKubeClient(kubeClient)).(*store)
+	ms := pdTestModelServer(t, s)
+	decode := pdTestPod(t, s, ms, "decode-0", "decode")
+	// also add a prefill so the group is non-empty
+	pdTestPod(t, s, ms, "prefill-0", "prefill")
+
+	s.SetPodDraining(types.NamespacedName{Namespace: "ns", Name: "decode-0"}, true)
+	setMetrics(decode, 0, 0)
+
+	s.markPodDrainedIfZero(context.Background(), decode)
+	assert.Equal(t, 1, countDrainPatches(s), "decode pod should drain on its own metrics")
+}
+
+// TestMarkPodDrainedIfZero_NonPDPod_OriginalLogic: a non-PD pod (modelServer
+// without PDGroup) keeps the original self-check behavior.
+func TestMarkPodDrainedIfZero_NonPDPod_OriginalLogic(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
+	s := New(WithKubeClient(kubeClient)).(*store)
+	ms := &aiv1alpha1.ModelServer{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "ms-nopd"},
+		Spec: aiv1alpha1.ModelServerSpec{WorkloadSelector: &aiv1alpha1.WorkloadSelector{MatchLabels: map[string]string{"app": "ms-nopd"}}}}
+	assert.NoError(t, s.AddOrUpdateModelServer(ms, sets.New[types.NamespacedName]()))
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod-nopd", Labels: map[string]string{"app": "ms-nopd"}}}
+	_, err := kubeClient.CoreV1().Pods("ns").Create(context.TODO(), pod, metav1.CreateOptions{})
+	assert.NoError(t, err)
+	assert.NoError(t, s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}))
+	pi := s.GetPodInfo(types.NamespacedName{Namespace: "ns", Name: "pod-nopd"})
+	s.SetPodDraining(types.NamespacedName{Namespace: "ns", Name: "pod-nopd"}, true)
+	setMetrics(pi, 0, 0)
+
+	s.markPodDrainedIfZero(context.Background(), pi)
+	assert.Equal(t, 1, countDrainPatches(s), "non-PD pod should drain on its own metrics")
+}
+
+// TestMarkPodDrainedIfZero_PDPrefill_MixedDrainingDecodes: with two paired
+// decodes, only the draining one is waited for; a non-draining decode is skipped.
+func TestMarkPodDrainedIfZero_PDPrefill_MixedDrainingDecodes(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
+	s := New(WithKubeClient(kubeClient)).(*store)
+	ms := pdTestModelServer(t, s)
+	prefill := pdTestPod(t, s, ms, "prefill-0", "prefill")
+	decodeA := pdTestPod(t, s, ms, "decode-0", "decode")
+	decodeB := pdTestPod(t, s, ms, "decode-1", "decode")
+
+	s.SetPodDraining(types.NamespacedName{Namespace: "ns", Name: "prefill-0"}, true)
+	s.SetPodDraining(types.NamespacedName{Namespace: "ns", Name: "decode-0"}, true)
+	// decode-1 NOT draining
+	setMetrics(prefill, 0, 0)
+	setMetrics(decodeA, 1, 0)
+	setMetrics(decodeB, 5, 0) // not draining, must be ignored
+
+	s.markPodDrainedIfZero(context.Background(), prefill)
+	assert.Equal(t, 0, countDrainPatches(s), "prefill drained while draining decode-A busy")
+
+	setMetrics(decodeA, 0, 0)
+	s.markPodDrainedIfZero(context.Background(), prefill)
+	assert.Equal(t, 1, countDrainPatches(s), "prefill should drain once draining decode-A is zero (decode-B ignored)")
+}
+
+// TestMarkPodDrainedIfZero_PDPrefill_DecodePodDeletedFromStore: a paired decode
+// already removed from the store is skipped (no longer a concern).
+func TestMarkPodDrainedIfZero_PDPrefill_DecodePodDeletedFromStore(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
+	s := New(WithKubeClient(kubeClient)).(*store)
+	ms := pdTestModelServer(t, s)
+	prefill := pdTestPod(t, s, ms, "prefill-0", "prefill")
+	pdTestPod(t, s, ms, "decode-0", "decode")
+
+	s.SetPodDraining(types.NamespacedName{Namespace: "ns", Name: "prefill-0"}, true)
+	s.SetPodDraining(types.NamespacedName{Namespace: "ns", Name: "decode-0"}, true)
+	// Remove the decode PodInfo from the store's pods map.
+	s.pods.Delete(types.NamespacedName{Namespace: "ns", Name: "decode-0"})
+	setMetrics(prefill, 0, 0)
+
+	s.markPodDrainedIfZero(context.Background(), prefill)
+	assert.Equal(t, 1, countDrainPatches(s), "prefill should drain when paired decode is gone from store")
+}
+
+// TestGetDecodePodsForPrefillPod verifies the reverse-pairing query:
+// prefill -> its paired decodes, decode -> nil, non-PD pod -> nil.
+func TestGetDecodePodsForPrefillPod(t *testing.T) {
+	s := New(WithKubeClient(kubefake.NewSimpleClientset())).(*store)
+	ms := pdTestModelServer(t, s)
+	prefill := pdTestPod(t, s, ms, "prefill-0", "prefill")
+	decode := pdTestPod(t, s, ms, "decode-0", "decode")
+
+	// prefill -> [decode-0]
+	got := s.getDecodePodsForPrefillPod(prefill)
+	assert.Len(t, got, 1)
+	assert.Equal(t, types.NamespacedName{Namespace: "ns", Name: "decode-0"}, got[0])
+
+	// decode -> nil (decode is not a prefill pod)
+	assert.Nil(t, s.getDecodePodsForPrefillPod(decode))
+
+	// non-PD pod -> nil
+	msNoPD := &aiv1alpha1.ModelServer{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "ms-nopd"},
+		Spec: aiv1alpha1.ModelServerSpec{WorkloadSelector: &aiv1alpha1.WorkloadSelector{MatchLabels: map[string]string{"app": "ms-nopd"}}}}
+	assert.NoError(t, s.AddOrUpdateModelServer(msNoPD, sets.New[types.NamespacedName]()))
+	podNoPD := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod-nopd", Labels: map[string]string{"app": "ms-nopd"}}}
+	assert.NoError(t, s.AddOrUpdatePod(podNoPD, []*aiv1alpha1.ModelServer{msNoPD}))
+	piNoPD := s.GetPodInfo(types.NamespacedName{Namespace: "ns", Name: "pod-nopd"})
+	assert.Nil(t, s.getDecodePodsForPrefillPod(piNoPD))
+}
