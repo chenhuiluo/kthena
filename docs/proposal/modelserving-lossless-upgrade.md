@@ -18,9 +18,11 @@ creation-date: 2026-10-20
 This proposal adds a drain step to `ModelServing` rolling updates so that an old
 Pod is deleted only after its in-flight inference requests finish generating
 (or a timeout fallback fires), instead of being SIGKILLed immediately by
-`DeleteCollection`. The goal is zero-downtime, zero-interruption upgrades: the
-service keeps serving throughout the update and in-flight requests are never
-killed mid-generation.
+`DeleteCollection`. The goal is **best-effort** zero-downtime, zero-interruption
+upgrades: on the normal path the service keeps serving throughout the update and
+in-flight requests are never killed mid-generation; residual cases the drain
+signal cannot fully close fall back to a timeout. This is "as lossless as
+possible," not absolute lossless — see the PD Disaggregation section.
 
 The drain is a two-phase annotation exchange between `model-serving-controller`
 and `kthena-router` over two Pod annotations, with no Redis and no new CRD field.
@@ -56,11 +58,12 @@ Lossless upgrade has two halves that are already partially in place:
 - Cover both rollout strategies (`ServingGroupRollingUpdate` and
   `RoleRollingUpdate`), plus scale-down and failure-rebuild, since they all
   converge on the same deletion path.
-- Be group-aware for PD disaggregated workloads at the drain-granularity level:
-  drain follows the rollout strategy (whole ServingGroup under
-  `ServingGroupRollingUpdate`), so prefill and decode are not deleted as
-  independent single Pods. (Precise per-pair drain for the pull-based NIXL/Mooncake
-  connectors is out of scope this round — see Non-Goals and the PD section.)
+- Be group-aware for PD disaggregated workloads: drain follows the rollout
+  strategy (whole ServingGroup under `ServingGroupRollingUpdate`), so prefill and
+  decode are not deleted as independent single Pods; and provide a precise drain
+  rule on the normal path using only the metrics the router already scrapes
+  (drain a prefill from its paired decode's in-flight, not its own), with
+  `drainTimeout` as the fallback for residual cases (see the PD section).
 - Work without Redis or any new CRD field.
 - Work for engines the router already adapts (vLLM including ascend, SGLang).
 
@@ -72,14 +75,11 @@ Lossless upgrade has two halves that are already partially in place:
 - Changing the rolling strategy itself (`maxUnavailable`/`maxSurge`/`partition`).
 - Drain as a separate API toggle: the drain timeout flag doubles as the
   enable/disable switch (`0` disables).
-- Precise per-pair PD drain for the pull-based NIXL/Mooncake connectors this
-  round. The prefill engine reports in-flight==0 before its KV has been pulled by
-  decode, so a prefill Pod cannot be safely deleted on its own metrics alone, and
-  whether the prefill request stays in the engine's running set until the pull
-  completes is engine-internal behavior this proposal cannot verify. PD updates
-  fall back to `drainTimeout` this round (the update completes, possibly with
-  interruption); a follow-up proposal will address the pull-based in-flight
-  semantics. See the PD Disaggregation section.
+- Absolute / strong lossless upgrade. This proposal makes the **normal path**
+  lossless and falls back to `drainTimeout` for residual cases, guaranteeing the
+  update always completes. Closing every engine-internal window would require
+  disproportionate complexity and code; that is left to follow-ups. See the PD
+  Disaggregation section.
 
 ### Proposal
 
@@ -104,10 +104,11 @@ dropped during scale-down.
 A user updates a PD-disaggregated `ModelServing` (a ServingGroup holds paired
 prefill + decode roles, where decode consumes the KV cache produced by prefill).
 During the update the old ServingGroup is drained. Because the drain gate is
-group-aware and the drain signal is the prefill engine's own in-flight count,
-a prefill Pod is only deleted once its KV has been handed off to its paired
-decode Pod; decode already holds the KV cache and continues generating
-independently. No in-flight PD request is broken by the update.
+group-aware and a prefill Pod is judged from its paired decode's in-flight (not
+its own metrics), the prefill is deleted only once no paired decode is still
+generating — i.e. its KV has already been delivered (push) or pulled. Decode
+that already holds the KV continues generating independently. On the normal
+path no in-flight PD request is broken by the update.
 
 #### Notes/Constraints/Caveats
 
@@ -195,46 +196,37 @@ so the request can finish and the counter can reach zero correctly.
 #### Drain Signal: Engine Metrics, Not onFlight
 
 Drain completion is judged from engine-reported metrics, not the router's
-`onFlight` counter. This is the central design choice for homogeneous and
-push-connector workloads. (The PD pull-connector case is not fully closed by
-engine metrics alone — see the PD Disaggregation section.)
+`onFlight` counter. This is the central design choice. For homogeneous and HTTP
+workloads the simple rule (`Running==0 && Waiting==0`) holds; for PD a prefill Pod
+is drained from its paired decode's in-flight (not its own unreliable metrics),
+with no new engine metrics introduced — see the PD Disaggregation section.
 
 | Dimension | `onFlight` (router counter) | Engine metrics (chosen) |
 |-----------|-----------------------------|--------------------------|
 | Counts all traffic sources | ❌ only traffic through the router, not direct-to-engine | ✅ engine's real in-flight, including direct |
 | Redis dependency | single replica in-memory OK; multi-replica without Redis each sees only its own count → false zero | ✅ HTTP scrape of engine, no Redis |
 | Monotonic after drain | new traffic could still land (informer latency) | ✅ once draining, no new traffic reaches the Pod; metric only decreases |
-| Scrape failure | n/a | leaves previous (non-zero) value on scrape *failure*; but a *successful* scrape missing the metric sets 0 (see false-zero handling below) |
 
-The engine metrics are `RequestRunningNum` + `RequestWaitingNum`, already
-engine-agnostic through the `backend/vllm` and `backend/sglang` adapter layers.
-The `onFlight` counter is used only for least-request scheduling scoring, not for
-drain.
+The primary engine metrics are `RequestRunningNum` + `RequestWaitingNum`,
+engine-agnostic through the `backend/vllm` and `backend/sglang` adapter layers. No
+new engine metrics are introduced: a single-Pod workload drains on its own
+`Running`/`Waiting`; a PD prefill drains from its paired decode's
+`Running`/`Waiting` (see the PD Disaggregation section). The `onFlight` counter is
+used only for least-request scheduling scoring, not for drain.
 
-For homogeneous and push-connector (SGLang, HTTP) workloads, engine metrics are
-sufficient: a Pod's `RequestRunningNum==0 && RequestWaitingNum==0` means it has
-no in-flight work and is safe to delete. For the pull-based NIXL/Mooncake
-connectors under PD, the prefill side has a handoff gap (see the PD Disaggregation
-section) that engine metrics alone do not close, so PD falls back to
-`drainTimeout` this round.
+For homogeneous and HTTP workloads, engine metrics are sufficient: a Pod's
+`RequestRunningNum==0 && RequestWaitingNum==0` means it has no in-flight work and
+is safe to delete. For PD (SGLang push, NIXL/Mooncake pull) a prefill Pod's own
+`Running`/`Waiting` is unreliable — for SGLang `num_running_reqs` is always 0 on a
+prefill Pod, for NIXL prefill reports zero before decode finishes pulling — so a
+prefill is drained from its paired decode's `Running`/`Waiting` instead. No new
+engine metrics are needed; the detail and the residual `drainTimeout` fallback
+are in the PD Disaggregation section.
 
-**False-zero handling.** Engine metrics can report zero when they should not,
-and the drain logic must account for it (raised in review):
-- **Staleness**: the value is from the last periodic scrape. An idle Pod whose
-  last scrape was 0 could receive a request just before `traffic-draining` is
-  observed, and a stale 0 would drain it early. Mitigation: only scrapes taken
-  *after* the router observed `traffic-draining` count, combined with the
-  router's local `onFlight==0` for that Pod.
-- **Missing metric on a successful scrape**: if a scrape succeeds but doesn't
-  contain `RequestRunningNum`/`RequestWaitingNum` (unsupported engine, renamed
-  metric, model not loaded yet), the current update path sets 0. Mitigation:
-  keep the previous value when the metric is absent on a successful scrape,
-  rather than setting 0.
-- **Direct-to-engine traffic**: `traffic-draining` only stops router-dispatched
-  traffic; direct-to-engine traffic is not gated and can keep the Pod from
-  draining (or arrive after `traffic-drained`). This is out of drain's scope and
-  bounded by `drainTimeout`; a separate egress-control mechanism would be needed
-  to gate it, left to future work.
+**This proposal targets best-effort (as-lossless-as-possible) upgrade, not
+strong/absolute lossless.** It makes the **normal path** lossless and falls back
+to `drainTimeout` for residual cases, guaranteeing the update always completes.
+This framing applies to the whole proposal, not only PD.
 
 #### Drain Granularity Follows Rollout Strategy
 
@@ -266,6 +258,11 @@ ServingGroup with prefill/decode roles must be group-aware, because a decode
 Pod's in-flight request depends on the prefill handoff, and the drain gate
 should apply to the pair/group, not each Pod independently.
 
+**Best-effort framing applies here too** (see the Drain Signal section): this PR
+makes the PD **normal path** lossless — the large majority of PD upgrades — and
+falls back to `drainTimeout` for the residual cases, guaranteeing the update
+always completes. The residual cases are no worse than today's behavior.
+
 **Drain granularity is already group-aware, not per-Pod.** Under the default
 `ServingGroupRollingUpdate`, the whole ServingGroup drains at once: all prefill
 and decode Pods get `traffic-draining` together and are deleted together once
@@ -274,78 +271,85 @@ deleted as independent single Pods under the default strategy. (Under
 `RoleRollingUpdate`, role instances drain independently — see the trade-off
 below.)
 
-**The hard part: the prefill→decode handoff is connector-dependent, and the
-pull-based connectors break the simple metric rule.** A PD request has a prefill
-phase (compute KV cache) and a decode phase (generate tokens), connected by a KV
-handoff. kthena has three connector implementations with two different handoff
-semantics:
+**The prefill→decode handoff makes a prefill Pod's own metrics unreliable, on
+every PD connector, for different reasons.** A PD request has a prefill phase
+(compute KV cache) and a decode phase (generate tokens), connected by a KV
+handoff. kthena has three connector implementations; on all of them a prefill
+Pod's own `Running`/`Waiting` does **not** mean "safe to delete":
 
-- **Push (SGLang)**: prefill and decode run concurrently; the prefill side pushes
-  the KV to decode (`connectors/sglang.go`). The prefill request stays in-flight
-  for the whole push, so `RequestRunningNum==0` on prefill means the push is done.
-  The simple metric rule holds here.
-- **Pull (NIXL, and Mooncake which reuses the NIXL code)**: sequential — prefill
-  finishes and returns `kv_transfer_params` (coordinates the decode engine uses
-  to pull the KV), then the decode request is sent and the decode engine pulls
-  (`connectors/nixl.go`, `connectors/types.go` `RemoteBlockIDs/RemoteHost`/
-  `RemotePort`). The prefill request leaves the engine's running set once it has
-  produced the KV and posted the blocks for pulling — **before** decode has
-  finished pulling. So `RequestRunningNum==0` on a prefill Pod does **not** mean
-  its KV has been pulled by decode; deleting the prefill at that point can break
-  an in-flight decode pull. This is the failure mode the review concern
-  describes, and it exists at the engine-metric level, not only in the router
-  `onFlight` counter.
-- **HTTP**: transparent passthrough, no KV handoff — the simple rule holds.
+- **HTTP** — transparent passthrough, no KV handoff. A PD request has no
+  separate prefill role, so this case does not arise; the simple rule
+  (`Running==0 && Waiting==0`) holds on the single Pod.
 
-Whether the prefill request stays in the engine's running set until the decode
-pull completes (vLLM delayed block freeing) is engine-internal behavior kthena
-neither controls nor observes, so this proposal cannot verify a drain rule that
-relies on it. The earlier draft of this section derived the rule from push
-semantics ("prefill pushes KV and stays running until the push is done") and
-applied it to NIXL — that was incorrect; the push wording matches SGLang, not the
-pull-based NIXL.
+- **SGLang (push)** — the prefill request lives in a separate inflight queue,
+  not the running batch (SGLang `disaggregation/prefill.py`), so
+  `sglang:num_running_reqs` is **always 0** on a prefill Pod and does not reflect
+  whether the KV push is in flight.
 
-**A conservative group-drain is not enough to close the gap.** One might try to
-make PD safe by draining the whole group and requiring all decode Pods to reach
-`RequestRunningNum==0` before any prefill is deleted (since no decode pulling ⟹
-prefill KV no longer needed). This is conservative but still rests on the same
-unverified premise — that a decode at `RequestRunningNum==0` has finished pulling
-and will not pull again (no cross-request KV reuse) — plus it misses queued
-decode requests: a decode in `RequestWaitingNum>0` (not yet running) will still
-pull prefill KV once it runs, so the drain gate would have to require
-`RequestWaitingNum==0` too, and even then the pull-completion timing is
-engine-internal. Validating all of this requires end-to-end testing against the
-real engine's NIXL/Mooncake connector and block manager, which is out of scope
-for this proposal.
+- **NIXL / Mooncake (pull)** — prefill computes the KV and posts blocks for
+  pulling, returning `kv_transfer_params` (coordinates the decode engine uses to
+  pull the KV), then the decode request is sent and the decode engine pulls
+  (`connectors/nixl.go`; `connectors/mooncake.go` reuses the NIXL code;
+  `connectors/types.go` `RemoteBlockIDs/RemoteHost/RemotePort`). The prefill
+  request leaves the running set once it has produced the KV and posted the
+  blocks — **before** decode has finished pulling. So `Running==0` on a prefill
+  Pod fires too early: the KV may still be needed by a decode pull in progress.
 
-**Scope decision this round: PD falls back to `drainTimeout`; precise PD drain is
-a follow-up.** Rather than ship a drain rule that is only plausibly correct, PD
-disaggregated workloads use the `drainTimeout` fallback path this round: the
-controller waits up to `drainTimeout`, then force-deletes (residual in-flight is
-bounded by `terminationGracePeriodSeconds` + preStop). This guarantees the update
-completes (no hang), but does **not** guarantee zero interruption for PD — an
-in-flight PD request may be interrupted, same as today's behavior. This is the
-"best-effort lossless on the normal path, guarantee the update completes when the
-drain signal can't be trusted" framing: for homogeneous / push-connector PD the
-normal path is lossless; for pull-connector PD the safe fallback is used until
-the follow-up lands.
+**The shared fix: drain a prefill Pod from its paired decode's in-flight, not
+from the prefill's own metrics.** Decode runs the normal engine loop on every
+connector, so `RequestRunningNum`/`RequestWaitingNum` on a decode Pod is
+reliable. A prefill Pod is safe to delete only when:
 
-A follow-up proposal will address precise PD drain, and needs to settle at least:
-- the pull-completion signal (does the prefill request stay in the running set
-  until decode's pull completes, and is that e2e-verifiable?);
-- `RequestWaitingNum==0` as part of the drain gate (queued decode still pulls KV);
-- cross-request KV reuse / prefix caching (decode momentarily zero while prefill
-  KV is still needed);
-- per-connector drain rules (push vs pull differ, a single blanket rule is
-  risky).
+> `prefill.Running==0 && prefill.Waiting==0` **and** every paired decode Pod has
+> `decode.Running==0 && decode.Waiting==0`
 
-**Trade-off note: drain window under group drain.** Under `ServingGroupRollingUpdate`
-the whole group drains together, so a fast Pod waits for the slowest in the
-group. Under `RoleRollingUpdate`, role instances drain independently. For PD
-users, `ServingGroupRollingUpdate` is the safer pairing (prefill and decode are
-not deleted independently), at the cost of a longer drain window; `RoleRollingUpdate`
-gives a shorter window but deletes prefill and decode independently. Both are
-covered by the `drainTimeout` fallback this round.
+Rationale: decode is the last stage of the request chain. A decode at zero
+means no request is generating, and a decode can only start generating after it
+received the KV (push delivered, or pull completed). So once every paired decode
+is at zero, no decode will generate again and none needs the prefill's KV — the
+prefill KV is no longer needed. Under `traffic-draining` no new request enters
+the group, so this is monotonic: once all paired decodes reach zero they stay
+zero, and the prefill is safe to delete. Pairing is group-level
+(`getPrefillPodsForDecodeGroup` returns all prefill Pods of the group), so the
+rule is group-aware, not per-Pod independent — matching the review's ask. For
+SGLang this works without the inflight-queue gauges: a paired decode at zero
+has already received the KV (it could not have generated otherwise), so the
+prefill push finished earlier; for NIXL it works because no decode is left to
+pull.
+
+This covers the **normal path** (rolling update, graceful scale-down):
+in-flight completes monotonically and prefill + decode both reach zero. Any
+residual the precise rule cannot close falls back to `drainTimeout`, which
+guarantees the update completes (see the best-effort framing in the Drain
+Signal section).
+
+**Scope this round: precise drain on the normal path from existing metrics only,
+with `drainTimeout` as the universal fallback.** No new engine metrics are
+introduced. Every topology gets a precise rule from the metrics the router
+already scrapes:
+
+| Topology | Prefill drain signal | Decode drain signal |
+|----------|-----------------------|----------------------|
+| Single-pod / HTTP | `Running==0 && Waiting==0` | (no decode role) |
+| SGLang push (PD) | `prefill==0` **and** paired `decode==0` | `Running==0 && Waiting==0` |
+| NIXL/Mooncake pull (PD) | `prefill==0` **and** paired `decode==0` | `Running==0 && Waiting==0` |
+
+The rule changes the *judge* (paired decode / group instead of the prefill Pod
+alone), not the *metric*, so it needs **no new scrape surface**.
+
+Follow-ups (not blocking this proposal):
+- cross-request KV reuse / prefix caching (decode momentarily zero while
+  prefill KV is still needed).
+
+**Trade-off note: drain window under group drain.** Under
+`ServingGroupRollingUpdate` the whole group drains together, so a fast Pod
+waits for the slowest in the group. Under `RoleRollingUpdate`, role instances
+drain independently. For PD users, `ServingGroupRollingUpdate` is the safer
+pairing (prefill and decode are not deleted independently), at the cost of a
+longer drain window; `RoleRollingUpdate` gives a shorter window but deletes
+prefill and decode independently, so the paired-zero rule must be applied
+across the pair, not within one role. Both are covered by the `drainTimeout`
+fallback.
 
 #### Configuration
 
@@ -405,8 +409,11 @@ completes.
   `spec.replicas`.
 - E2E test for a PD-disaggregated `ModelServing` rolling update under
   `ServingGroupRollingUpdate`, asserting that a prefill Pod is not deleted while
-  it still has in-flight (KV not yet handed off), and that decode continues
-  generating after its paired prefill is removed.
+  a paired decode still has in-flight (KV not yet delivered/pulled), and that
+  decode continues generating after its paired prefill is removed.
+- Unit test for the router's group-aware drain-zero judgment: a prefill Pod is
+  judged drained only when both it and every paired decode reach
+  `Running==0 && Waiting==0` (no new engine metrics are added).
 
 ### Alternatives
 
@@ -419,8 +426,8 @@ its own count and could falsely report zero. Engine metrics avoid both
 problems. The NIXL handoff gap is *not* a reason to prefer engine metrics over
 `onFlight` — both signals have the same gap on the NIXL pull path (prefill
 reports zero before decode has pulled the KV); that gap is a PD-specific problem
-handled by scoping PD to the `drainTimeout` fallback this round, not by the
-choice of drain signal (see [PD Disaggregation](#pd-disaggregation)).
+closed by the paired-decode drain rule on the normal path, not by the choice of
+drain signal (see [PD Disaggregation](#pd-disaggregation)).
 
 #### `preStop` hook only
 
