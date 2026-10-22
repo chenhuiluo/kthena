@@ -30,9 +30,8 @@ type modelServer struct {
 	modelServer *aiv1alpha1.ModelServer
 	pods        sets.Set[types.NamespacedName]
 
-	// PDGroup categorization for efficient PD scheduling
-	// Key: PD group value (the actual value of the group key label)
-	// Value: PDGroupPods containing categorized decode/prefill pods
+	// PDGroup categorization for efficient PD scheduling.
+	// Key: PD group value; Value: PDGroupPods with categorized decode/prefill pods.
 	pdGroups map[string]*PDGroupPods
 	// Reverse indexes updated with pdGroups under mutex, independent of PodInfo labels.
 	decodePodGroups  map[types.NamespacedName]string
@@ -201,9 +200,7 @@ func (m *modelServer) getPrefillPodsForDecodeGroup(pod *PodInfo) []types.Namespa
 }
 
 // getDecodePodsForPrefillPod returns decode pods paired with the given prefill
-// pod (same PD group). Returns nil if there is no PDGroup config, the pod lacks
-// the group-key label, or the pod does not match the prefill labels. Reverse of
-// getPrefillPodsForDecodeGroup, using the same label categorization.
+// pod (same PD group). Nil if no PDGroup config or the pod isn't a prefill.
 func (m *modelServer) getDecodePodsForPrefillPod(pod *PodInfo) []types.NamespacedName {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()

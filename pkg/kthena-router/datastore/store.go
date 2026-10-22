@@ -209,9 +209,8 @@ func WithRedisOnFlightCounter(counter OnFlightCounter) Option {
 	}
 }
 
-// WithKubeClient configures the store to patch traffic-drained annotations onto
-// draining pods during lossless upgrade. Optional: without it draining pods are
-// still excluded from scheduling but the controller falls back to drainTimeout.
+// WithKubeClient lets the store patch traffic-drained annotations onto draining
+// pods. Without it, draining pods are still excluded from scheduling (drainTimeout fallback).
 func WithKubeClient(client kubernetes.Interface) Option {
 	return func(s *store) {
 		s.kubeClient = client
@@ -367,9 +366,8 @@ type PodInfo struct {
 	// kept in sync with the global Redis counter so it reflects cross-router traffic.
 	onFlightRequestNum atomic.Int64
 
-	// draining is set true when the pod is annotated traffic-draining during
-	// lossless upgrade: the router stops scheduling new requests to it but keeps
-	// the PodInfo in the store so in-flight requests can finish and decrement.
+	// draining is set when the pod is annotated traffic-draining: the router
+	// stops scheduling new requests to it but keeps PodInfo for in-flight to finish.
 	draining atomic.Bool
 
 	mutex sync.RWMutex // Protects concurrent access to Pod, engine, metrics, models and modelServer fields
@@ -460,10 +458,8 @@ type store struct {
 	fairnessQueueConfig   FairnessQueueConfig
 	metricsScrapeInterval time.Duration
 
-	// kubeClient is optional. When non-nil, the store patches traffic-drained
-	// annotations onto draining pods during lossless upgrade (B1). When nil,
-	// draining pods are still excluded from scheduling but the controller relies
-	// solely on its drainTimeout to delete them.
+	// kubeClient is optional. When non-nil, the store patches traffic-drained onto
+	// draining pods; when nil, draining pods are still excluded from scheduling.
 	kubeClient kubernetes.Interface
 }
 
@@ -678,10 +674,7 @@ func (s *store) Run(ctx context.Context) {
 }
 
 // markPodDrainedIfZero patches traffic-drained=true onto a draining pod once its
-// engine-reported in-flight requests reach zero (lossless upgrade). Idempotent:
-// skips pods already drained. Runs inside the store.Run scrape loop, so it
-// piggybacks on the existing per-pod goroutine and semaphore — no new goroutine.
-// No-op when the store has no kubeClient (controller falls back to drainTimeout).
+// engine in-flight reaches zero. Idempotent; no-op without a kubeClient.
 func (s *store) markPodDrainedIfZero(ctx context.Context, pod *PodInfo) {
 	if s.kubeClient == nil || !pod.IsDraining() {
 		return
@@ -699,11 +692,8 @@ func (s *store) markPodDrainedIfZero(ctx context.Context, pod *PodInfo) {
 		return
 	}
 
-	// PD: a prefill Pod is safe to delete only when every paired decode Pod that
-	// is ALSO draining has reached zero. Decode is the request chain's last stage,
-	// so a draining decode at zero means its KV has been delivered/pulled and the
-	// prefill is no longer needed. A non-draining decode is skipped (still serving
-	// new requests). See the PD Disaggregation section of the proposal.
+	// PD: a prefill Pod also needs every paired draining decode at zero — decode
+	// at zero means its KV was delivered/pulled. Non-draining decodes are skipped.
 	if decodePodNames := s.getDecodePodsForPrefillPod(pod); len(decodePodNames) > 0 {
 		for _, decodePodName := range decodePodNames {
 			dpValue, ok := s.pods.Load(decodePodName)
@@ -731,9 +721,8 @@ func (s *store) markPodDrainedIfZero(ctx context.Context, pod *PodInfo) {
 		klog.Errorf("failed to marshal traffic-drained patch for pod %s/%s: %v", podObj.Namespace, podObj.Name, err)
 		return
 	}
-	// Retry transient errors with client-go backoff (terminal NotFound/Forbidden/
-	// Invalid skipped). The Patch is idempotent (merge-patch traffic-drained=true);
-	// on success SetPodDrained below makes the next scrape cycle short-circuit.
+	// Retry transient errors with client-go backoff (terminal NotFound/Forbidden/Invalid
+	// skipped). Idempotent merge-patch; SetPodDrained below short-circuits the next scrape.
 	patchErr := retry.OnError(retry.DefaultRetry, func(e error) bool {
 		return !apierrors.IsNotFound(e) && !apierrors.IsForbidden(e) && !apierrors.IsInvalid(e)
 	}, func() error {
@@ -1230,10 +1219,8 @@ func (s *store) GetPrefillPodsForDecodeGroup(modelServerName types.NamespacedNam
 	return prefillPods, nil
 }
 
-// getDecodePodsForPrefillPod returns the decode pods paired with the given
-// prefill pod, across every modelServer the pod belongs to (a pod may belong to
-// several). Results are deduplicated. Returns nil if the pod is not a prefill
-// pod in any modelServer, so calling on a decode or non-PD pod is safe.
+// getDecodePodsForPrefillPod returns decode pods paired with the given prefill
+// pod across all its modelServers (deduplicated). Nil if not a prefill pod.
 func (s *store) getDecodePodsForPrefillPod(pod *PodInfo) []types.NamespacedName {
 	modelServers := pod.GetModelServers()
 	if modelServers == nil || modelServers.Len() == 0 {
@@ -1353,9 +1340,8 @@ func (s *store) AppendModelServerToPod(pod *corev1.Pod, modelServers []*aiv1alph
 	return nil
 }
 
-// SetPodDraining marks a pod as draining (lossless upgrade). The pod remains in
-// the store so in-flight requests can finish and decrement; it is only excluded
-// from scheduling candidates via IsDraining checks in the query methods.
+// SetPodDraining marks a pod as draining: it stays in the store (in-flight still
+// tracked) but is excluded from scheduling candidates via IsDraining checks.
 func (s *store) SetPodDraining(podName types.NamespacedName, draining bool) {
 	if value, ok := s.pods.Load(podName); ok {
 		value.(*PodInfo).SetDraining(draining)
@@ -2283,9 +2269,8 @@ func (p *PodInfo) IsDraining() bool {
 	return p.draining.Load()
 }
 
-// SetPodDrained marks the in-memory pod object with traffic-drained so the
-// scrape loop does not re-patch it (PodInfo.Pod is not refreshed by the API
-// server until an informer update arrives).
+// SetPodDrained marks the in-memory pod with traffic-drained so the scrape loop
+// does not re-patch it (PodInfo.Pod isn't refreshed until an informer update).
 func (p *PodInfo) SetPodDrained() {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()

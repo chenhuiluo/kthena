@@ -3131,9 +3131,8 @@ func TestPodInfoDrainingExcludesFromCandidates(t *testing.T) {
 	assert.Len(t, got, 2)
 }
 
-// TestMarkPodDrainedIfZero verifies the store.Run drain check patches
-// traffic-drained=true onto a draining pod only when its engine in-flight
-// metrics reach zero.
+// TestMarkPodDrainedIfZero verifies the drain check patches traffic-drained=true
+// onto a draining pod only when its engine in-flight metrics reach zero.
 func TestMarkPodDrainedIfZero(t *testing.T) {
 	kubeClient := kubefake.NewSimpleClientset()
 	s := New(WithKubeClient(kubeClient)).(*store)
@@ -3196,9 +3195,8 @@ func TestMarkPodDrainedIfZeroNoKubeClient(t *testing.T) {
 	assert.NotPanics(t, func() { s.markPodDrainedIfZero(context.Background(), pi) })
 }
 
-// pdTestModelServer builds a PD-disaggregated ModelServer (prefill+decode
-// roles distinguished by labels, grouped by a group-key label) and registers it
-// with the store. Helper for the PD drain tests below.
+// pdTestModelServer builds a PD-disaggregated ModelServer (prefill+decode roles by
+// labels, grouped by a group-key label) and registers it with the store.
 func pdTestModelServer(t *testing.T, s *store) *aiv1alpha1.ModelServer {
 	t.Helper()
 	ms := &aiv1alpha1.ModelServer{
@@ -3217,8 +3215,7 @@ func pdTestModelServer(t *testing.T, s *store) *aiv1alpha1.ModelServer {
 }
 
 // pdTestPod builds a PD pod with the given role and group value, creates it in
-// the fake clientset, registers it with the store (which categorizes it into the
-// PDGroup), and returns its PodInfo.
+// the fake clientset, registers it with the store, and returns its PodInfo.
 func pdTestPod(t *testing.T, s *store, ms *aiv1alpha1.ModelServer, name, role string) *PodInfo {
 	t.Helper()
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
@@ -3257,8 +3254,7 @@ func countDrainPatches(s *store) int {
 }
 
 // TestMarkPodDrainedIfZero_PDPrefill_WaitsForDrainingDecode: under
-// ServingGroupRollingUpdate the whole group drains, so a prefill Pod must wait
-// for its paired (also-draining) decode Pod to reach zero in-flight.
+// ServingGroupRollingUpdate a prefill Pod waits for its paired decode to reach zero.
 func TestMarkPodDrainedIfZero_PDPrefill_WaitsForDrainingDecode(t *testing.T) {
 	kubeClient := kubefake.NewSimpleClientset()
 	s := New(WithKubeClient(kubeClient)).(*store)
@@ -3282,9 +3278,7 @@ func TestMarkPodDrainedIfZero_PDPrefill_WaitsForDrainingDecode(t *testing.T) {
 }
 
 // TestMarkPodDrainedIfZero_PDPrefill_DecodeNotDraining_DrainsOnOwnMetrics: under
-// RoleRollingUpdate only the prefill role drains; the paired decode keeps
-// serving new requests and never reaches zero, so it is skipped and the prefill
-// drains on its own metrics.
+// RoleRollingUpdate only the prefill drains; the paired decode is skipped.
 func TestMarkPodDrainedIfZero_PDPrefill_DecodeNotDraining_DrainsOnOwnMetrics(t *testing.T) {
 	kubeClient := kubefake.NewSimpleClientset()
 	s := New(WithKubeClient(kubeClient)).(*store)
