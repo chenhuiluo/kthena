@@ -9176,7 +9176,53 @@ func TestDeleteServingGroupDrainGate(t *testing.T) {
 	})
 }
 
-// TestPatchTrafficDrainingRetriesThenForceDeletes verifies that when patching
+// TestDrainingStatusNotFlippedToRunning verifies the state-machine fix for the
+// review bug where UpdateModelServingStatus (reconcile step 5) flipped a
+// Draining/Deleting ServingGroup back to Running, causing drain Phase 1 to
+// re-enter forever and never reach Phase 2. It calls the real aggregation with a
+// ready group so the buggy branch (checkServingGroupReady -> Running) would
+// fire without the fix.
+func TestDrainingStatusNotFlippedToRunning(t *testing.T) {
+	ms := createStandardModelServing("ms-drain-statemachine", 1, 1)
+	h := newTestController(t, ms)
+	controller := h.controller
+	drainWorkqueue(t, controller.workqueue)
+	nsn := utils.GetNamespaceName(ms)
+	sgName := ms.Name + "-0"
+	roleID := utils.GenerateRoleID("prefill", 0)
+	controller.SetDrainTimeout(5 * time.Minute)
+
+	// Build a Running group with a Running role so checkServingGroupReady is true.
+	controller.store.AddServingGroup(nsn, 0, "rev-1")
+	controller.store.UpdateServingGroupStatus(nsn, sgName, datastore.ServingGroupRunning)
+	controller.store.AddRole(nsn, sgName, "prefill", roleID, "rev-1", "hash")
+	controller.store.UpdateRoleStatus(nsn, sgName, "prefill", roleID, datastore.RoleRunning)
+
+	// Simulate drain Phase 1: the group is now Draining (role still Running).
+	require.NoError(t, controller.store.UpdateServingGroupStatus(nsn, sgName, datastore.ServingGroupDraining))
+	require.Equal(t, datastore.ServingGroupDraining, controller.store.GetServingGroupStatus(nsn, sgName))
+
+	// Re-run the status aggregation (reconcile step 5). Before the fix this
+	// flipped the group back to Running because checkServingGroupReady was true.
+	require.NoError(t, controller.UpdateModelServingStatus(ms, "rev-1"))
+	require.Equal(t, datastore.ServingGroupDraining, controller.store.GetServingGroupStatus(nsn, sgName),
+		"UpdateModelServingStatus must not flip a Draining group back to Running")
+
+	// Deleting must also be preserved by the aggregation.
+	require.NoError(t, controller.store.UpdateServingGroupStatus(nsn, sgName, datastore.ServingGroupDeleting))
+	require.NoError(t, controller.UpdateModelServingStatus(ms, "rev-1"))
+	require.Equal(t, datastore.ServingGroupDeleting, controller.store.GetServingGroupStatus(nsn, sgName),
+		"UpdateModelServingStatus must not flip a Deleting group back to Running")
+
+	// drainServingGroupGate must not flip a Deleting group back to Draining
+	// (the reverse-direction oscillation fix).
+	handled, err := controller.drainServingGroupGate(context.Background(), ms, sgName, datastore.ServingGroupDeleting)
+	require.NoError(t, err)
+	require.False(t, handled, "drain gate must let a Deleting group proceed (handled=false)")
+	require.Equal(t, datastore.ServingGroupDeleting, controller.store.GetServingGroupStatus(nsn, sgName),
+		"drain gate must not flip a Deleting group back to Draining")
+}
+
 // traffic-draining fails after retries, the pod is force-deleted (so the router
 // drops its traffic via DeletionTimestamp) instead of being left to time out.
 func TestPatchTrafficDrainingRetriesThenForceDeletes(t *testing.T) {
