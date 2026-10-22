@@ -1152,7 +1152,9 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 		klog.Errorf("manageRoleReplicasPerGroup: failed to parse partition for role %s: %v", targetRole.Name, partitionErr)
 	}
 	for index, roleObj := range roleList {
-		if roleObj.Status == datastore.RoleDeleting {
+		// Skip roles being deleted or drained-for-deletion: a Draining role is
+		// pending removal, so do not recreate its missing pods.
+		if roleObj.Status == datastore.RoleDeleting || roleObj.Status == datastore.RoleDraining {
 			continue
 		}
 		roleIDValue := fmt.Sprintf("%s/%s/%s/%s", ms.Namespace, groupName, targetRole.Name, roleObj.Name)
@@ -1221,19 +1223,16 @@ func (c *ModelServingController) hasUpdateableOutdatedRole(
 	return false
 }
 
-// sgHasOutdatedRole reports whether a ServingGroup has any outdated role replica
-// (template hash differs from the spec) across its roleSpecs. Inspects per-role
-// hashes rather than SG.Revision, which can be rebuilt to the new revision on
-// restart before all roles are updated. Partition-protected and Deleting roles
-// are skipped, matching hasUpdateableOutdatedRole semantics.
-func (c *ModelServingController) sgHasOutdatedRole(
+// servingGroupHasOutdatedRole reports whether a ServingGroup has any outdated
+// role replica (template hash differs from spec). Uses per-role hashes, not SG.Revision.
+func (c *ModelServingController) servingGroupHasOutdatedRole(
 	ms *workloadv1alpha1.ModelServing,
 	sg datastore.ServingGroup,
 ) bool {
 	for _, roleSpec := range ms.Spec.Template.Roles {
 		roleList, err := c.store.GetRoleList(utils.GetNamespaceName(ms), sg.Name, roleSpec.Name)
 		if err != nil {
-			klog.Errorf("sgHasOutdatedRole: failed to get roles for role %s in ServingGroup %s: %v", roleSpec.Name, sg.Name, err)
+			klog.Errorf("servingGroupHasOutdatedRole: failed to get roles for role %s in ServingGroup %s: %v", roleSpec.Name, sg.Name, err)
 			continue
 		}
 		if c.hasUpdateableOutdatedRole(ms, sg.Name, roleSpec, roleList) {
@@ -1334,9 +1333,8 @@ func (c *ModelServingController) DeleteRole(ctx context.Context, ms *workloadv1a
 		return
 	}
 
-	// Lossless upgrade: drain in-flight requests before deleting. When the gate
-	// handles the request (drain in progress or just initiated), return now;
-	// the ModelServing is re-enqueued to re-check drain completion.
+	// Lossless upgrade: drain in-flight before deleting. When the gate handles
+	// the request (drain in progress), return now; the ModelServing is re-enqueued.
 	if handled, err := c.drainRoleGate(ctx, ms, groupName, roleName, roleID, roleStatus); err != nil {
 		klog.Errorf("drain gate failed for role %s/%s: %v", roleName, roleID, err)
 		return
@@ -1439,12 +1437,10 @@ func (c *ModelServingController) manageRollingUpdate(ctx context.Context, ms *wo
 
 	newServingGroupUnavailableCount := 0
 	// RoleRollingUpdate judges outdated per-role by hash; SG.Revision may be
-	// rebuilt to the new revision on restart before all roles update, so a group
-	// still containing old-revision roles must still be treated as outdated.
-	// ServingGroupRollingUpdate replaces whole groups and keeps the SG.Revision check.
+	// rebuilt to the new revision on restart before all roles update.
 	isRoleRollingUpdate := ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.Type == workloadv1alpha1.RoleRollingUpdate
 	for _, sg := range groupsAfterPartition {
-		roleOutdated := isRoleRollingUpdate && c.sgHasOutdatedRole(ms, sg)
+		roleOutdated := isRoleRollingUpdate && c.servingGroupHasOutdatedRole(ms, sg)
 		if sg.Status != datastore.ServingGroupRunning {
 			if sg.Revision == revision && !roleOutdated {
 				newServingGroupUnavailableCount++
@@ -1764,7 +1760,9 @@ func (c *ModelServingController) handleReadyPod(ms *workloadv1alpha1.ModelServin
 		klog.Warningf("failed to check role %s/%s readiness, skipping role status update: %v", roleName, roleID, err)
 	} else if roleReady {
 		currentRoleStatus := c.store.GetRoleStatus(utils.GetNamespaceName(ms), servingGroupName, roleName, roleID)
-		if currentRoleStatus != datastore.RoleRunning && currentRoleStatus != datastore.RoleDeleting {
+		// Do not overwrite a Draining role (drain gate owns it); otherwise a
+		// pod-ready event during drain re-enters drain Phase 1 and never Phase 2.
+		if currentRoleStatus != datastore.RoleRunning && currentRoleStatus != datastore.RoleDeleting && currentRoleStatus != datastore.RoleDraining {
 			if err := c.store.UpdateRoleStatus(utils.GetNamespaceName(ms), servingGroupName, roleName, roleID, datastore.RoleRunning); err != nil {
 				klog.Warningf("failed to update role %s/%s status to Running: %v", roleName, roleID, err)
 			} else {
@@ -1782,6 +1780,12 @@ func (c *ModelServingController) handleReadyPod(ms *workloadv1alpha1.ModelServin
 		return fmt.Errorf("failed to check ServingGroup status, err: %v", err)
 	}
 	if ready {
+		// Do not overwrite a Draining/Deleting group: those are owned by the
+		// drain gate. A pod-ready event during drain would re-enter Phase 1.
+		currentStatus := c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName)
+		if currentStatus == datastore.ServingGroupDraining || currentStatus == datastore.ServingGroupDeleting {
+			return nil
+		}
 		// All pods in the ServingGroup are running, so the ServingGroup status also needs to be set to running
 		err = c.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName, datastore.ServingGroupRunning)
 		klog.V(4).Infof("ServingGroup: %s/%s status updated to Running", ms.GetName(), servingGroupName)
@@ -2351,11 +2355,9 @@ func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.M
 			if group.Revision != "" {
 				referencedRevisions = append(referencedRevisions, group.Revision)
 			}
-			if group.Status == datastore.ServingGroupDeleting {
-				// Scaling -> Running or
-				// Creating -> Running
-				// No Deleting -> Running.
-				// So directly add deleting groups to progressingGroups
+			if group.Status == datastore.ServingGroupDeleting || group.Status == datastore.ServingGroupDraining {
+				// Deleting and Draining are owned by the drain gate; overwriting
+				// them to Running here re-enters drain Phase 1 forever (never Phase 2).
 				progressingGroups = append(progressingGroups, ordinal)
 				continue
 			}
@@ -2708,7 +2710,9 @@ func (c *ModelServingController) syncHeadlessServices(ctx context.Context, ms *w
 			}
 
 			for _, roleObj := range roleList {
-				if roleObj.Status == datastore.RoleDeleting {
+				// Skip roles being deleted or drained-for-deletion: a Draining
+				// role is pending removal, so do not (re)create its headless service.
+				if roleObj.Status == datastore.RoleDeleting || roleObj.Status == datastore.RoleDraining {
 					continue
 				}
 
@@ -2869,12 +2873,8 @@ func (c *ModelServingController) createPod(
 	return nil
 }
 
-// patchTrafficDraining annotates pods with traffic-draining=<RFC3339 timestamp>
-// so the router stops sending them new traffic (lossless upgrade). The timestamp
-// lets the controller bound the drain wait (drainTimeout). Retries transient
-// errors with client-go backoff (terminal NotFound/Forbidden/Invalid skipped);
-// pods that still fail are returned for force-delete (K8s DeletionTimestamp
-// removes them from scheduling).
+// patchTrafficDraining annotates pods with traffic-draining=<RFC3339 ts> so the
+// router stops new traffic. Retries transient errors; failed pods are force-deleted.
 func (c *ModelServingController) patchTrafficDraining(ctx context.Context, pods []*corev1.Pod) []*corev1.Pod {
 	now := time.Now().Format(time.RFC3339)
 	patch, err := json.Marshal(map[string]interface{}{
@@ -2910,11 +2910,8 @@ func (c *ModelServingController) patchTrafficDraining(ctx context.Context, pods 
 	return failed
 }
 
-// forceDeletePods deletes the given pods by name, used when traffic-draining
-// annotation could not be applied (apiserver persisted failures). K8s deletion
-// sets DeletionTimestamp, which the router observes and removes the pod from
-// scheduling — so traffic is still removed, and preStop/gracePeriod drains the
-// in-flight requests as a fallback.
+// forceDeletePods deletes pods by name (used when traffic-draining could not be
+// applied). K8s DeletionTimestamp removes them from scheduling; preStop drains.
 func (c *ModelServingController) forceDeletePods(ctx context.Context, ms *workloadv1alpha1.ModelServing, pods []*corev1.Pod) {
 	for _, pod := range pods {
 		// On NotFound the pod is already gone — nothing to force.
@@ -2935,10 +2932,8 @@ func allPodsDrained(pods []*corev1.Pod) bool {
 	return true
 }
 
-// drainServingGroupGate implements the two-phase drain for ServingGroup deletion.
-// Returns (handled, error): when handled is true the caller returns immediately
-// (drain in progress or just initiated). When handled is false, drain has
-// completed (or is disabled) and the caller proceeds with the original deletion.
+// drainServingGroupGate implements the two-phase drain for ServingGroup
+// deletion. Returns (handled, error): true = drain in progress, caller returns.
 func (c *ModelServingController) drainServingGroupGate(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupName string, currentStatus datastore.ServingGroupStatus) (bool, error) {
 	// drainTimeout == 0 disables lossless drain; proceed to immediate deletion.
 	if c.drainTimeout == 0 {
@@ -2946,6 +2941,11 @@ func (c *ModelServingController) drainServingGroupGate(ctx context.Context, ms *
 	}
 
 	msName := utils.GetNamespaceName(ms)
+	// A Deleting group already drained; don't flip it back to Draining (would
+	// oscillate). Return false to let deleteServingGroup retry deletion.
+	if currentStatus == datastore.ServingGroupDeleting {
+		return false, nil
+	}
 	if currentStatus != datastore.ServingGroupDraining {
 		// Phase 1: mark draining and annotate pods, then requeue.
 		if err := c.store.UpdateServingGroupStatus(msName, servingGroupName, datastore.ServingGroupDraining); err != nil {
@@ -3043,9 +3043,7 @@ func (c *ModelServingController) drainRoleGate(ctx context.Context, ms *workload
 }
 
 // drainingTimedOut reports whether the drain wait has exceeded drainTimeout.
-// The drain start time is read from the first draining pod's annotation
-// (set by patchTrafficDraining is a single batch, so they start together).
-// When the group/role has no pods left to inspect, it returns false.
+// Drain start is read from the first draining pod's traffic-draining timestamp.
 func (c *ModelServingController) drainingTimedOut(ms *workloadv1alpha1.ModelServing, servingGroupName, roleName, roleID string) bool {
 	var indexName, indexValue string
 	if roleName != "" {
@@ -3082,9 +3080,8 @@ func (c *ModelServingController) deleteServingGroup(ctx context.Context, ms *wor
 		return nil
 	}
 
-	// Lossless upgrade: drain in-flight requests before deleting. When the gate
-	// handles the request (drain in progress or just initiated), return now;
-	// the ModelServing is re-enqueued to re-check drain completion.
+	// Lossless upgrade: drain in-flight before deleting. When the gate handles
+	// the request (drain in progress), return now; the ModelServing is re-enqueued.
 	if handled, err := c.drainServingGroupGate(ctx, ms, servingGroupName, status); err != nil {
 		return err
 	} else if handled {
