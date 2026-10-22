@@ -6859,7 +6859,7 @@ func TestDeleteRoleRollbackOnFailure(t *testing.T) {
 
 			startAction := len(client.Actions())
 
-			controller.DeleteRole(context.Background(), ms, groupName, roleName, roleID)
+			controller.DeleteRole(context.Background(), ms, groupName, roleName, roleID, false)
 
 			finalStatus := controller.store.GetRoleStatus(nsn, groupName, roleName, roleID)
 			assert.Equal(t, tt.expectedFinalStatus, finalStatus)
@@ -7392,7 +7392,7 @@ func TestDeleteServingGroupRollbackOnFailure(t *testing.T) {
 			startAction := len(client.Actions())
 			startVolcanoAction := len(volcanoClient.Actions())
 
-			err = controller.deleteServingGroup(context.Background(), ms, sgName)
+			err = controller.deleteServingGroup(context.Background(), ms, sgName, false)
 			if tt.expectError {
 				assert.Error(t, err)
 			} else {
@@ -9116,6 +9116,9 @@ func TestDeleteServingGroupDrainGate(t *testing.T) {
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 			Name: "drain-pod", Namespace: "default",
 			Labels: map[string]string{workloadv1alpha1.GroupNameLabelKey: sgName},
+		}, Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
 		}}
 		_, err = client.CoreV1().Pods("default").Create(context.TODO(), pod, metav1.CreateOptions{})
 		assert.NoError(t, err)
@@ -9128,7 +9131,7 @@ func TestDeleteServingGroupDrainGate(t *testing.T) {
 		controller, client, ms, sgName, _ := makeController(t, 5*time.Minute)
 		nsn := utils.GetNamespaceName(ms)
 
-		err := controller.deleteServingGroup(context.Background(), ms, sgName)
+		err := controller.deleteServingGroup(context.Background(), ms, sgName, false)
 		assert.NoError(t, err)
 		// Drain phase: status is Draining, not Deleting; pod still exists.
 		assert.Equal(t, datastore.ServingGroupDraining, controller.store.GetServingGroupStatus(nsn, sgName))
@@ -9145,7 +9148,7 @@ func TestDeleteServingGroupDrainGate(t *testing.T) {
 		nsn := utils.GetNamespaceName(ms)
 
 		// Phase 1: initiate drain.
-		assert.NoError(t, controller.deleteServingGroup(context.Background(), ms, sgName))
+		assert.NoError(t, controller.deleteServingGroup(context.Background(), ms, sgName, false))
 		assert.Equal(t, datastore.ServingGroupDraining, controller.store.GetServingGroupStatus(nsn, sgName))
 
 		// Simulate router writing traffic-drained onto the pod (in cache + client).
@@ -9160,7 +9163,7 @@ func TestDeleteServingGroupDrainGate(t *testing.T) {
 		drainWorkqueue(t, controller.workqueue)
 
 		// Phase 2: gate sees all drained, proceeds to delete.
-		err = controller.deleteServingGroup(context.Background(), ms, sgName)
+		err = controller.deleteServingGroup(context.Background(), ms, sgName, false)
 		assert.NoError(t, err)
 		assert.Equal(t, datastore.ServingGroupDeleting, controller.store.GetServingGroupStatus(nsn, sgName))
 	})
@@ -9169,7 +9172,7 @@ func TestDeleteServingGroupDrainGate(t *testing.T) {
 		controller, _, ms, sgName, _ := makeController(t, 0)
 		nsn := utils.GetNamespaceName(ms)
 
-		err := controller.deleteServingGroup(context.Background(), ms, sgName)
+		err := controller.deleteServingGroup(context.Background(), ms, sgName, false)
 		assert.NoError(t, err)
 		// drainTimeout=0: goes straight to Deleting, no Draining phase.
 		assert.Equal(t, datastore.ServingGroupDeleting, controller.store.GetServingGroupStatus(nsn, sgName))
@@ -9248,6 +9251,9 @@ func TestPatchTrafficDrainingRetriesThenForceDeletes(t *testing.T) {
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name: "p", Namespace: "default",
 		Labels: map[string]string{workloadv1alpha1.GroupNameLabelKey: sgName},
+	}, Status: corev1.PodStatus{
+		Phase:      corev1.PodRunning,
+		Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
 	}}
 	_, err = client.CoreV1().Pods("default").Create(context.TODO(), pod, metav1.CreateOptions{})
 	assert.NoError(t, err)
@@ -9255,7 +9261,7 @@ func TestPatchTrafficDrainingRetriesThenForceDeletes(t *testing.T) {
 	drainWorkqueue(t, controller.workqueue)
 
 	// Phase 1: patch fails 3x -> force-delete the pod.
-	err = controller.deleteServingGroup(context.Background(), ms, sgName)
+	err = controller.deleteServingGroup(context.Background(), ms, sgName, false)
 	assert.NoError(t, err)
 
 	// A delete should have been issued for the pod (force-delete on patch failure).

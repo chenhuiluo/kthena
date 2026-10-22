@@ -998,7 +998,7 @@ func (c *ModelServingController) scaleDownRoles(ctx context.Context, ms *workloa
 		target := nonProtectedScores[i]
 		klog.V(2).Infof("Scaling down non-protected role %s (priority: %d, deletion cost: %d, index: %d)",
 			target.Name, target.Priority, target.DeletionCost, target.Index)
-		c.DeleteRole(ctx, ms, groupName, targetRole.Name, target.Name)
+		c.DeleteRole(ctx, ms, groupName, targetRole.Name, target.Name, false)
 	}
 
 	// After all non-protected roles are deleted, proceed to delete protected roles if needed
@@ -1011,7 +1011,7 @@ func (c *ModelServingController) scaleDownRoles(ctx context.Context, ms *workloa
 			target := protectedScores[i]
 			klog.V(2).Infof("Scaling down protected role %s (priority: %d, deletion cost: %d, index: %d, partition=%d)",
 				target.Name, target.Priority, target.DeletionCost, target.Index, partition)
-			c.DeleteRole(ctx, ms, groupName, targetRole.Name, target.Name)
+			c.DeleteRole(ctx, ms, groupName, targetRole.Name, target.Name, false)
 		}
 	}
 }
@@ -1320,7 +1320,7 @@ func (c *ModelServingController) getModelServingAndResourceDetails(resource meta
 	return ms, servingGroupName, roleName, roleID
 }
 
-func (c *ModelServingController) DeleteRole(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName, roleName, roleID string) {
+func (c *ModelServingController) DeleteRole(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName, roleName, roleID string, skipDrain bool) {
 	selector := labels.SelectorFromSet(map[string]string{
 		workloadv1alpha1.GroupNameLabelKey: groupName,
 		workloadv1alpha1.RoleLabelKey:      roleName,
@@ -1333,13 +1333,15 @@ func (c *ModelServingController) DeleteRole(ctx context.Context, ms *workloadv1a
 		return
 	}
 
-	// Lossless upgrade: drain in-flight before deleting. When the gate handles
-	// the request (drain in progress), return now; the ModelServing is re-enqueued.
-	if handled, err := c.drainRoleGate(ctx, ms, groupName, roleName, roleID, roleStatus); err != nil {
-		klog.Errorf("drain gate failed for role %s/%s: %v", roleName, roleID, err)
-		return
-	} else if handled {
-		return
+	// Lossless upgrade: drain in-flight before deleting. skipDrain bypasses the
+	// gate for failure-recovery deletes (rebuild immediately).
+	if !skipDrain {
+		if handled, err := c.drainRoleGate(ctx, ms, groupName, roleName, roleID, roleStatus); err != nil {
+			klog.Errorf("drain gate failed for role %s/%s: %v", roleName, roleID, err)
+			return
+		} else if handled {
+			return
+		}
 	}
 
 	err := c.store.UpdateRoleStatus(utils.GetNamespaceName(ms), groupName, roleName, roleID, datastore.RoleDeleting)
@@ -1534,7 +1536,7 @@ func (c *ModelServingController) deleteOutdatedServingGroups(
 	for i := len(groups) - 1; i >= 0 && updateCount < maxScaleDown; i-- {
 		sg := groups[i]
 		klog.V(2).Infof("ServingGroup %s will be terminated for update (status=%s)", sg.Name, sg.Status)
-		if err := c.deleteServingGroup(ctx, ms, sg.Name); err != nil {
+		if err := c.deleteServingGroup(ctx, ms, sg.Name, false); err != nil {
 			return updateCount, err
 		}
 		updateCount++
@@ -1568,7 +1570,7 @@ func (c *ModelServingController) deleteOutdatedRoles(
 		}
 		for _, role := range rolesToDelete {
 			klog.V(2).Infof("Role %s/%s in ServingGroup %s will be terminated for update", role.roleName, role.roleID, sg.Name)
-			c.DeleteRole(ctx, ms, sg.Name, role.roleName, role.roleID)
+			c.DeleteRole(ctx, ms, sg.Name, role.roleName, role.roleID, false)
 		}
 		updateCount++
 	}
@@ -1917,13 +1919,13 @@ func (c *ModelServingController) handleDeletedPod(ms *workloadv1alpha1.ModelServ
 	switch ms.Spec.RecoveryPolicy {
 	case workloadv1alpha1.ServingGroupRecreate:
 		// Rebuild the entire ServingGroup directly
-		if err := c.deleteServingGroup(context.TODO(), ms, servingGroupName); err != nil {
+		if err := c.deleteServingGroup(context.TODO(), ms, servingGroupName, true); err != nil {
 			klog.Errorf("failed to delete ServingGroup %s: %v", servingGroupName, err)
 		}
 	case workloadv1alpha1.RoleRecreate:
 		// If Rolling update in RoleRecreate mode, requires re-entering the queue during the pod delete event.
 		if c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName) == datastore.ServingGroupDeleting {
-			if err := c.deleteServingGroup(context.TODO(), ms, servingGroupName); err != nil {
+			if err := c.deleteServingGroup(context.TODO(), ms, servingGroupName, true); err != nil {
 				klog.Errorf("failed to delete ServingGroup %s: %v", servingGroupName, err)
 			}
 			return nil
@@ -1935,7 +1937,7 @@ func (c *ModelServingController) handleDeletedPod(ms *workloadv1alpha1.ModelServ
 				return fmt.Errorf("failed to set ServingGroup %s status: %v", servingGroupName, err)
 			}
 		}
-		c.DeleteRole(context.Background(), ms, servingGroupName, utils.GetRoleName(pod), utils.GetRoleID(pod))
+		c.DeleteRole(context.Background(), ms, servingGroupName, utils.GetRoleName(pod), utils.GetRoleID(pod), true)
 	case workloadv1alpha1.NoneRestartPolicy:
 		// None: re-enqueue to refill the single missing pod (not the whole role/group).
 		if err := c.markPodUnavailable(ms, servingGroupName, pod); err != nil {
@@ -2655,7 +2657,7 @@ func (c *ModelServingController) scaleDownServingGroups(ctx context.Context, ms 
 		targetGroup := nonProtectedScores[i]
 		klog.V(2).Infof("Scaling down non-protected serving group %s (priority: %d, deletion cost: %d, index: %d)",
 			targetGroup.Name, targetGroup.Priority, targetGroup.DeletionCost, targetGroup.Index)
-		if e := c.deleteServingGroup(ctx, ms, targetGroup.Name); e != nil {
+		if e := c.deleteServingGroup(ctx, ms, targetGroup.Name, false); e != nil {
 			err = append(err, e)
 		}
 	}
@@ -2671,7 +2673,7 @@ func (c *ModelServingController) scaleDownServingGroups(ctx context.Context, ms 
 			targetGroup := protectedScores[i]
 			klog.V(2).Infof("Scaling down protected serving group %s (priority: %d, deletion cost: %d, index: %d, partition=%d)",
 				targetGroup.Name, targetGroup.Priority, targetGroup.DeletionCost, targetGroup.Index, partition)
-			if e := c.deleteServingGroup(ctx, ms, targetGroup.Name); e != nil {
+			if e := c.deleteServingGroup(ctx, ms, targetGroup.Name, false); e != nil {
 				err = append(err, e)
 			}
 		}
@@ -2890,6 +2892,12 @@ func (c *ModelServingController) patchTrafficDraining(ctx context.Context, pods 
 	}
 	var failed []*corev1.Pod
 	for _, pod := range pods {
+		if !utils.IsPodRunningAndReady(pod) {
+			// NotReady: no traffic to drain; force-delete directly (the router
+			// already dropped it; waiting for traffic-drained would hang 5m).
+			failed = append(failed, pod)
+			continue
+		}
 		if _, ok := pod.Annotations[utils.TrafficDrainingAnnotation]; ok {
 			continue // already draining
 		}
@@ -2921,10 +2929,13 @@ func (c *ModelServingController) forceDeletePods(ctx context.Context, ms *worklo
 	}
 }
 
-// allPodsDrained returns true when every pod has the traffic-drained annotation.
-// Pods already gone (in-flight drain completed) are treated as drained.
+// allPodsDrained returns true when every Ready pod has traffic-drained. NotReady
+// pods are skipped (no traffic to drain; the router already dropped them).
 func allPodsDrained(pods []*corev1.Pod) bool {
 	for _, pod := range pods {
+		if !utils.IsPodRunningAndReady(pod) {
+			continue
+		}
 		if _, ok := pod.Annotations[utils.TrafficDrainedAnnotation]; !ok {
 			return false
 		}
@@ -3074,18 +3085,20 @@ func (c *ModelServingController) drainingTimedOut(ms *workloadv1alpha1.ModelServ
 	return time.Since(start) >= c.drainTimeout
 }
 
-func (c *ModelServingController) deleteServingGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupName string) error {
+func (c *ModelServingController) deleteServingGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupName string, skipDrain bool) error {
 	status := c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), servingGroupName)
 	if status == datastore.ServingGroupNotFound {
 		return nil
 	}
 
-	// Lossless upgrade: drain in-flight before deleting. When the gate handles
-	// the request (drain in progress), return now; the ModelServing is re-enqueued.
-	if handled, err := c.drainServingGroupGate(ctx, ms, servingGroupName, status); err != nil {
-		return err
-	} else if handled {
-		return nil
+	// Lossless upgrade: drain in-flight before deleting. skipDrain bypasses the
+	// gate for failure-recovery deletes (rebuild immediately).
+	if !skipDrain {
+		if handled, err := c.drainServingGroupGate(ctx, ms, servingGroupName, status); err != nil {
+			return err
+		} else if handled {
+			return nil
+		}
 	}
 
 	// update ServingGroup status to Deleting before deleting pods and services.
