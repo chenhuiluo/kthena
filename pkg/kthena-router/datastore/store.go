@@ -369,6 +369,10 @@ type PodInfo struct {
 	// draining is set when the pod is annotated traffic-draining: the router
 	// stops scheduling new requests to it but keeps PodInfo for in-flight to finish.
 	draining atomic.Bool
+	// drained is set once the router has patched traffic-drained onto the pod,
+	// so the scrape loop does not re-patch it. Lock-free like draining; never
+	// writes into the informer-cached Pod.Annotations (which is read concurrently).
+	drained atomic.Bool
 
 	mutex sync.RWMutex // Protects concurrent access to Pod, engine, metrics, models and modelServer fields
 	// Protected fields - use accessor methods for thread-safe access
@@ -683,12 +687,14 @@ func (s *store) markPodDrainedIfZero(ctx context.Context, pod *PodInfo) {
 	if podObj == nil {
 		return
 	}
-	if _, already := podObj.Annotations[workloadv1alpha1.TrafficDrainedAnnotation]; already {
+	if pod.IsDrained() {
 		return
 	}
-	// Only drain when the engine has no running or waiting requests. Scrape
-	// failure leaves the previous (non-zero) values, so this never falsely fires.
-	if pod.GetRequestRunningNum() != 0 || pod.GetRequestWaitingNum() != 0 {
+	// Only drain when there is no in-flight work. Require both the engine
+	// (running/waiting) and the router's local onFlight to be zero: a request the
+	// router has dispatched but the engine has not admitted yet (still in the HTTP
+	// path or tokenization) shows onFlight>0 while running/waiting are 0.
+	if pod.GetRequestRunningNum() != 0 || pod.GetRequestWaitingNum() != 0 || pod.GetOnFlightRequestNum() != 0 {
 		return
 	}
 
@@ -722,7 +728,7 @@ func (s *store) markPodDrainedIfZero(ctx context.Context, pod *PodInfo) {
 		return
 	}
 	// Retry transient errors with client-go backoff (terminal NotFound/Forbidden/Invalid
-	// skipped). Idempotent merge-patch; SetPodDrained below short-circuits the next scrape.
+	// skipped). Idempotent merge-patch; SetDrained below short-circuits the next scrape.
 	patchErr := retry.OnError(retry.DefaultRetry, func(e error) bool {
 		return !apierrors.IsNotFound(e) && !apierrors.IsForbidden(e) && !apierrors.IsInvalid(e)
 	}, func() error {
@@ -735,9 +741,8 @@ func (s *store) markPodDrainedIfZero(ctx context.Context, pod *PodInfo) {
 		klog.Errorf("failed to patch traffic-drained on pod %s/%s after retries: %v", podObj.Namespace, podObj.Name, patchErr)
 		return
 	}
-	// In-memory mark so the next scrape cycle skips the patch (PodInfo.Pod isn't
-	// refreshed by the API server until an informer update arrives).
-	pod.SetPodDrained()
+	// In-memory mark so the next scrape cycle skips re-patching.
+	pod.SetDrained()
 	klog.V(2).Infof("Pod %s/%s drained (in-flight zero), annotated traffic-drained", podObj.Namespace, podObj.Name)
 }
 
@@ -2269,18 +2274,15 @@ func (p *PodInfo) IsDraining() bool {
 	return p.draining.Load()
 }
 
-// SetPodDrained marks the in-memory pod with traffic-drained so the scrape loop
-// does not re-patch it (PodInfo.Pod isn't refreshed until an informer update).
-func (p *PodInfo) SetPodDrained() {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	if p.Pod == nil {
-		return
-	}
-	if p.Pod.Annotations == nil {
-		p.Pod.Annotations = map[string]string{}
-	}
-	p.Pod.Annotations[workloadv1alpha1.TrafficDrainedAnnotation] = "true"
+// SetDrained marks that the router has patched traffic-drained onto the pod, so
+// the scrape loop does not re-patch it. Lock-free; does not touch Pod.Annotations.
+func (p *PodInfo) SetDrained() {
+	p.drained.Store(true)
+}
+
+// IsDrained reports whether the router has already patched traffic-drained.
+func (p *PodInfo) IsDrained() bool {
+	return p.drained.Load()
 }
 
 // GetTPOT returns the time per output token
