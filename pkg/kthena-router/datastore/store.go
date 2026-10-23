@@ -702,8 +702,8 @@ func (s *store) markPodDrainedIfZero(ctx context.Context, pod *PodInfo) {
 		return
 	}
 
-	// PD: a prefill Pod also needs every paired draining decode at zero — decode
-	// at zero means its KV was delivered/pulled. Non-draining decodes are skipped.
+	// PD: a prefill Pod also needs every paired decode at zero (draining or not).
+	// NIXL/Mooncake are pull-based: a non-draining decode may still pull prefill KV.
 	if decodePodNames := s.getDecodePodsForPrefillPod(pod); len(decodePodNames) > 0 {
 		for _, decodePodName := range decodePodNames {
 			dpValue, ok := s.pods.Load(decodePodName)
@@ -711,11 +711,8 @@ func (s *store) markPodDrainedIfZero(ctx context.Context, pod *PodInfo) {
 				continue // paired decode already deleted
 			}
 			decodePod := dpValue.(*PodInfo)
-			if !decodePod.IsDraining() {
-				continue // not draining: still serving new requests
-			}
-			if decodePod.GetRequestRunningNum() != 0 || decodePod.GetRequestWaitingNum() != 0 {
-				return // paired draining decode still has in-flight
+			if decodePod.GetRequestRunningNum() != 0 || decodePod.GetRequestWaitingNum() != 0 || decodePod.GetOnFlightRequestNum() != 0 {
+				return // paired decode still has in-flight
 			}
 		}
 	}
