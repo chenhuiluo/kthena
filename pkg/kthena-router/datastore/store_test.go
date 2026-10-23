@@ -3277,9 +3277,9 @@ func TestMarkPodDrainedIfZero_PDPrefill_WaitsForDrainingDecode(t *testing.T) {
 	assert.Equal(t, 1, countDrainPatches(s), "prefill not drained after paired decode zero")
 }
 
-// TestMarkPodDrainedIfZero_PDPrefill_DecodeNotDraining_DrainsOnOwnMetrics: under
-// RoleRollingUpdate only the prefill drains; the paired decode is skipped.
-func TestMarkPodDrainedIfZero_PDPrefill_DecodeNotDraining_DrainsOnOwnMetrics(t *testing.T) {
+// TestMarkPodDrainedIfZero_PDPrefill_DecodeNotDraining_WaitsForDecode: a paired
+// decode is checked whether or not it is draining (NIXL pull may pull prefill KV).
+func TestMarkPodDrainedIfZero_PDPrefill_DecodeNotDraining_WaitsForDecode(t *testing.T) {
 	kubeClient := kubefake.NewSimpleClientset()
 	s := New(WithKubeClient(kubeClient)).(*store)
 	ms := pdTestModelServer(t, s)
@@ -3291,8 +3291,14 @@ func TestMarkPodDrainedIfZero_PDPrefill_DecodeNotDraining_DrainsOnOwnMetrics(t *
 	setMetrics(prefill, 0, 0)
 	setMetrics(decode, 3, 0)
 
+	// decode has in-flight: prefill must NOT be drained even though decode is not draining.
 	s.markPodDrainedIfZero(context.Background(), prefill)
-	assert.Equal(t, 1, countDrainPatches(s), "prefill should drain on own metrics when decode not draining")
+	assert.Equal(t, 0, countDrainPatches(s), "prefill must wait for paired decode even when decode is not draining")
+
+	// decode reaches zero: prefill is now drained.
+	setMetrics(decode, 0, 0)
+	s.markPodDrainedIfZero(context.Background(), prefill)
+	assert.Equal(t, 1, countDrainPatches(s), "prefill should drain once paired decode reaches zero")
 }
 
 // TestMarkPodDrainedIfZero_PDDecode_OriginalLogic: a decode Pod is the last stage
@@ -3333,7 +3339,7 @@ func TestMarkPodDrainedIfZero_NonPDPod_OriginalLogic(t *testing.T) {
 }
 
 // TestMarkPodDrainedIfZero_PDPrefill_MixedDrainingDecodes: with two paired
-// decodes, only the draining one is waited for; a non-draining decode is skipped.
+// decodes, both are waited for (draining or not). NIXL pull may pull from either.
 func TestMarkPodDrainedIfZero_PDPrefill_MixedDrainingDecodes(t *testing.T) {
 	kubeClient := kubefake.NewSimpleClientset()
 	s := New(WithKubeClient(kubeClient)).(*store)
@@ -3347,14 +3353,21 @@ func TestMarkPodDrainedIfZero_PDPrefill_MixedDrainingDecodes(t *testing.T) {
 	// decode-1 NOT draining
 	setMetrics(prefill, 0, 0)
 	setMetrics(decodeA, 1, 0)
-	setMetrics(decodeB, 5, 0) // not draining, must be ignored
+	setMetrics(decodeB, 5, 0) // not draining, but still checked
 
+	// decode-A busy: prefill must NOT drain.
 	s.markPodDrainedIfZero(context.Background(), prefill)
-	assert.Equal(t, 0, countDrainPatches(s), "prefill drained while draining decode-A busy")
+	assert.Equal(t, 0, countDrainPatches(s), "prefill drained while decode-A busy")
 
+	// decode-A reaches zero, but decode-B still busy: prefill still must NOT drain.
 	setMetrics(decodeA, 0, 0)
 	s.markPodDrainedIfZero(context.Background(), prefill)
-	assert.Equal(t, 1, countDrainPatches(s), "prefill should drain once draining decode-A is zero (decode-B ignored)")
+	assert.Equal(t, 0, countDrainPatches(s), "prefill must wait for decode-B too (drain state irrelevant)")
+
+	// both decodes zero: prefill drains.
+	setMetrics(decodeB, 0, 0)
+	s.markPodDrainedIfZero(context.Background(), prefill)
+	assert.Equal(t, 1, countDrainPatches(s), "prefill should drain once both paired decodes are zero")
 }
 
 // TestMarkPodDrainedIfZero_PDPrefill_DecodePodDeletedFromStore: a paired decode
