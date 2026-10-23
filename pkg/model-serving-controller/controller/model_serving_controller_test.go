@@ -9107,7 +9107,17 @@ func TestDeleteServingGroupDrainGate(t *testing.T) {
 		controller.podGroupManager = &fakePodGroupManager{deleteFunc: podgroupmanager.NewManager(client, volcanoClient, apiextClient, nil).DeletePodGroup}
 		controller.SetDrainTimeout(drainTimeout)
 
-		ms := &workloadv1alpha1.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "drain-ms", Namespace: "default"}}
+		ms := &workloadv1alpha1.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "drain-ms", Namespace: "default"},
+			Spec: workloadv1alpha1.ModelServingSpec{
+				Replicas: ptr.To(int32(1)),
+				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+					Type: workloadv1alpha1.ServingGroupRollingUpdate,
+					RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{
+						MaxSurge:       ptr.To(intstr.FromInt(1)),
+						MaxUnavailable: ptr.To(intstr.FromInt(0)),
+					},
+				},
+			}}
 		sgName := "drain-ms-0"
 		nsn := utils.GetNamespaceName(ms)
 		controller.store.AddServingGroup(nsn, 0, "rev-1")
@@ -9177,6 +9187,27 @@ func TestDeleteServingGroupDrainGate(t *testing.T) {
 		// drainTimeout=0: goes straight to Deleting, no Draining phase.
 		assert.Equal(t, datastore.ServingGroupDeleting, controller.store.GetServingGroupStatus(nsn, sgName))
 	})
+
+	t.Run("non_maxSurge_rollout_skips_drain", func(t *testing.T) {
+		controller, client, ms, sgName, _ := makeController(t, 5*time.Minute)
+		// A maxUnavailable rollout (no surge) is not lossless: delete directly.
+		ms.Spec.RolloutStrategy = &workloadv1alpha1.RolloutStrategy{
+			Type: workloadv1alpha1.ServingGroupRollingUpdate,
+			RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{
+				MaxUnavailable: ptr.To(intstr.FromInt(2)),
+			},
+		}
+		nsn := utils.GetNamespaceName(ms)
+
+		err := controller.deleteServingGroup(context.Background(), ms, sgName, false)
+		assert.NoError(t, err)
+		// No Draining phase; the pod is never annotated traffic-draining.
+		assert.Equal(t, datastore.ServingGroupDeleting, controller.store.GetServingGroupStatus(nsn, sgName))
+		gotPod, perr := client.CoreV1().Pods("default").Get(context.TODO(), "drain-pod", metav1.GetOptions{})
+		assert.NoError(t, perr)
+		assert.Empty(t, gotPod.Annotations[workloadv1alpha1.TrafficDrainingAnnotation],
+			"non-maxSurge rollout must not annotate traffic-draining")
+	})
 }
 
 // TestDrainingStatusNotFlippedToRunning verifies the state-machine fix for the
@@ -9187,6 +9218,14 @@ func TestDeleteServingGroupDrainGate(t *testing.T) {
 // fire without the fix.
 func TestDrainingStatusNotFlippedToRunning(t *testing.T) {
 	ms := createStandardModelServing("ms-drain-statemachine", 1, 1)
+	// A lossless (maxSurge) rollout so the drain gate reaches the Deleting guard.
+	ms.Spec.RolloutStrategy = &workloadv1alpha1.RolloutStrategy{
+		Type: workloadv1alpha1.ServingGroupRollingUpdate,
+		RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{
+			MaxSurge:       ptr.To(intstr.FromInt(1)),
+			MaxUnavailable: ptr.To(intstr.FromInt(0)),
+		},
+	}
 	h := newTestController(t, ms)
 	controller := h.controller
 	drainWorkqueue(t, controller.workqueue)
@@ -9243,7 +9282,17 @@ func TestPatchTrafficDrainingRetriesThenForceDeletes(t *testing.T) {
 		return true, nil, fmt.Errorf("apiserver unavailable")
 	})
 
-	ms := &workloadv1alpha1.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "ms", Namespace: "default"}}
+	ms := &workloadv1alpha1.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: "ms", Namespace: "default"},
+		Spec: workloadv1alpha1.ModelServingSpec{
+			Replicas: ptr.To(int32(1)),
+			RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+				Type: workloadv1alpha1.ServingGroupRollingUpdate,
+				RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{
+					MaxSurge:       ptr.To(intstr.FromInt(1)),
+					MaxUnavailable: ptr.To(intstr.FromInt(0)),
+				},
+			},
+		}}
 	sgName := "ms-0"
 	controller.store.AddServingGroup(utils.GetNamespaceName(ms), 0, "rev-1")
 	controller.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), sgName, datastore.ServingGroupRunning)
