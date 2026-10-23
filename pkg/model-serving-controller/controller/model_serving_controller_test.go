@@ -9208,6 +9208,32 @@ func TestDeleteServingGroupDrainGate(t *testing.T) {
 		assert.Empty(t, gotPod.Annotations[workloadv1alpha1.TrafficDrainingAnnotation],
 			"non-maxSurge rollout must not annotate traffic-draining")
 	})
+
+	t.Run("drain_timeout_forces_delete_without_traffic_drained", func(t *testing.T) {
+		// drainTimeout=1ms so the gate times out immediately when no router
+		// writes traffic-drained (e.g. no ModelServer selects the pod).
+		controller, client, ms, sgName, pod := makeController(t, 1*time.Millisecond)
+		nsn := utils.GetNamespaceName(ms)
+
+		// Phase 1: annotate traffic-draining, set status to Draining.
+		require.NoError(t, controller.deleteServingGroup(context.Background(), ms, sgName, false))
+		require.Equal(t, datastore.ServingGroupDraining, controller.store.GetServingGroupStatus(nsn, sgName))
+
+		// No router writes traffic-drained (the pod is never drained). Wait
+		// past drainTimeout, then re-run the gate: it must force-delete.
+		// Sync the traffic-draining annotation into the informer cache (in a real
+		// cluster the watch does this), so drainingTimedOut can read the timestamp.
+		patched, perr := client.CoreV1().Pods("default").Get(context.TODO(), "drain-pod", metav1.GetOptions{})
+		require.NoError(t, perr)
+		require.NoError(t, controller.podsInformer.GetIndexer().Update(patched))
+		time.Sleep(20 * time.Millisecond)
+		drainWorkqueue(t, controller.workqueue)
+		err := controller.deleteServingGroup(context.Background(), ms, sgName, false)
+		assert.NoError(t, err)
+		assert.Equal(t, datastore.ServingGroupDeleting, controller.store.GetServingGroupStatus(nsn, sgName),
+			"drain gate must force-delete once drainTimeout elapses without traffic-drained")
+		_ = pod
+	})
 }
 
 // TestDrainingStatusNotFlippedToRunning verifies the state-machine fix for the
