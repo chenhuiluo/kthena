@@ -2941,7 +2941,7 @@ func (c *ModelServingController) patchTrafficDraining(ctx context.Context, pods 
 	for _, pod := range pods {
 		if !utils.IsPodRunningAndReady(pod) {
 			// NotReady: no traffic to drain; force-delete directly (the router
-			// already dropped it; waiting for traffic-drained would hang 5m).
+			// already dropped it; waiting for traffic-drained would hang drainTimeout).
 			failed = append(failed, pod)
 			continue
 		}
