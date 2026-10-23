@@ -126,6 +126,53 @@ func (c *ModelServingController) SetDrainTimeout(d time.Duration) {
 	c.drainTimeout = d
 }
 
+// losslessDrainEnabledForServingGroup reports whether lossless drain is on for
+// ServingGroup deletion: drainTimeout>0 and a maxSurge rollout (maxSurge>0, maxUnavailable==0).
+func (c *ModelServingController) losslessDrainEnabledForServingGroup(ms *workloadv1alpha1.ModelServing) bool {
+	if c.drainTimeout == 0 {
+		return false
+	}
+	maxSurge, err := utils.GetMaxSurge(ms)
+	if err != nil || maxSurge <= 0 {
+		return false
+	}
+	maxUnavailable, err := utils.GetMaxUnavailable(ms)
+	if err != nil || maxUnavailable > 0 {
+		return false
+	}
+	return true
+}
+
+// losslessDrainEnabledForRole is the per-Role variant for RoleRollingUpdate,
+// using each Role's own maxSurge/maxUnavailable budget instead of the SG-level one.
+func (c *ModelServingController) losslessDrainEnabledForRole(ms *workloadv1alpha1.ModelServing, roleName string) bool {
+	if c.drainTimeout == 0 {
+		return false
+	}
+	var roleSpec *workloadv1alpha1.Role
+	for i := range ms.Spec.Template.Roles {
+		if ms.Spec.Template.Roles[i].Name == roleName {
+			roleSpec = &ms.Spec.Template.Roles[i]
+			break
+		}
+	}
+	if roleSpec == nil {
+		return false
+	}
+	maxSurge, err := utils.GetMaxSurgeForRole(*roleSpec)
+	if err != nil || maxSurge <= 0 {
+		return false
+	}
+	maxUnavailable, configured, err := utils.GetMaxUnavailableForRole(*roleSpec)
+	if err != nil {
+		return false
+	}
+	if configured && maxUnavailable > 0 {
+		return false
+	}
+	return true
+}
+
 func NewModelServingController(kubeClientSet kubernetes.Interface, modelServingClient clientset.Interface, volcanoClient volcano.Interface, apiextClient apiextClientSet.Interface) (*ModelServingController, error) {
 	selector, err := labels.NewRequirement(workloadv1alpha1.GroupNameLabelKey, selection.Exists, nil)
 	if err != nil {
@@ -2946,8 +2993,8 @@ func allPodsDrained(pods []*corev1.Pod) bool {
 // drainServingGroupGate implements the two-phase drain for ServingGroup
 // deletion. Returns (handled, error): true = drain in progress, caller returns.
 func (c *ModelServingController) drainServingGroupGate(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupName string, currentStatus datastore.ServingGroupStatus) (bool, error) {
-	// drainTimeout == 0 disables lossless drain; proceed to immediate deletion.
-	if c.drainTimeout == 0 {
+	// Only a lossless (maxSurge) rollout drains; otherwise delete immediately.
+	if !c.losslessDrainEnabledForServingGroup(ms) {
 		return false, nil
 	}
 
@@ -3006,7 +3053,8 @@ func (c *ModelServingController) drainServingGroupGate(ctx context.Context, ms *
 
 // drainRoleGate implements the two-phase drain for Role deletion (RoleRollingUpdate).
 func (c *ModelServingController) drainRoleGate(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName, roleName, roleID string, currentStatus datastore.RoleStatus) (bool, error) {
-	if c.drainTimeout == 0 {
+	// Only a lossless (Role maxSurge) rollout drains; otherwise delete immediately.
+	if !c.losslessDrainEnabledForRole(ms, roleName) {
 		return false, nil
 	}
 
