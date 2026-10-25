@@ -30,6 +30,6 @@ type Config struct {
 	AutoscalingSyncPeriodSeconds int
 	// DrainTimeout is the max wait for in-flight requests to drain before
 	// deleting a pod during lossless upgrade. 0 disables draining (delete
-	// immediately). Default 30s.
+	// immediately). Default 0 (disabled); set >0 to enable lossless drain.
 	DrainTimeout time.Duration
 }
